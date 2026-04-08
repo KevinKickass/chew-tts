@@ -128,8 +128,7 @@ pub fn forward(
 
     let stream_ref = Arc::clone(kernels.ops.stream());
 
-    // Profiling: disabled for production (sync barriers kill performance)
-    let profile = false;
+    let profile = std::env::var("CHEW_PROFILE").is_ok() && seq_len == 1;
     let mut t_norm = 0u128;
     let mut t_gemm = 0u128;
     let mut t_rope = 0u128;
@@ -159,18 +158,31 @@ pub fn forward(
 
     // Layer 0: separate RMSNorm (no previous FFN residual to fuse with)
     if n_layers > 0 {
-        timed!(t_norm, kernels.ops.rms_norm_f32in(
-            hidden, &weights.layers[0].attn_norm, &mut scratch.norm_out,
-            seq_len, config.dim, config.rms_norm_eps,
-        ))?;
+        if seq_len == 1 {
+            // Fused: RMSNorm + Q8_1 quantize in one kernel
+            let x_q8 = kernels.gemv.x_q8_mut();
+            kernels.ops.rms_norm_f32in_q8(
+                hidden, &weights.layers[0].attn_norm, &mut scratch.norm_out,
+                x_q8, seq_len, config.dim, config.rms_norm_eps,
+            )?;
+        } else {
+            kernels.ops.rms_norm_f32in(
+                hidden, &weights.layers[0].attn_norm, &mut scratch.norm_out,
+                seq_len, config.dim, config.rms_norm_eps,
+            )?;
+        }
     }
 
     for layer_idx in 0..n_layers {
         let layer = &weights.layers[layer_idx];
 
-        // 2. QKV projections — quantize norm_out once, reuse for all 3
-        if seq_len == 1 {
-            kernels.gemv.quantize_input(&scratch.norm_out, config.dim)?;
+        // 2. QKV projections — for decode, x_q8 already contains quantized norm_out
+        //    (from fused rms_norm_f32in_q8 or fused_add_rmsnorm_q8)
+        if seq_len == 1 && layer_idx > 0 {
+            // Layer 0 was already fused above; layers 1+ were fused at end of previous layer
+            // x_q8 is already set — no quantize_input needed
+        } else if seq_len > 1 {
+            // Prefill path: no GEMV quantization needed
         }
         timed!(t_gemm, gemm_q(kernels, &scratch.norm_out, &layer.attn_q, &mut scratch.q,
             seq_len, config.n_heads * config.head_dim, config.dim))?;
@@ -216,15 +228,21 @@ pub fn forward(
             seq_len, config.dim, config.n_heads * config.head_dim))?;
 
         // 7+8. Fused: hidden += attn_out, then RMSNorm → norm_out
-        timed!(t_add, kernels.ops.fused_add_rmsnorm(
-            hidden, &scratch.attn_out, &layer.ffn_norm, &mut scratch.norm_out,
-            seq_len, config.dim, config.rms_norm_eps,
-        ))?;
-
-        // 9. Gate + Up projections — quantize norm_out once for both
         if seq_len == 1 {
-            kernels.gemv.quantize_input(&scratch.norm_out, config.dim)?;
+            // Fused: add + RMSNorm + Q8_1 quantize in one kernel
+            let x_q8 = kernels.gemv.x_q8_mut();
+            timed!(t_add, kernels.ops.fused_add_rmsnorm_q8(
+                hidden, &scratch.attn_out, &layer.ffn_norm, &mut scratch.norm_out,
+                x_q8, seq_len, config.dim, config.rms_norm_eps,
+            ))?;
+        } else {
+            timed!(t_add, kernels.ops.fused_add_rmsnorm(
+                hidden, &scratch.attn_out, &layer.ffn_norm, &mut scratch.norm_out,
+                seq_len, config.dim, config.rms_norm_eps,
+            ))?;
         }
+
+        // 9. Gate + Up projections — for decode, x_q8 already has quantized norm_out
         timed!(t_gemm, gemm_q(kernels, &scratch.norm_out, &layer.ffn_gate, &mut scratch.ffn_gate_out,
             seq_len, config.ff_dim, config.dim))?;
         timed!(t_gemm, gemm_q(kernels, &scratch.norm_out, &layer.ffn_up, &mut scratch.ffn_up_out,
@@ -245,12 +263,22 @@ pub fn forward(
 
         // 12. Residual + next layer's attn_norm (fused if not last layer)
         if layer_idx + 1 < n_layers {
-            // Fused: hidden += ffn_out, then RMSNorm with next layer's attn_norm
-            timed!(t_add, kernels.ops.fused_add_rmsnorm(
-                hidden, &scratch.ffn_out,
-                &weights.layers[layer_idx + 1].attn_norm, &mut scratch.norm_out,
-                seq_len, config.dim, config.rms_norm_eps,
-            ))?;
+            if seq_len == 1 {
+                // Fused: add + RMSNorm + Q8_1 quantize for next layer's QKV
+                let x_q8 = kernels.gemv.x_q8_mut();
+                timed!(t_add, kernels.ops.fused_add_rmsnorm_q8(
+                    hidden, &scratch.ffn_out,
+                    &weights.layers[layer_idx + 1].attn_norm, &mut scratch.norm_out,
+                    x_q8, seq_len, config.dim, config.rms_norm_eps,
+                ))?;
+            } else {
+                // Fused: hidden += ffn_out, then RMSNorm with next layer's attn_norm
+                timed!(t_add, kernels.ops.fused_add_rmsnorm(
+                    hidden, &scratch.ffn_out,
+                    &weights.layers[layer_idx + 1].attn_norm, &mut scratch.norm_out,
+                    seq_len, config.dim, config.rms_norm_eps,
+                ))?;
+            }
         } else {
             // Last layer: just add, norm happens after the loop
             timed!(t_add, kernels.ops.add_inplace_f32_f16(hidden, &scratch.ffn_out, n_elems))?;

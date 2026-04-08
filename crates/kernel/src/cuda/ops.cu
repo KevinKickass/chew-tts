@@ -6,6 +6,9 @@
 
 #include <cuda_fp16.h>
 
+typedef unsigned char  uint8_t;
+typedef signed char    int8_t;
+
 extern "C" {
 
 // --- RMSNorm (f16 input, f16 output) ---
@@ -140,6 +143,132 @@ __global__ void fused_add_rmsnorm(float* __restrict__ hidden,
     // Pass 2: normalize + scale
     for (int i = threadIdx.x; i < dim; i += blockDim.x) {
         n_row[i] = __float2half(h_row[i] / rms * __half2float(weight[i]));
+    }
+}
+
+// --- RMSNorm (f32→f16) + Q8_1 Quantize ---
+// Combines rms_norm_f32in + quantize_input into one kernel.
+__global__ void rms_norm_f32in_q8(const float* __restrict__ x,
+                                   const __half* __restrict__ weight,
+                                   __half* __restrict__ out,
+                                   void* __restrict__ x_q8,
+                                   int dim,
+                                   float eps) {
+    int row = blockIdx.x;
+    const float* x_row = x + row * dim;
+    __half* out_row = out + row * dim;
+
+    extern __shared__ float sdata[];
+
+    float local_sum = 0.0f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        float v = x_row[i];
+        local_sum += v * v;
+    }
+    sdata[threadIdx.x] = local_sum;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
+        __syncthreads();
+    }
+
+    float rms = sqrtf(sdata[0] / (float)dim + eps);
+
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        float norm_val = x_row[i] / rms * __half2float(weight[i]);
+        out_row[i] = __float2half(norm_val);
+
+        // Q8_1 quantize
+        float amax = fabsf(norm_val);
+        float wsum = norm_val;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, offset));
+            wsum += __shfl_xor_sync(0xFFFFFFFF, wsum, offset);
+        }
+        float d = amax / 127.0f;
+        float id = (d != 0.0f) ? 1.0f / d : 0.0f;
+        int8_t q = (int8_t)__float2int_rn(norm_val * id);
+
+        int q8_block = i / 32;
+        int q8_in = i % 32;
+        uint8_t* block_ptr = (uint8_t*)x_q8 + q8_block * 36;
+        if (q8_in == 0) {
+            *(half2*)(block_ptr) = make_half2(__float2half(d), __float2half(wsum));
+        }
+        ((int8_t*)(block_ptr + 4))[q8_in] = q;
+    }
+}
+
+// --- Fused Add + RMSNorm + Q8_1 Quantize ---
+// Same as fused_add_rmsnorm but ALSO writes Q8_1 quantized norm_out.
+// Eliminates a separate quantize_input kernel launch.
+// x_q8 format: half2 ds + int8_t qs[32] = 36 bytes per 32-element block.
+__global__ void fused_add_rmsnorm_q8(float* __restrict__ hidden,
+                                      const __half* __restrict__ delta,
+                                      const __half* __restrict__ weight,
+                                      __half* __restrict__ norm_out,
+                                      void* __restrict__ x_q8,
+                                      int dim,
+                                      float eps) {
+    int row = blockIdx.x;
+    float* h_row = hidden + row * dim;
+    __half* n_row = norm_out + row * dim;
+    const __half* d_row = delta + row * dim;
+
+    extern __shared__ float sdata[];
+
+    // Pass 1: add + sum of squares
+    float local_sum = 0.0f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        float v = h_row[i] + __half2float(d_row[i]);
+        h_row[i] = v;
+        local_sum += v * v;
+    }
+    sdata[threadIdx.x] = local_sum;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
+        __syncthreads();
+    }
+
+    float rms = sqrtf(sdata[0] / (float)dim + eps);
+
+    // Pass 2: normalize + scale + Q8_1 quantize
+    // Each warp handles consecutive 32 elements. With stride access and 256 threads:
+    // Iteration 0: threads 0-255 handle elements 0-255
+    // Iteration 1: threads 0-255 handle elements 256-511
+    // Within each iteration: warp 0 handles elements [iter*256 + 0..31]
+    //                        warp 1 handles elements [iter*256 + 32..63]
+    //                        etc.
+    // So each warp has consecutive 32 elements → can do Q8_1 block quantize.
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        float norm_val = h_row[i] / rms * __half2float(weight[i]);
+        n_row[i] = __float2half(norm_val);
+
+        // Q8_1 quantize: warp-level reduce for this group of 32 elements
+        float amax = fabsf(norm_val);
+        float wsum = norm_val;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, offset));
+            wsum += __shfl_xor_sync(0xFFFFFFFF, wsum, offset);
+        }
+
+        float d = amax / 127.0f;
+        float id = (d != 0.0f) ? 1.0f / d : 0.0f;
+        int8_t q = (int8_t)__float2int_rn(norm_val * id);
+
+        // Write Q8_1 block: half2 ds (4 bytes) + int8_t qs[32]
+        int q8_block = i / 32;
+        int q8_in = i % 32;
+        uint8_t* block_ptr = (uint8_t*)x_q8 + q8_block * 36;
+        if (q8_in == 0) {
+            *(half2*)(block_ptr) = make_half2(__float2half(d), __float2half(wsum));
+        }
+        ((int8_t*)(block_ptr + 4))[q8_in] = q;
     }
 }
 

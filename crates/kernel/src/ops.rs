@@ -22,6 +22,8 @@ pub struct OpsKernels {
     copy_f32_to_f16: CudaFunction,
     copy_f16: CudaFunction,
     fused_add_rmsnorm: CudaFunction,
+    rms_norm_f32in_q8: CudaFunction,
+    fused_add_rmsnorm_q8: CudaFunction,
     add_inplace_f32_f16: CudaFunction,
     fused_rope_kv: CudaFunction,
     argmax_f16: CudaFunction,
@@ -51,6 +53,8 @@ impl OpsKernels {
             copy_f32_to_f16: loader::get_fn(&module, "copy_f32_to_f16")?,
             copy_f16: loader::get_fn(&module, "copy_f16")?,
             fused_add_rmsnorm: loader::get_fn(&module, "fused_add_rmsnorm")?,
+            rms_norm_f32in_q8: loader::get_fn(&module, "rms_norm_f32in_q8")?,
+            fused_add_rmsnorm_q8: loader::get_fn(&module, "fused_add_rmsnorm_q8")?,
             add_inplace_f32_f16: loader::get_fn(&module, "add_inplace_f32_f16")?,
             fused_rope_kv: loader::get_fn(&module, "fused_rope_kv")?,
             argmax_f16: loader::get_fn(&module, "argmax_f16")?,
@@ -337,6 +341,62 @@ impl OpsKernels {
             slice_ptr_mut(norm_out), scalar_ptr(&dim_i), scalar_ptr(&eps),
         ];
         unsafe { self.fast.launch(&self.fused_add_rmsnorm, cfg, &mut args)? }
+        Ok(())
+    }
+
+    /// RMSNorm (f32→f16) + Q8_1 quantize in one kernel.
+    /// Writes both norm_out (f16) and x_q8 (Q8_1 format) simultaneously.
+    pub fn rms_norm_f32in_q8(
+        &self,
+        x: &CudaSlice<f32>,
+        weight: &CudaSlice<half::f16>,
+        out: &mut CudaSlice<half::f16>,
+        x_q8: &mut CudaSlice<u8>,
+        n_rows: u32,
+        dim: u32,
+        eps: f32,
+    ) -> Result<(), KernelError> {
+        let threads = 256u32.min(dim);
+        let cfg = LaunchConfig {
+            grid_dim: (n_rows, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: threads * 4,
+        };
+        let dim_i = dim as i32;
+        let mut args: [*mut c_void; 6] = [
+            slice_ptr(x), slice_ptr(weight), slice_ptr_mut(out),
+            slice_ptr_mut(x_q8), scalar_ptr(&dim_i), scalar_ptr(&eps),
+        ];
+        unsafe { self.fast.launch(&self.rms_norm_f32in_q8, cfg, &mut args)? }
+        Ok(())
+    }
+
+    /// Fused add + RMSNorm + Q8_1 quantize in one kernel.
+    /// hidden += delta, norm_out = rmsnorm(hidden) * weight, x_q8 = quantize(norm_out).
+    pub fn fused_add_rmsnorm_q8(
+        &self,
+        hidden: &mut CudaSlice<f32>,
+        delta: &CudaSlice<half::f16>,
+        weight: &CudaSlice<half::f16>,
+        norm_out: &mut CudaSlice<half::f16>,
+        x_q8: &mut CudaSlice<u8>,
+        n_rows: u32,
+        dim: u32,
+        eps: f32,
+    ) -> Result<(), KernelError> {
+        let threads = 256u32.min(dim);
+        let cfg = LaunchConfig {
+            grid_dim: (n_rows, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: threads * 4,
+        };
+        let dim_i = dim as i32;
+        let mut args: [*mut c_void; 7] = [
+            slice_ptr_mut(hidden), slice_ptr(delta), slice_ptr(weight),
+            slice_ptr_mut(norm_out), slice_ptr_mut(x_q8),
+            scalar_ptr(&dim_i), scalar_ptr(&eps),
+        ];
+        unsafe { self.fast.launch(&self.fused_add_rmsnorm_q8, cfg, &mut args)? }
         Ok(())
     }
 

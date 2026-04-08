@@ -42,6 +42,12 @@ impl GemvKernels {
         })
     }
 
+    /// Mutable reference to the pre-allocated Q8_1 input buffer.
+    /// Used by fused norm+quantize kernels that write Q8_1 directly.
+    pub fn x_q8_mut(&mut self) -> &mut CudaSlice<u8> {
+        &mut self.x_q8
+    }
+
     /// Quantize input vector x (f16) to Q8_1 format.
     /// Must be called once before any gemv calls with the same x.
     pub fn quantize_input(&mut self, x: &CudaSlice<half::f16>, k: u32) -> Result<(), KernelError> {
