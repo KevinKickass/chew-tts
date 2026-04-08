@@ -529,27 +529,44 @@ __global__ void mha_fused(const __half* __restrict__ q,       // f16
         __syncthreads();
     }
 
-    // --- Step 2: Softmax over scores ---
-    if (threadIdx.x == 0) {
-        float max_val = -1e30f;
-        for (int kp = 0; kp < kv_len; kp++) {
-            if (scores[kp] > max_val) max_val = scores[kp];
+    // --- Step 2: Softmax over scores (parallel) ---
+    // Find max (parallel reduction)
+    {
+        float local_max = -1e30f;
+        for (int kp = threadIdx.x; kp < kv_len; kp += blockDim.x) {
+            if (scores[kp] > local_max) local_max = scores[kp];
         }
-        scratch[0] = max_val;
+        scratch[threadIdx.x] = local_max;
+        __syncthreads();
+        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+            if (threadIdx.x < s) scratch[threadIdx.x] = fmaxf(scratch[threadIdx.x], scratch[threadIdx.x + s]);
+            __syncthreads();
+        }
     }
-    __syncthreads();
     float max_val = scratch[0];
+    __syncthreads();
 
-    if (threadIdx.x == 0) {
-        float sum = 0.0f;
-        for (int kp = 0; kp < kv_len; kp++) {
+    // Exp + sum (parallel)
+    {
+        float local_sum = 0.0f;
+        for (int kp = threadIdx.x; kp < kv_len; kp += blockDim.x) {
             float e = expf(scores[kp] - max_val);
             scores[kp] = e;
-            sum += e;
+            local_sum += e;
         }
-        for (int kp = 0; kp < kv_len; kp++) {
-            scores[kp] /= sum;
+        scratch[threadIdx.x] = local_sum;
+        __syncthreads();
+        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+            if (threadIdx.x < s) scratch[threadIdx.x] += scratch[threadIdx.x + s];
+            __syncthreads();
         }
+    }
+    float sum_inv = 1.0f / scratch[0];
+    __syncthreads();
+
+    // Normalize (parallel)
+    for (int kp = threadIdx.x; kp < kv_len; kp += blockDim.x) {
+        scores[kp] *= sum_inv;
     }
     __syncthreads();
 
