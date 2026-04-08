@@ -99,13 +99,11 @@ impl VramPlan {
         let max_scratch_elements: u64 = 64 * 1024 * 1024; // matches MAX_SCRATCH_ELEMENTS in gemm.rs
         let dequant_scratch_bytes = max_weight_elements.min(max_scratch_elements) * 2;
 
-        // KV cache: 2 (K+V) * n_layers * max_seq * n_kv_heads * head_dim * 2 bytes (f16)
-        let kv_cache_bytes = 2
-            * config.n_layers as u64
-            * context_length as u64
-            * config.n_kv_heads as u64
-            * config.head_dim as u64
-            * 2;
+        // KV cache: 2 (K+V) * per KV-owning layer: max_seq * n_kv_heads * head_dim * 2 bytes (f16)
+        let kv_cache_bytes: u64 = (0..config.n_kv_layers as usize).map(|i| {
+            let hd = config.layer_head_dim(i) as u64;
+            2 * context_length as u64 * config.n_kv_heads as u64 * hd * 2
+        }).sum();
 
         // Scratch buffers for forward pass:
         // Most buffers are f16 (2 bytes), residual stays f32 (4 bytes).
@@ -114,7 +112,7 @@ impl VramPlan {
         let ff = config.ff_dim as u64;
         let nh = config.n_heads as u64;
         let nkv = config.n_kv_heads as u64;
-        let hd = config.head_dim as u64;
+        let hd = config.max_head_dim as u64;
         let v = config.vocab_size as u64;
 
         let scratch_f16_elements = s * d       // norm_out

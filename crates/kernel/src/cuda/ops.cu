@@ -834,4 +834,199 @@ __global__ void mha_fused_graph(
     }
 }
 
+// =============================================================
+// Gemma 4 kernels
+// =============================================================
+
+// --- GELU activation: out = GELU(gate) * up ---
+// Gemma 4 uses GELU instead of SiLU.
+__global__ void gelu(const __half* __restrict__ gate,
+                     const __half* __restrict__ up,
+                     __half* __restrict__ out,
+                     int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+
+    float g = __half2float(gate[idx]);
+    float u = __half2float(up[idx]);
+    // GELU approximation (tanh version, matches PyTorch)
+    float gelu_g = 0.5f * g * (1.0f + tanhf(0.7978845608f * (g + 0.044715f * g * g * g)));
+    out[idx] = __float2half(gelu_g * u);
+}
+
+// --- RMSNorm without weight multiplication (for V norm) ---
+// Just normalizes by RMS, no learned weight scaling.
+// f16 input → f16 output.
+__global__ void rms_norm_no_weight(const __half* __restrict__ x,
+                                    __half* __restrict__ out,
+                                    int dim,
+                                    float eps) {
+    int row = blockIdx.x;
+    const __half* x_row = x + row * dim;
+    __half* out_row = out + row * dim;
+
+    extern __shared__ float sdata[];
+
+    float local_sum = 0.0f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        float v = __half2float(x_row[i]);
+        local_sum += v * v;
+    }
+    sdata[threadIdx.x] = local_sum;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            sdata[threadIdx.x] += sdata[threadIdx.x + s];
+        }
+        __syncthreads();
+    }
+
+    float rms = sqrtf(sdata[0] / (float)dim + eps);
+
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        out_row[i] = __float2half(__half2float(x_row[i]) / rms);
+    }
+}
+
+// --- Scale f16 tensor by scalar ---
+// out[i] = x[i] * scale
+__global__ void scale_f16(const __half* __restrict__ x,
+                          __half* __restrict__ out,
+                          int n,
+                          float scale) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    out[idx] = __float2half(__half2float(x[idx]) * scale);
+}
+
+// --- Scale f32 tensor by scalar in-place ---
+// x[i] *= scale
+__global__ void scale_f32_inplace(float* __restrict__ x,
+                                  int n,
+                                  float scale) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    x[idx] *= scale;
+}
+
+// --- Logit softcapping: out = tanh(x / cap) * cap ---
+// Applied after the final logit projection in Gemma 4.
+__global__ void logit_softcap(const __half* __restrict__ x,
+                              __half* __restrict__ out,
+                              int n,
+                              float cap) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    float v = __half2float(x[idx]);
+    out[idx] = __float2half(tanhf(v / cap) * cap);
+}
+
+// --- RoPE NeoX (interleaved first/second half) --- f16 in-place
+// NeoX-style: pairs are (x[i], x[i + d/2]) instead of (x[2i], x[2i+1])
+// x has shape [seq_len, n_heads, head_dim]
+__global__ void rope_neox(__half* __restrict__ x,
+                          int head_dim,
+                          int n_heads,
+                          int pos,
+                          float theta_base) {
+    int seq_idx  = blockIdx.x;
+    int head_idx = blockIdx.y;
+    int pair_idx = threadIdx.x;  // 0..head_dim/2-1
+
+    int half_dim = head_dim / 2;
+    if (pair_idx >= half_dim) return;
+
+    int base = seq_idx * n_heads * head_dim + head_idx * head_dim;
+    int idx0 = base + pair_idx;           // first half
+    int idx1 = base + pair_idx + half_dim; // second half
+
+    float freq = 1.0f / powf(theta_base, (float)(2 * pair_idx) / (float)head_dim);
+    float angle = (float)(pos + seq_idx) * freq;
+    float cos_a = cosf(angle);
+    float sin_a = sinf(angle);
+
+    float x0 = __half2float(x[idx0]);
+    float x1 = __half2float(x[idx1]);
+
+    x[idx0] = __float2half(x0 * cos_a - x1 * sin_a);
+    x[idx1] = __float2half(x0 * sin_a + x1 * cos_a);
+}
+
+// --- RoPE NeoX graph-compatible (reads pos from device memory) ---
+__global__ void rope_neox_graph(__half* __restrict__ x,
+                                const int* __restrict__ decode_params,
+                                int head_dim,
+                                int n_heads,
+                                float theta_base) {
+    int seq_idx  = blockIdx.x;
+    int head_idx = blockIdx.y;
+    int pair_idx = threadIdx.x;
+
+    int half_dim = head_dim / 2;
+    if (pair_idx >= half_dim) return;
+
+    int pos = decode_params[0];
+    int base = seq_idx * n_heads * head_dim + head_idx * head_dim;
+    int idx0 = base + pair_idx;
+    int idx1 = base + pair_idx + half_dim;
+
+    float freq = 1.0f / powf(theta_base, (float)(2 * pair_idx) / (float)head_dim);
+    float angle = (float)(pos + seq_idx) * freq;
+    float cos_a = cosf(angle);
+    float sin_a = sinf(angle);
+
+    float x0 = __half2float(x[idx0]);
+    float x1 = __half2float(x[idx1]);
+
+    x[idx0] = __float2half(x0 * cos_a - x1 * sin_a);
+    x[idx1] = __float2half(x0 * sin_a + x1 * cos_a);
+}
+
+// --- MHA with custom attention scale (no 1/sqrt(d)) ---
+// Same as mha_fused but takes explicit scale parameter, for Gemma 4
+// which uses attention_scale=1.0 (pre-normalized via QK norms).
+// (This is already handled by the existing mha_fused which takes scale param)
+
+// --- Post-norm fused add: out = rmsnorm(delta) * weight, hidden += out ---
+// For Gemma 4 post-attention/post-FFN norms.
+// delta is f16, hidden is f32, weight is f16, out is f16.
+__global__ void post_norm_add(float* __restrict__ hidden,
+                              const __half* __restrict__ delta,
+                              const __half* __restrict__ weight,
+                              __half* __restrict__ norm_out,
+                              int dim,
+                              float eps) {
+    int row = blockIdx.x;
+    const __half* d_row = delta + row * dim;
+    float* h_row = hidden + row * dim;
+    __half* n_row = norm_out + row * dim;
+
+    extern __shared__ float sdata[];
+
+    // Compute RMS of delta
+    float local_sum = 0.0f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        float v = __half2float(d_row[i]);
+        local_sum += v * v;
+    }
+    sdata[threadIdx.x] = local_sum;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
+        __syncthreads();
+    }
+
+    float rms = sqrtf(sdata[0] / (float)dim + eps);
+
+    // norm_out = rmsnorm(delta) * weight, hidden += norm_out
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        float normed = __half2float(d_row[i]) / rms * __half2float(weight[i]);
+        n_row[i] = __float2half(normed);
+        h_row[i] += normed;
+    }
+}
+
 } // extern "C"
+

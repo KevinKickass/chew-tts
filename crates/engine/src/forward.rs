@@ -52,7 +52,7 @@ impl ScratchBuffers {
         let ff = config.ff_dim as usize;
         let nh = config.n_heads as usize;
         let nkv = config.n_kv_heads as usize;
-        let hd = config.head_dim as usize;
+        let hd = config.max_head_dim as usize;
         let v = config.vocab_size as usize;
         let _kv = max_kv_len as usize;
 
@@ -310,6 +310,230 @@ pub fn forward(
     }
     gemm_q(kernels, &scratch.norm_out, &weights.output, &mut scratch.logits,
         seq_len, config.vocab_size, config.dim)?;
+
+    kv_cache.advance(seq_len);
+
+    Ok(())
+}
+
+/// Run the Gemma 4 transformer forward pass.
+///
+/// Key differences from Llama:
+/// - Variable head_dim per layer (512 for full attn, 256 for SWA)
+/// - QK norms after Q/K projection
+/// - V norm (no weight) after V projection
+/// - GELU instead of SiLU
+/// - Post-attention and post-FFN norms (applied before residual add)
+/// - Per-layer embedding (skipped for initial implementation)
+/// - Layer output scale
+/// - Shared KV layers
+/// - RoPE NeoX (interleaved first/second half)
+/// - Input embedding scaled by sqrt(dim)
+/// - Logit softcapping (applied after logit projection, in engine)
+pub fn forward_gemma4(
+    hidden: &mut CudaSlice<f32>,
+    weights: &ModelWeights,
+    config: &ModelConfig,
+    kernels: &mut GpuKernels,
+    kv_cache: &mut KvCache,
+    scratch: &mut ScratchBuffers,
+    seq_len: u32,
+) -> Result<(), KernelError> {
+    let pos = kv_cache.pos();
+    let total_kv_len = pos + seq_len;
+
+    let stream_ref = Arc::clone(kernels.ops.stream());
+    let _ = &stream_ref;
+
+    let n_layers = config.n_layers as usize;
+
+    for layer_idx in 0..n_layers {
+        let layer = &weights.layers[layer_idx];
+        let hd = config.layer_head_dim(layer_idx);
+        let _is_swa = config.is_swa(layer_idx);
+        let has_kv = config.has_kv(layer_idx);
+        let rope_theta = config.layer_rope_theta(layer_idx);
+
+        // 1. Attention norm: f32 hidden → f16 norm_out
+        kernels.ops.rms_norm_f32in(
+            hidden, &layer.attn_norm, &mut scratch.norm_out,
+            seq_len, config.dim, config.rms_norm_eps,
+        )?;
+
+        // 2. QKV projections
+        // Q: [seq_len, n_heads * hd]
+        let q_dim = config.n_heads * hd;
+        let kv_dim = config.n_kv_heads * hd;
+
+        gemm_q(kernels, &scratch.norm_out, &layer.attn_q, &mut scratch.q,
+            seq_len, q_dim, config.dim)?;
+
+        // K and V: only compute if this layer owns its KV cache
+        if has_kv {
+            gemm_q(kernels, &scratch.norm_out, &layer.attn_k, &mut scratch.k,
+                seq_len, kv_dim, config.dim)?;
+            gemm_q(kernels, &scratch.norm_out, &layer.attn_v, &mut scratch.v,
+                seq_len, kv_dim, config.dim)?;
+        }
+
+        // 3. QK norms (RMSNorm with learned weights)
+        // The rms_norm kernel requires different src and dst pointers.
+        // We use unsafe to allow in-place operation since it's element-wise.
+        if let Some(ref q_norm) = layer.attn_q_norm {
+            // Q norm: per-head norm, weight shape [head_dim]
+            // Q is [seq_len, n_heads, head_dim] — treat as (seq_len * n_heads) rows of head_dim
+            // SAFETY: rms_norm reads x[row,i] then writes out[row,i] — same buffer is safe.
+            let src_ptr = &scratch.q as *const CudaSlice<half::f16>;
+            let dst_ptr = &mut scratch.q as *mut CudaSlice<half::f16>;
+            unsafe {
+                kernels.ops.rms_norm(
+                    &*src_ptr, q_norm, &mut *dst_ptr,
+                    seq_len * config.n_heads, hd, config.rms_norm_eps,
+                )?;
+            }
+        }
+        if has_kv {
+            if let Some(ref k_norm) = layer.attn_k_norm {
+                let src_ptr = &scratch.k as *const CudaSlice<half::f16>;
+                let dst_ptr = &mut scratch.k as *mut CudaSlice<half::f16>;
+                unsafe {
+                    kernels.ops.rms_norm(
+                        &*src_ptr, k_norm, &mut *dst_ptr,
+                        seq_len * config.n_kv_heads, hd, config.rms_norm_eps,
+                    )?;
+                }
+            }
+
+            // V norm (no weight — just normalize by RMS)
+            let src_ptr = &scratch.v as *const CudaSlice<half::f16>;
+            let dst_ptr = &mut scratch.v as *mut CudaSlice<half::f16>;
+            unsafe {
+                kernels.ops.rms_norm_no_weight(
+                    &*src_ptr, &mut *dst_ptr,
+                    seq_len * config.n_kv_heads, hd, config.rms_norm_eps,
+                )?;
+            }
+        }
+
+        // 4. RoPE NeoX on Q (and K if this layer owns KV)
+        kernels.ops.rope_neox(&mut scratch.q, seq_len, config.n_heads, hd, pos, rope_theta)?;
+        if has_kv {
+            kernels.ops.rope_neox(&mut scratch.k, seq_len, config.n_kv_heads, hd, pos, rope_theta)?;
+        }
+
+        // 5. Write K, V into KV cache (only for KV-owning layers)
+        if has_kv {
+            let kv_elems = seq_len * kv_dim;
+            {
+                let mut k_cache = kv_cache.k_mut(layer_idx, seq_len);
+                kernels.ops.copy_f16(&scratch.k, &mut k_cache, kv_elems)?;
+            }
+            {
+                let mut v_cache = kv_cache.v_mut(layer_idx, seq_len);
+                kernels.ops.copy_f16(&scratch.v, &mut v_cache, kv_elems)?;
+            }
+        }
+
+        // 6. Multi-Head Attention
+        // Use KV from this layer's cache source (may be shared)
+        let kv_source = config.kv_source_layer(layer_idx);
+        let kv_hd = config.layer_head_dim(kv_source);
+        {
+            let k_full = kv_cache.k_full(layer_idx, total_kv_len);
+            let v_full = kv_cache.v_full(layer_idx, total_kv_len);
+
+            // Gemma 4 uses attention_scale=1.0 (QK norms handle scaling)
+            kernels.ops.mha_fused_scaled(
+                &scratch.q, &k_full, &v_full, &mut scratch.attn_mha_out,
+                kv_hd, config.n_heads, config.n_kv_heads,
+                seq_len, total_kv_len, pos,
+                config.attention_scale,
+            )?;
+        }
+
+        // 7. Output projection
+        gemm_q(kernels, &scratch.attn_mha_out, &layer.attn_output, &mut scratch.attn_out,
+            seq_len, config.dim, q_dim)?;
+
+        // 8. Post-attention norm: attn_out = rmsnorm(attn_out) * weight
+        if let Some(ref pan) = layer.post_attention_norm {
+            kernels.ops.post_norm_add(
+                hidden, &scratch.attn_out, pan, &mut scratch.norm_out,
+                seq_len, config.dim, config.rms_norm_eps,
+            )?;
+        } else {
+            // No post-norm: just add to residual
+            kernels.ops.add_inplace_f32_f16(hidden, &scratch.attn_out, seq_len * config.dim)?;
+        }
+
+        // 9. FFN norm
+        kernels.ops.rms_norm_f32in(
+            hidden, &layer.ffn_norm, &mut scratch.norm_out,
+            seq_len, config.dim, config.rms_norm_eps,
+        )?;
+
+        // 10. Gate + Up projections
+        gemm_q(kernels, &scratch.norm_out, &layer.ffn_gate, &mut scratch.ffn_gate_out,
+            seq_len, config.ff_dim, config.dim)?;
+        gemm_q(kernels, &scratch.norm_out, &layer.ffn_up, &mut scratch.ffn_up_out,
+            seq_len, config.ff_dim, config.dim)?;
+
+        // 11. GELU(gate) * up (Gemma 4 uses GELU instead of SiLU)
+        kernels.ops.gelu(
+            &scratch.ffn_gate_out, &scratch.ffn_up_out, &mut scratch.ffn_silu_out,
+            seq_len * config.ff_dim,
+        )?;
+
+        // 12. Down projection
+        gemm_q(kernels, &scratch.ffn_silu_out, &layer.ffn_down, &mut scratch.ffn_out,
+            seq_len, config.dim, config.ff_dim)?;
+
+        // 13. Post-FFN norm
+        if let Some(ref pfn) = layer.post_ffw_norm {
+            kernels.ops.post_norm_add(
+                hidden, &scratch.ffn_out, pfn, &mut scratch.norm_out,
+                seq_len, config.dim, config.rms_norm_eps,
+            )?;
+        } else {
+            kernels.ops.add_inplace_f32_f16(hidden, &scratch.ffn_out, seq_len * config.dim)?;
+        }
+
+        // 14. Layer output scale
+        if let Some(scale) = layer.layer_output_scale {
+            if (scale - 1.0).abs() > 1e-6 {
+                kernels.ops.scale_f32_inplace(hidden, seq_len * config.dim, scale)?;
+            }
+        }
+
+        // Per-layer embedding (skipped for initial implementation — complex and can be added later)
+    }
+
+    // === Final norm + logits ===
+    kernels.ops.rms_norm_f32in(
+        hidden, &weights.output_norm, &mut scratch.norm_out,
+        seq_len, config.dim, config.rms_norm_eps,
+    )?;
+
+    // Output logits
+    gemm_q(kernels, &scratch.norm_out, &weights.output, &mut scratch.logits,
+        seq_len, config.vocab_size, config.dim)?;
+
+    // Logit softcapping: tanh(logits / cap) * cap
+    // The kernel supports different src/dst, but we want in-place.
+    // We'll modify the CUDA kernel to support in-place by checking pointers,
+    // or just make it write to the same buffer (CUDA allows this for element-wise).
+    // Actually, the borrow checker issue is Rust-side. The kernel reads idx then writes idx,
+    // so same-buffer is safe. Use unsafe to work around the borrow checker.
+    if let Some(cap) = config.logit_softcap {
+        let n_logits = seq_len * config.vocab_size;
+        // SAFETY: logit_softcap is an element-wise kernel that reads element [i]
+        // and writes element [i] — no aliasing conflict within the kernel.
+        let src_ptr = &scratch.logits as *const CudaSlice<half::f16>;
+        let dst_ptr = &mut scratch.logits as *mut CudaSlice<half::f16>;
+        unsafe {
+            kernels.ops.logit_softcap(&*src_ptr, &mut *dst_ptr, n_logits, cap)?;
+        }
+    }
 
     kv_cache.advance(seq_len);
 

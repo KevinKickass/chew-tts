@@ -28,6 +28,13 @@ pub struct ModelWeights {
     pub output_norm: CudaSlice<half::f16>,
     /// Output projection (lm_head): [vocab_size, dim] — quantized
     pub output: QuantWeight,
+    // Gemma 4 per-layer embedding weights (shared across layers)
+    /// per_layer_token_embd: [n_embd_per_layer * n_layers, vocab_size] — quantized
+    pub per_layer_token_embd: Option<QuantWeight>,
+    /// per_layer_model_proj: [n_embd_per_layer * n_layers, dim] — quantized
+    pub per_layer_model_proj: Option<QuantWeight>,
+    /// per_layer_proj_norm: [n_embd_per_layer] — f16
+    pub per_layer_proj_norm: Option<CudaSlice<half::f16>>,
 }
 
 /// Weights for one transformer layer.
@@ -50,6 +57,23 @@ pub struct LayerWeights {
     pub ffn_up: QuantWeight,
     /// FFN down: [dim, ff_dim] — quantized
     pub ffn_down: QuantWeight,
+
+    // === Gemma 4 specific (all Optional) ===
+    /// QK norm weights: [head_dim] — f16
+    pub attn_q_norm: Option<CudaSlice<half::f16>>,
+    pub attn_k_norm: Option<CudaSlice<half::f16>>,
+    /// Post-attention norm: [dim] — f16
+    pub post_attention_norm: Option<CudaSlice<half::f16>>,
+    /// Post-FFN norm: [dim] — f16
+    pub post_ffw_norm: Option<CudaSlice<half::f16>>,
+    /// Post-norm (after everything): [dim] — f16
+    pub post_norm: Option<CudaSlice<half::f16>>,
+    /// Per-layer input gate: [dim, embd_per_layer] — quantized
+    pub inp_gate: Option<QuantWeight>,
+    /// Per-layer projection: [embd_per_layer, dim] — quantized
+    pub proj: Option<QuantWeight>,
+    /// Layer output scale: scalar f32
+    pub layer_output_scale: Option<f32>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -83,6 +107,8 @@ impl ModelWeights {
             "loading model weights to GPU"
         );
 
+        let is_gemma4 = config.is_gemma4();
+
         // Embeddings must be f16 for the embed_tokens kernel
         let token_embd = upload_and_dequant(gguf, "token_embd.weight", alloc, dequant, gpu_idx)?;
         let output_norm =
@@ -97,10 +123,48 @@ impl ModelWeights {
             upload_quantized(gguf, "token_embd.weight", alloc, gpu_idx)?
         };
 
+        // Gemma 4 per-layer embedding weights
+        let per_layer_token_embd = if is_gemma4 && gguf.find_tensor("per_layer_token_embd.weight").is_some() {
+            Some(upload_quantized(gguf, "per_layer_token_embd.weight", alloc, gpu_idx)?)
+        } else {
+            None
+        };
+        let per_layer_model_proj = if is_gemma4 && gguf.find_tensor("per_layer_model_proj.weight").is_some() {
+            Some(upload_quantized(gguf, "per_layer_model_proj.weight", alloc, gpu_idx)?)
+        } else {
+            None
+        };
+        let per_layer_proj_norm = if is_gemma4 && gguf.find_tensor("per_layer_proj_norm.weight").is_some() {
+            Some(upload_and_dequant(gguf, "per_layer_proj_norm.weight", alloc, dequant, gpu_idx)?)
+        } else {
+            None
+        };
+
         let mut layers = Vec::with_capacity(config.n_layers as usize);
         for i in 0..config.n_layers {
             let pfx = format!("blk.{i}");
             info!(layer = i, "loading layer weights");
+
+            // Load Gemma 4 optional tensors
+            let attn_q_norm = try_upload_and_dequant(gguf, &format!("{pfx}.attn_q_norm.weight"), alloc, dequant, gpu_idx)?;
+            let attn_k_norm = try_upload_and_dequant(gguf, &format!("{pfx}.attn_k_norm.weight"), alloc, dequant, gpu_idx)?;
+            let post_attention_norm = try_upload_and_dequant(gguf, &format!("{pfx}.post_attention_norm.weight"), alloc, dequant, gpu_idx)?;
+            let post_ffw_norm = try_upload_and_dequant(gguf, &format!("{pfx}.post_ffw_norm.weight"), alloc, dequant, gpu_idx)?;
+            let post_norm = try_upload_and_dequant(gguf, &format!("{pfx}.post_norm.weight"), alloc, dequant, gpu_idx)?;
+            let inp_gate = try_upload_quantized(gguf, &format!("{pfx}.inp_gate.weight"), alloc, gpu_idx)?;
+            let proj = try_upload_quantized(gguf, &format!("{pfx}.proj.weight"), alloc, gpu_idx)?;
+
+            // Layer output scale: read F32 scalar from GGUF
+            let layer_output_scale = if let Some((_ti, data)) = gguf.tensor_data_by_name(&format!("{pfx}.layer_output_scale.weight")).ok() {
+                if data.len() >= 4 {
+                    let val = f32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+                    Some(val)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
 
             let layer = LayerWeights {
                 // Norms are tiny — dequant to f16
@@ -118,6 +182,15 @@ impl ModelWeights {
                 ffn_gate: upload_quantized(gguf, &format!("{pfx}.ffn_gate.weight"), alloc, gpu_idx)?,
                 ffn_up: upload_quantized(gguf, &format!("{pfx}.ffn_up.weight"), alloc, gpu_idx)?,
                 ffn_down: upload_quantized(gguf, &format!("{pfx}.ffn_down.weight"), alloc, gpu_idx)?,
+                // Gemma 4 specific
+                attn_q_norm,
+                attn_k_norm,
+                post_attention_norm,
+                post_ffw_norm,
+                post_norm,
+                inp_gate,
+                proj,
+                layer_output_scale,
             };
             layers.push(layer);
         }
@@ -129,6 +202,9 @@ impl ModelWeights {
             layers,
             output_norm,
             output,
+            per_layer_token_embd,
+            per_layer_model_proj,
+            per_layer_proj_norm,
         })
     }
 }
@@ -193,4 +269,33 @@ fn upload_and_dequant(
     // src_gpu dropped here, freeing quantized bytes
 
     Ok(dst_gpu)
+}
+
+/// Try to upload and dequant — returns None if tensor doesn't exist.
+fn try_upload_and_dequant(
+    gguf: &GgufFile,
+    name: &str,
+    alloc: &VramAllocator,
+    dequant: &DequantKernels,
+    gpu_idx: usize,
+) -> Result<Option<CudaSlice<half::f16>>, LoadError> {
+    if gguf.find_tensor(name).is_some() {
+        Ok(Some(upload_and_dequant(gguf, name, alloc, dequant, gpu_idx)?))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Try to upload quantized — returns None if tensor doesn't exist.
+fn try_upload_quantized(
+    gguf: &GgufFile,
+    name: &str,
+    alloc: &VramAllocator,
+    gpu_idx: usize,
+) -> Result<Option<QuantWeight>, LoadError> {
+    if gguf.find_tensor(name).is_some() {
+        Ok(Some(upload_quantized(gguf, name, alloc, gpu_idx)?))
+    } else {
+        Ok(None)
+    }
 }

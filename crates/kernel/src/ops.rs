@@ -33,6 +33,15 @@ pub struct OpsKernels {
     rope_graph: CudaFunction,
     copy_f16_with_offset: CudaFunction,
     mha_fused_graph: CudaFunction,
+    // Gemma 4 kernels
+    gelu: CudaFunction,
+    rms_norm_no_weight: CudaFunction,
+    scale_f16: CudaFunction,
+    scale_f32_inplace: CudaFunction,
+    logit_softcap: CudaFunction,
+    rope_neox: CudaFunction,
+    rope_neox_graph: CudaFunction,
+    post_norm_add: CudaFunction,
 }
 
 impl OpsKernels {
@@ -63,6 +72,15 @@ impl OpsKernels {
             rope_graph: loader::get_fn(&module, "rope_graph")?,
             copy_f16_with_offset: loader::get_fn(&module, "copy_f16_with_offset")?,
             mha_fused_graph: loader::get_fn(&module, "mha_fused_graph")?,
+            // Gemma 4 kernels
+            gelu: loader::get_fn(&module, "gelu")?,
+            rms_norm_no_weight: loader::get_fn(&module, "rms_norm_no_weight")?,
+            scale_f16: loader::get_fn(&module, "scale_f16")?,
+            scale_f32_inplace: loader::get_fn(&module, "scale_f32_inplace")?,
+            logit_softcap: loader::get_fn(&module, "logit_softcap")?,
+            rope_neox: loader::get_fn(&module, "rope_neox")?,
+            rope_neox_graph: loader::get_fn(&module, "rope_neox_graph")?,
+            post_norm_add: loader::get_fn(&module, "post_norm_add")?,
             _module: module,
         })
     }
@@ -673,6 +691,207 @@ impl OpsKernels {
         Ok(())
     }
 
+    // =============================================================
+    // Gemma 4 kernel wrappers
+    // =============================================================
+
+    /// GELU activation: out = GELU(gate) * up, element-wise, all f16.
+    pub fn gelu(
+        &self,
+        gate: &CudaSlice<half::f16>,
+        up: &CudaSlice<half::f16>,
+        out: &mut CudaSlice<half::f16>,
+        n: u32,
+    ) -> Result<(), KernelError> {
+        let threads = 256u32;
+        let blocks = (n + threads - 1) / threads;
+        let cfg = LaunchConfig {
+            grid_dim: (blocks, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let n_i = n as i32;
+        let mut args: [*mut c_void; 4] = [
+            slice_ptr(gate), slice_ptr(up), slice_ptr_mut(out),
+            scalar_ptr(&n_i),
+        ];
+        unsafe { self.fast.launch(&self.gelu, cfg, &mut args)? }
+        Ok(())
+    }
+
+    /// RMSNorm without weight: just normalize by RMS. f16 in/out.
+    pub fn rms_norm_no_weight(
+        &self,
+        x: &CudaSlice<half::f16>,
+        out: &mut CudaSlice<half::f16>,
+        n_rows: u32,
+        dim: u32,
+        eps: f32,
+    ) -> Result<(), KernelError> {
+        let threads = 256u32.min(dim);
+        let cfg = LaunchConfig {
+            grid_dim: (n_rows, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: threads * 4,
+        };
+        let dim_i = dim as i32;
+        let mut args: [*mut c_void; 4] = [
+            slice_ptr(x), slice_ptr_mut(out),
+            scalar_ptr(&dim_i), scalar_ptr(&eps),
+        ];
+        unsafe { self.fast.launch(&self.rms_norm_no_weight, cfg, &mut args)? }
+        Ok(())
+    }
+
+    /// Scale f16 tensor by scalar: out[i] = x[i] * scale.
+    pub fn scale_f16(
+        &self,
+        x: &CudaSlice<half::f16>,
+        out: &mut CudaSlice<half::f16>,
+        n: u32,
+        scale: f32,
+    ) -> Result<(), KernelError> {
+        let threads = 256u32;
+        let blocks = (n + threads - 1) / threads;
+        let cfg = LaunchConfig {
+            grid_dim: (blocks, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let n_i = n as i32;
+        let mut args: [*mut c_void; 4] = [
+            slice_ptr(x), slice_ptr_mut(out),
+            scalar_ptr(&n_i), scalar_ptr(&scale),
+        ];
+        unsafe { self.fast.launch(&self.scale_f16, cfg, &mut args)? }
+        Ok(())
+    }
+
+    /// Scale f32 tensor in-place: x[i] *= scale.
+    pub fn scale_f32_inplace(
+        &self,
+        x: &mut CudaSlice<f32>,
+        n: u32,
+        scale: f32,
+    ) -> Result<(), KernelError> {
+        let threads = 256u32;
+        let blocks = (n + threads - 1) / threads;
+        let cfg = LaunchConfig {
+            grid_dim: (blocks, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let n_i = n as i32;
+        let mut args: [*mut c_void; 3] = [
+            slice_ptr_mut(x), scalar_ptr(&n_i), scalar_ptr(&scale),
+        ];
+        unsafe { self.fast.launch(&self.scale_f32_inplace, cfg, &mut args)? }
+        Ok(())
+    }
+
+    /// Logit softcapping: out = tanh(x / cap) * cap. In-place on f16.
+    pub fn logit_softcap(
+        &self,
+        x: &CudaSlice<half::f16>,
+        out: &mut CudaSlice<half::f16>,
+        n: u32,
+        cap: f32,
+    ) -> Result<(), KernelError> {
+        let threads = 256u32;
+        let blocks = (n + threads - 1) / threads;
+        let cfg = LaunchConfig {
+            grid_dim: (blocks, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let n_i = n as i32;
+        let mut args: [*mut c_void; 4] = [
+            slice_ptr(x), slice_ptr_mut(out),
+            scalar_ptr(&n_i), scalar_ptr(&cap),
+        ];
+        unsafe { self.fast.launch(&self.logit_softcap, cfg, &mut args)? }
+        Ok(())
+    }
+
+    /// RoPE NeoX-style: pairs are (x[i], x[i+d/2]) instead of (x[2i], x[2i+1]).
+    /// x shape: [seq_len, n_heads, head_dim]
+    pub fn rope_neox(
+        &self,
+        x: &mut CudaSlice<half::f16>,
+        seq_len: u32,
+        n_heads: u32,
+        head_dim: u32,
+        pos: u32,
+        theta_base: f32,
+    ) -> Result<(), KernelError> {
+        let cfg = LaunchConfig {
+            grid_dim: (seq_len, n_heads, 1),
+            block_dim: (head_dim / 2, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let hd = head_dim as i32;
+        let nh = n_heads as i32;
+        let p = pos as i32;
+        let mut args: [*mut c_void; 5] = [
+            slice_ptr_mut(x), scalar_ptr(&hd), scalar_ptr(&nh),
+            scalar_ptr(&p), scalar_ptr(&theta_base),
+        ];
+        unsafe { self.fast.launch(&self.rope_neox, cfg, &mut args)? }
+        Ok(())
+    }
+
+    /// RoPE NeoX graph-compatible (reads pos from device memory).
+    pub fn rope_neox_graph(
+        &self,
+        x: &mut CudaSlice<half::f16>,
+        decode_params: &CudaSlice<i32>,
+        seq_len: u32,
+        n_heads: u32,
+        head_dim: u32,
+        theta_base: f32,
+    ) -> Result<(), KernelError> {
+        let cfg = LaunchConfig {
+            grid_dim: (seq_len, n_heads, 1),
+            block_dim: (head_dim / 2, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let hd = head_dim as i32;
+        let nh = n_heads as i32;
+        let mut args: [*mut c_void; 5] = [
+            slice_ptr_mut(x), slice_ptr(decode_params),
+            scalar_ptr(&hd), scalar_ptr(&nh), scalar_ptr(&theta_base),
+        ];
+        unsafe { self.fast.launch(&self.rope_neox_graph, cfg, &mut args)? }
+        Ok(())
+    }
+
+    /// Post-norm fused add: norm_out = rmsnorm(delta) * weight, hidden += norm_out.
+    /// For Gemma 4 post-attention/post-FFN norms.
+    pub fn post_norm_add(
+        &self,
+        hidden: &mut CudaSlice<f32>,
+        delta: &CudaSlice<half::f16>,
+        weight: &CudaSlice<half::f16>,
+        norm_out: &mut CudaSlice<half::f16>,
+        n_rows: u32,
+        dim: u32,
+        eps: f32,
+    ) -> Result<(), KernelError> {
+        let threads = 256u32.min(dim);
+        let cfg = LaunchConfig {
+            grid_dim: (n_rows, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: threads * 4,
+        };
+        let dim_i = dim as i32;
+        let mut args: [*mut c_void; 6] = [
+            slice_ptr_mut(hidden), slice_ptr(delta), slice_ptr(weight),
+            slice_ptr_mut(norm_out), scalar_ptr(&dim_i), scalar_ptr(&eps),
+        ];
+        unsafe { self.fast.launch(&self.post_norm_add, cfg, &mut args)? }
+        Ok(())
+    }
+
     /// Computes Q@K^T/sqrt(head_dim), causal mask, softmax, @V — all fused.
     pub fn mha_fused(
         &self,
@@ -687,8 +906,26 @@ impl OpsKernels {
         kv_len: u32,
         pos_offset: u32,
     ) -> Result<(), KernelError> {
+        self.mha_fused_scaled(q, k, v, out, head_dim, n_heads, n_kv_heads,
+            seq_len, kv_len, pos_offset, 1.0 / (head_dim as f32).sqrt())
+    }
+
+    /// MHA with custom attention scale (Gemma 4 uses scale=1.0).
+    pub fn mha_fused_scaled(
+        &self,
+        q: &CudaSlice<half::f16>,
+        k: &CudaView<'_, half::f16>,
+        v: &CudaView<'_, half::f16>,
+        out: &mut CudaSlice<half::f16>,
+        head_dim: u32,
+        n_heads: u32,
+        n_kv_heads: u32,
+        seq_len: u32,
+        kv_len: u32,
+        pos_offset: u32,
+        scale: f32,
+    ) -> Result<(), KernelError> {
         let threads = 128u32.min(head_dim);
-        // Shared memory: kv_len floats (scores) + threads floats (reduction scratch)
         let smem = (kv_len + threads) * 4;
         let cfg = LaunchConfig {
             grid_dim: (n_heads, seq_len, 1),
@@ -702,7 +939,6 @@ impl OpsKernels {
         let sl = seq_len as i32;
         let kvl = kv_len as i32;
         let po = pos_offset as i32;
-        let scale = 1.0f32 / (head_dim as f32).sqrt();
 
         let mut args: [*mut c_void; 11] = [
             slice_ptr(q), view_ptr(k), view_ptr(v), slice_ptr_mut(out),

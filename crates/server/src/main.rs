@@ -71,7 +71,8 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("failed to load tokenizer from {}: {e}", tokenizer_path.display()))?;
 
     let eos_token_id = tokenizer
-        .token_to_id("<|eot_id|>")
+        .token_to_id("<end_of_turn>")  // Gemma 4
+        .or_else(|| tokenizer.token_to_id("<|eot_id|>"))  // Llama
         .or_else(|| tokenizer.token_to_id("</s>"))
         .or_else(|| tokenizer.token_to_id("<|endoftext|>"))
         .or_else(|| tokenizer.token_to_id("<|end|>"))
@@ -161,8 +162,30 @@ struct Usage {
     total_tokens: u32,
 }
 
+/// Build a chat prompt based on model architecture.
+fn build_prompt(messages: &[ChatMessage], arch: &str) -> String {
+    match arch {
+        "gemma4" | "gemma3" | "gemma2" => build_prompt_gemma(messages),
+        _ => build_prompt_llama(messages),
+    }
+}
+
+/// Build a Gemma-style chat prompt.
+fn build_prompt_gemma(messages: &[ChatMessage]) -> String {
+    let mut prompt = String::new();
+    for msg in messages {
+        let role = match msg.role.as_str() {
+            "system" => "user", // Gemma doesn't have system role, treat as user
+            r => r,
+        };
+        prompt.push_str(&format!("<start_of_turn>{}\n{}<end_of_turn>\n", role, msg.content));
+    }
+    prompt.push_str("<start_of_turn>model\n");
+    prompt
+}
+
 /// Build a Llama 3.1 Instruct chat prompt.
-fn build_prompt(messages: &[ChatMessage]) -> String {
+fn build_prompt_llama(messages: &[ChatMessage]) -> String {
     let mut prompt = String::from("<|begin_of_text|>");
     for msg in messages {
         prompt.push_str(&format!(
@@ -178,7 +201,7 @@ async fn chat_completions(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ChatRequest>,
 ) -> Result<Json<ChatResponse>, AppError> {
-    let prompt = build_prompt(&req.messages);
+    let prompt = build_prompt(&req.messages, &state.model_name);
 
     let encoding = state
         .tokenizer

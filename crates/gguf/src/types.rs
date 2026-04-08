@@ -339,6 +339,16 @@ impl GgufHeader {
             _ => Err(GgufError::TensorNotFound(key.into())),
         }
     }
+
+    /// Generic get for any key as bool array.
+    pub fn get_bool_array(&self, key: &str) -> Result<Vec<bool>, GgufError> {
+        match self.metadata.get(key) {
+            Some(MetadataValue::Array(arr)) => {
+                Ok(arr.iter().map(|v| matches!(v, MetadataValue::Bool(true))).collect())
+            }
+            _ => Err(GgufError::TensorNotFound(key.into())),
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

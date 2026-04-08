@@ -73,6 +73,10 @@ impl ChewEngine {
             kv_heads = config.n_kv_heads,
             ff = config.ff_dim,
             vocab = config.vocab_size,
+            max_head_dim = config.max_head_dim,
+            n_kv_layers = config.n_kv_layers,
+            logit_softcap = ?config.logit_softcap,
+            sliding_window = ?config.sliding_window,
             "model config"
         );
 
@@ -125,11 +129,18 @@ impl ChewEngine {
         let max_weight_elems = {
             let d = config.dim as usize;
             let nh = config.n_heads as usize;
-            let hd = config.head_dim as usize;
+            let hd = config.max_head_dim as usize;
             let ff = config.ff_dim as usize;
             let v = config.vocab_size as usize;
             // Largest matrices: ffn_gate/up [ff_dim, dim], output [vocab, dim]
-            [nh * hd * d, ff * d, v * d].into_iter().max().unwrap()
+            // For Gemma 4: per_layer_token_embd can be huge but stays quantized
+            let mut max = [nh * hd * d, ff * d, v * d].into_iter().max().unwrap();
+            // per_layer_model_proj: [n_embd_per_layer * n_layers, dim]
+            if let Some(epl) = config.embd_per_layer {
+                let proj_size = (epl as usize) * (config.n_layers as usize) * d;
+                max = max.max(proj_size);
+            }
+            max
         };
         // max_k for GEMV Q8_1 buffer: largest K dimension in any weight matrix
         let max_k = config.ff_dim.max(config.dim) as usize;
@@ -195,16 +206,34 @@ impl ChewEngine {
             self.config.dim,
         )?;
 
+        // Scale embeddings by sqrt(dim) for Gemma 4
+        if self.config.is_gemma4() {
+            let scale = (self.config.dim as f32).sqrt();
+            self.kernels.ops.scale_f32_inplace(&mut hidden, prefill_len * self.config.dim, scale)?;
+        }
+
         // Forward pass on prefill
-        forward::forward(
-            &mut hidden,
-            &self.weights,
-            &self.config,
-            &mut self.kernels,
-            &mut self.kv_cache,
-            &mut self.scratch,
-            prefill_len,
-        )?;
+        if self.config.is_gemma4() {
+            forward::forward_gemma4(
+                &mut hidden,
+                &self.weights,
+                &self.config,
+                &mut self.kernels,
+                &mut self.kv_cache,
+                &mut self.scratch,
+                prefill_len,
+            )?;
+        } else {
+            forward::forward(
+                &mut hidden,
+                &self.weights,
+                &self.config,
+                &mut self.kernels,
+                &mut self.kv_cache,
+                &mut self.scratch,
+                prefill_len,
+            )?;
+        }
 
         // Sample first token from logits of last position
         // Logits are f16 — download and convert to f32 for sampling
@@ -274,7 +303,8 @@ impl ChewEngine {
         // Eliminates ~300 cuLaunchKernel calls per token (~1-2ms host overhead).
         // Works for both greedy and non-greedy: graph captures forward pass only,
         // sampling (argmax or CPU top-k) happens outside the graph.
-        let use_graph = std::env::var("CHEW_NO_GRAPH").is_err() && max_new_tokens > 20;
+        // Disable CUDA graph for Gemma 4 (different forward pass, variable head_dim)
+        let use_graph = std::env::var("CHEW_NO_GRAPH").is_err() && max_new_tokens > 20 && !self.config.is_gemma4();
         let mut decode_graph: Option<forward::DecodeGraph> = None;
 
         let greedy = params.temperature == 0.0;
@@ -302,6 +332,12 @@ impl ChewEngine {
                     &self.weights.token_embd, &tok_gpu, &mut decode_hidden, 1, self.config.dim,
                 )?;
 
+                // Scale embeddings by sqrt(dim) for Gemma 4
+                if self.config.is_gemma4() {
+                    let scale = (self.config.dim as f32).sqrt();
+                    self.kernels.ops.scale_f32_inplace(&mut decode_hidden, self.config.dim, scale)?;
+                }
+
                 if use_graph {
                     if let Some(ref mut dg) = decode_graph {
                         let pos = self.kv_cache.pos();
@@ -315,6 +351,11 @@ impl ChewEngine {
                             pos, &self.stream,
                         )?);
                     }
+                } else if self.config.is_gemma4() {
+                    forward::forward_gemma4(
+                        &mut decode_hidden, &self.weights, &self.config,
+                        &mut self.kernels, &mut self.kv_cache, &mut self.scratch, 1,
+                    )?;
                 } else {
                     forward::forward(
                         &mut decode_hidden, &self.weights, &self.config,
@@ -363,10 +404,23 @@ impl ChewEngine {
                     &self.weights.token_embd, &tok_gpu, &mut decode_hidden, 1, self.config.dim,
                 )?;
 
-                forward::forward(
-                    &mut decode_hidden, &self.weights, &self.config,
-                    &mut self.kernels, &mut self.kv_cache, &mut self.scratch, 1,
-                )?;
+                // Scale embeddings by sqrt(dim) for Gemma 4
+                if self.config.is_gemma4() {
+                    let scale = (self.config.dim as f32).sqrt();
+                    self.kernels.ops.scale_f32_inplace(&mut decode_hidden, self.config.dim, scale)?;
+                }
+
+                if self.config.is_gemma4() {
+                    forward::forward_gemma4(
+                        &mut decode_hidden, &self.weights, &self.config,
+                        &mut self.kernels, &mut self.kv_cache, &mut self.scratch, 1,
+                    )?;
+                } else {
+                    forward::forward(
+                        &mut decode_hidden, &self.weights, &self.config,
+                        &mut self.kernels, &mut self.kv_cache, &mut self.scratch, 1,
+                    )?;
+                }
 
                 self.stream.memcpy_dtoh(
                     &self.scratch.logits.slice(0..vocab), &mut logits_f16,
