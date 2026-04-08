@@ -27,6 +27,10 @@ pub struct OpsKernels {
     argmax_f16: CudaFunction,
     sample_top_k: CudaFunction,
     mha_fused: CudaFunction,
+    // CUDA Graph-compatible variants
+    rope_graph: CudaFunction,
+    copy_f16_with_offset: CudaFunction,
+    mha_fused_graph: CudaFunction,
 }
 
 impl OpsKernels {
@@ -52,6 +56,9 @@ impl OpsKernels {
             argmax_f16: loader::get_fn(&module, "argmax_f16")?,
             sample_top_k: loader::get_fn(&module, "sample_top_k")?,
             mha_fused: loader::get_fn(&module, "mha_fused")?,
+            rope_graph: loader::get_fn(&module, "rope_graph")?,
+            copy_f16_with_offset: loader::get_fn(&module, "copy_f16_with_offset")?,
+            mha_fused_graph: loader::get_fn(&module, "mha_fused_graph")?,
             _module: module,
         })
     }
@@ -511,6 +518,98 @@ impl OpsKernels {
                 .launch(cfg)
                 .map_err(|e| KernelError::Launch(e.to_string()))?;
         }
+        Ok(())
+    }
+
+    // === CUDA Graph-compatible kernel wrappers ===
+
+    /// RoPE reading pos from device memory (decode_params[0]).
+    /// For CUDA Graph capture — pos changes each step but pointer is stable.
+    pub fn rope_graph(
+        &self,
+        x: &mut CudaSlice<half::f16>,
+        decode_params: &CudaSlice<i32>,
+        seq_len: u32,
+        n_heads: u32,
+        head_dim: u32,
+        theta_base: f32,
+    ) -> Result<(), KernelError> {
+        let cfg = LaunchConfig {
+            grid_dim: (seq_len, n_heads, 1),
+            block_dim: (head_dim / 2, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let hd = head_dim as i32;
+        let nh = n_heads as i32;
+        let mut args: [*mut c_void; 5] = [
+            slice_ptr_mut(x), slice_ptr(decode_params),
+            scalar_ptr(&hd), scalar_ptr(&nh), scalar_ptr(&theta_base),
+        ];
+        unsafe { self.fast.launch(&self.rope_graph, cfg, &mut args)? }
+        Ok(())
+    }
+
+    /// Copy f16 with offset read from decode_params[2].
+    /// Writes src[0..n] to dst_base[offset..offset+n].
+    /// For KV cache writes in CUDA Graph mode.
+    pub fn copy_f16_with_offset(
+        &self,
+        src: &CudaSlice<half::f16>,
+        dst_base: &mut CudaSlice<half::f16>,
+        decode_params: &CudaSlice<i32>,
+        n: u32,
+    ) -> Result<(), KernelError> {
+        let threads = 256u32;
+        let blocks = (n + threads - 1) / threads;
+        let cfg = LaunchConfig {
+            grid_dim: (blocks, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let n_i = n as i32;
+        let mut args: [*mut c_void; 4] = [
+            slice_ptr(src), slice_ptr_mut(dst_base), slice_ptr(decode_params),
+            scalar_ptr(&n_i),
+        ];
+        unsafe { self.fast.launch(&self.copy_f16_with_offset, cfg, &mut args)? }
+        Ok(())
+    }
+
+    /// MHA reading kv_len/pos from device memory. Uses base KV cache pointers.
+    /// shared_mem_bytes must be pre-computed for max kv_len (allocated at capture time).
+    pub fn mha_fused_graph(
+        &self,
+        q: &CudaSlice<half::f16>,
+        k_base: &CudaSlice<half::f16>,
+        v_base: &CudaSlice<half::f16>,
+        out: &mut CudaSlice<half::f16>,
+        decode_params: &CudaSlice<i32>,
+        head_dim: u32,
+        n_heads: u32,
+        n_kv_heads: u32,
+        seq_len: u32,
+        max_kv_len: u32,
+    ) -> Result<(), KernelError> {
+        let threads = 128u32.min(head_dim);
+        // Allocate shared memory for max_kv_len (graph-stable)
+        let smem = (max_kv_len + threads) * 4;
+        let cfg = LaunchConfig {
+            grid_dim: (n_heads, seq_len, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: smem,
+        };
+        let hd = head_dim as i32;
+        let nh = n_heads as i32;
+        let nkv = n_kv_heads as i32;
+        let sl = seq_len as i32;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut args: [*mut c_void; 10] = [
+            slice_ptr(q), slice_ptr(k_base), slice_ptr(v_base), slice_ptr_mut(out),
+            slice_ptr(decode_params),
+            scalar_ptr(&hd), scalar_ptr(&nh), scalar_ptr(&nkv),
+            scalar_ptr(&sl), scalar_ptr(&scale),
+        ];
+        unsafe { self.fast.launch(&self.mha_fused_graph, cfg, &mut args)? }
         Ok(())
     }
 

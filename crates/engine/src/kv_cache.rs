@@ -101,4 +101,34 @@ impl KvCache {
         let end = (total_len as usize) * stride;
         self.layers[layer].v.slice(0..end)
     }
+
+    /// Get the full K cache buffer for a layer (base pointer, for CUDA Graph mode).
+    pub fn k_base(&self, layer: usize) -> &CudaSlice<half::f16> {
+        &self.layers[layer].k
+    }
+
+    /// Get the full V cache buffer for a layer (base pointer, for CUDA Graph mode).
+    pub fn v_base(&self, layer: usize) -> &CudaSlice<half::f16> {
+        &self.layers[layer].v
+    }
+
+    /// Get the full K cache buffer for a layer (mutable, for CUDA Graph offset writes).
+    pub fn k_base_mut(&mut self, layer: usize) -> &mut CudaSlice<half::f16> {
+        &mut self.layers[layer].k
+    }
+
+    /// Get the full V cache buffer for a layer (mutable, for CUDA Graph offset writes).
+    pub fn v_base_mut(&mut self, layer: usize) -> &mut CudaSlice<half::f16> {
+        &mut self.layers[layer].v
+    }
+
+    /// Max sequence length this cache was allocated for.
+    pub fn max_seq(&self) -> u32 {
+        self.max_seq
+    }
+
+    /// KV stride in elements: n_kv_heads * head_dim
+    pub fn kv_stride(&self) -> u32 {
+        self.n_kv_heads * self.head_dim
+    }
 }

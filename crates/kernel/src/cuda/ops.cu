@@ -555,4 +555,137 @@ __global__ void sample_top_k(const __half* __restrict__ logits,
         out[0] = gi[0];
     }
 }
+// =============================================================
+// CUDA Graph-compatible kernels
+// =============================================================
+// These read dynamic per-step parameters from device memory
+// instead of kernel arguments, allowing CUDA Graph replay
+// without re-capture.
+//
+// decode_params layout (int array in device memory):
+//   [0] = pos          (current sequence position)
+//   [1] = kv_len       (total KV cache length = pos + 1 for decode)
+//   [2] = kv_offset    (element offset for KV cache write = pos * n_kv_heads * head_dim)
+
+// --- RoPE reading pos from device memory ---
+__global__ void rope_graph(__half* __restrict__ x,
+                           const int* __restrict__ decode_params,
+                           int head_dim,
+                           int n_heads,
+                           float theta_base) {
+    int seq_idx  = blockIdx.x;
+    int head_idx = blockIdx.y;
+    int pair_idx = threadIdx.x;
+
+    if (pair_idx >= head_dim / 2) return;
+
+    int pos = decode_params[0];
+    int offset = seq_idx * n_heads * head_dim + head_idx * head_dim + pair_idx * 2;
+
+    float freq = 1.0f / powf(theta_base, (float)(2 * pair_idx) / (float)head_dim);
+    float angle = (float)(pos + seq_idx) * freq;
+    float cos_a = cosf(angle);
+    float sin_a = sinf(angle);
+
+    float x0 = __half2float(x[offset]);
+    float x1 = __half2float(x[offset + 1]);
+
+    x[offset]     = __float2half(x0 * cos_a - x1 * sin_a);
+    x[offset + 1] = __float2half(x0 * sin_a + x1 * cos_a);
+}
+
+// --- Copy f16 with offset (for KV cache writes without changing pointers) ---
+__global__ void copy_f16_with_offset(const __half* __restrict__ src,
+                                      __half* __restrict__ dst_base,
+                                      const int* __restrict__ decode_params,
+                                      int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    int kv_offset = decode_params[2];
+    dst_base[kv_offset + idx] = src[idx];
+}
+
+// --- MHA reading kv_len and pos_offset from device memory ---
+// Uses base KV cache pointers (not views) — compatible with graph replay.
+// Shared memory must be allocated for max_kv_len at capture time.
+__global__ void mha_fused_graph(
+    const __half* __restrict__ q,
+    const __half* __restrict__ k_base,     // Full KV cache K base pointer
+    const __half* __restrict__ v_base,     // Full KV cache V base pointer
+    __half* __restrict__ out,
+    const int* __restrict__ decode_params, // [pos, kv_len, kv_offset]
+    int head_dim,
+    int n_heads,
+    int n_kv_heads,
+    int seq_len,
+    float scale) {
+    int head = blockIdx.x;
+    int q_pos_local = blockIdx.y;
+
+    int kv_len = decode_params[1];
+    int pos_offset = decode_params[0]; // For decode, pos_offset = pos
+
+    int q_pos_global = pos_offset + q_pos_local;
+    int kv_head = head / (n_heads / n_kv_heads);
+
+    const __half* q_vec = q + q_pos_local * n_heads * head_dim + head * head_dim;
+
+    extern __shared__ float smem[];
+    float* scores = smem;
+    float* scratch = smem + kv_len;
+
+    // --- Step 1: Compute attention scores ---
+    for (int kp = 0; kp < kv_len; kp++) {
+        if (kp > q_pos_global) {
+            if (threadIdx.x == 0) scores[kp] = -1e30f;
+            continue;
+        }
+        const __half* k_vec = k_base + kp * n_kv_heads * head_dim + kv_head * head_dim;
+        float dot = 0.0f;
+        for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+            dot += __half2float(q_vec[d]) * __half2float(k_vec[d]);
+        }
+        scratch[threadIdx.x] = dot;
+        __syncthreads();
+        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+            if (threadIdx.x < s) scratch[threadIdx.x] += scratch[threadIdx.x + s];
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) scores[kp] = scratch[0] * scale;
+        __syncthreads();
+    }
+
+    // --- Step 2: Softmax ---
+    if (threadIdx.x == 0) {
+        float max_val = -1e30f;
+        for (int kp = 0; kp < kv_len; kp++)
+            if (scores[kp] > max_val) max_val = scores[kp];
+        scratch[0] = max_val;
+    }
+    __syncthreads();
+    float max_val = scratch[0];
+
+    if (threadIdx.x == 0) {
+        float sum = 0.0f;
+        for (int kp = 0; kp < kv_len; kp++) {
+            float e = expf(scores[kp] - max_val);
+            scores[kp] = e;
+            sum += e;
+        }
+        for (int kp = 0; kp < kv_len; kp++) scores[kp] /= sum;
+    }
+    __syncthreads();
+
+    // --- Step 3: Weighted sum of V ---
+    __half* out_vec = out + q_pos_local * n_heads * head_dim + head * head_dim;
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        float acc = 0.0f;
+        for (int kp = 0; kp < kv_len; kp++) {
+            const __half* v_vec = v_base + kp * n_kv_heads * head_dim + kv_head * head_dim;
+            acc += scores[kp] * __half2float(v_vec[d]);
+        }
+        out_vec[d] = __float2half(acc);
+    }
+}
+
 } // extern "C"

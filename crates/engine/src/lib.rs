@@ -262,10 +262,6 @@ impl ChewEngine {
         }
 
         // Decode loop: one token at a time
-        let pos_seed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .subsec_nanos();
         // Pre-allocate decode buffers ONCE (no per-token GPU allocs!)
         let mut tok_gpu = self.stream
             .alloc_zeros::<i32>(1)
@@ -273,6 +269,13 @@ impl ChewEngine {
         let mut decode_hidden = self.stream
             .alloc_zeros::<f32>(self.config.dim as usize)
             .map_err(EngineError::Driver)?;
+
+        // CUDA Graph: capture on first decode step, replay on subsequent steps.
+        // Eliminates ~300 cuLaunchKernel calls per token (~1-2ms host overhead).
+        // Works for both greedy and non-greedy: graph captures forward pass only,
+        // sampling (argmax or CPU top-k) happens outside the graph.
+        let use_graph = std::env::var("CHEW_NO_GRAPH").is_err() && max_new_tokens > 20;
+        let mut decode_graph: Option<forward::DecodeGraph> = None;
 
         for _step in 1..max_new_tokens {
             let last = *all_tokens.last().unwrap();
@@ -289,15 +292,37 @@ impl ChewEngine {
                 self.config.dim,
             )?;
 
-            forward::forward(
-                &mut decode_hidden,
-                &self.weights,
-                &self.config,
-                &mut self.kernels,
-                &mut self.kv_cache,
-                &mut self.scratch,
-                1,
-            )?;
+            if use_graph {
+                if let Some(ref mut dg) = decode_graph {
+                    // Replay: update params + single graph launch
+                    let pos = self.kv_cache.pos();
+                    dg.replay(pos, self.kv_cache.kv_stride(), &self.stream)?;
+                    self.kv_cache.advance(1);
+                } else {
+                    // First decode step: capture the graph
+                    let pos = self.kv_cache.pos();
+                    decode_graph = Some(forward::DecodeGraph::capture(
+                        &mut decode_hidden,
+                        &self.weights,
+                        &self.config,
+                        &mut self.kernels,
+                        &mut self.kv_cache,
+                        &mut self.scratch,
+                        pos,
+                        &self.stream,
+                    )?);
+                }
+            } else {
+                forward::forward(
+                    &mut decode_hidden,
+                    &self.weights,
+                    &self.config,
+                    &mut self.kernels,
+                    &mut self.kv_cache,
+                    &mut self.scratch,
+                    1,
+                )?;
+            }
 
             // Greedy: GPU argmax (4 bytes). Non-greedy: CPU sampling with heap-based top-K.
             if params.temperature == 0.0 {

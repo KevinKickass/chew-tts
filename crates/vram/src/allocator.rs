@@ -59,7 +59,7 @@ impl VramAllocator {
         let mut streams = Vec::with_capacity(count);
         for i in 0..count {
             let ctx = CudaContext::new(i).map_err(|e| VramError::CudaInit(e.to_string()))?;
-            let stream = ctx.default_stream();
+            let stream = ctx.new_stream().map_err(|e| VramError::CudaInit(e.to_string()))?;
 
             let (free, total) = ctx
                 .mem_get_info()
