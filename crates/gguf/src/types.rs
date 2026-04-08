@@ -313,6 +313,32 @@ impl GgufHeader {
             .get(&format!("{arch}.feed_forward_length"))
             .and_then(|v| v.as_u32())
     }
+
+    /// Generic get for any key as u32.
+    pub fn get_u32(&self, key: &str) -> Result<u32, GgufError> {
+        self.metadata
+            .get(key)
+            .and_then(|v| v.as_u32())
+            .ok_or_else(|| GgufError::TensorNotFound(key.into()))
+    }
+
+    /// Generic get for any key as f32.
+    pub fn get_f32(&self, key: &str) -> Result<f32, GgufError> {
+        self.metadata
+            .get(key)
+            .and_then(|v| v.as_f32())
+            .ok_or_else(|| GgufError::TensorNotFound(key.into()))
+    }
+
+    /// Generic get for any key as u32 array.
+    pub fn get_u32_array(&self, key: &str) -> Result<Vec<u32>, GgufError> {
+        match self.metadata.get(key) {
+            Some(MetadataValue::Array(arr)) => {
+                Ok(arr.iter().filter_map(|v| v.as_u32()).collect())
+            }
+            _ => Err(GgufError::TensorNotFound(key.into())),
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

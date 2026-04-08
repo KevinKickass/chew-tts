@@ -14,6 +14,13 @@ pub struct ModelConfig {
     pub context_length: u32,
     pub rope_theta: f32,
     pub rms_norm_eps: f32,
+    // Gemma 4 specific
+    pub sliding_window: Option<u32>,
+    pub swa_layers: Vec<bool>,       // per-layer: true = SWA, false = full attention
+    pub n_kv_shared_layers: u32,     // layers from end that share KV cache
+    pub attention_scale: f32,        // 1.0 for Gemma 4, 1/sqrt(d) for Llama
+    pub logit_softcap: Option<f32>,  // final logit softcapping
+    pub rope_theta_swa: Option<f32>, // separate rope base for SWA layers
 }
 
 impl ModelConfig {
@@ -34,6 +41,21 @@ impl ModelConfig {
         let rope_theta = header.rope_freq_base().unwrap_or(10000.0);
         let rms_norm_eps = header.rms_norm_eps().unwrap_or(1e-5);
 
+        // Gemma 4 specific
+        let is_gemma4 = arch == "gemma4";
+        let sliding_window = header.get_u32(&format!("{arch}.attention.sliding_window")).ok();
+        let n_kv_shared_layers = header.get_u32(&format!("{arch}.attention.shared_kv_layers")).unwrap_or(0);
+        let attention_scale = if is_gemma4 { 1.0 } else { 1.0 / (head_dim as f32).sqrt() };
+        let logit_softcap = header.get_f32(&format!("{arch}.final_logit_softcapping")).ok();
+        let rope_theta_swa = header.get_f32(&format!("{arch}.rope.freq_base_swa")).ok();
+
+        // SWA layer pattern (if present)
+        let swa_layers = if let Ok(pattern) = header.get_u32_array(&format!("{arch}.attention.sliding_window_pattern")) {
+            pattern.iter().map(|&v| v != 0).collect()
+        } else {
+            vec![false; n_layers as usize]
+        };
+
         Ok(Self {
             arch,
             n_layers,
@@ -46,6 +68,12 @@ impl ModelConfig {
             context_length,
             rope_theta,
             rms_norm_eps,
+            sliding_window,
+            swa_layers,
+            n_kv_shared_layers,
+            attention_scale,
+            logit_softcap,
+            rope_theta_swa,
         })
     }
 
