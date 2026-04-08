@@ -1,0 +1,12 @@
+[package]
+name = "chew-vram"
+version.workspace = true
+edition.workspace = true
+description = "GPU VRAM allocator — owns all GPU memory, cudarc-based"
+
+[dependencies]
+cudarc.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+parking_lot.workspace = true
+serde.workspace = true

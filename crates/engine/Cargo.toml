@@ -1,0 +1,19 @@
+[package]
+name = "chew-engine"
+version.workspace = true
+edition.workspace = true
+description = "Transformer inference engine — forward pass, KV cache, sampling"
+
+[dependencies]
+chew-gguf.workspace = true
+chew-vram.workspace = true
+chew-kernel.workspace = true
+tokenizers.workspace = true
+half.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+parking_lot.workspace = true
+dashmap.workspace = true
+uuid.workspace = true
+serde.workspace = true
+serde_json.workspace = true

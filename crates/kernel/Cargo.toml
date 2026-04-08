@@ -1,0 +1,12 @@
+[package]
+name = "chew-kernel"
+version.workspace = true
+edition.workspace = true
+description = "CUDA kernels — dequant, RMSNorm, RoPE, SiLU, Softmax, GEMM via cuBLAS"
+
+[dependencies]
+chew-vram.workspace = true
+cudarc.workspace = true
+half.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

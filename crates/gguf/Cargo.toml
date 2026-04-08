@@ -1,0 +1,12 @@
+[package]
+name = "chew-gguf"
+version.workspace = true
+edition.workspace = true
+description = "GGUF file parser — reads metadata, tensor info, and raw weight data"
+
+[dependencies]
+half.workspace = true
+byteorder.workspace = true
+memmap2.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

@@ -1,0 +1,54 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/gguf",
+    "crates/vram",
+    "crates/kernel",
+    "crates/engine",
+    "crates/server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+# Internal crates
+chew-gguf = { path = "crates/gguf" }
+chew-vram = { path = "crates/vram" }
+chew-kernel = { path = "crates/kernel" }
+chew-engine = { path = "crates/engine" }
+
+# CUDA
+cudarc = { version = "0.19", features = ["std", "driver", "cublas", "cuda-12080"] }
+
+# Async
+tokio = { version = "1", features = ["full"] }
+
+# HTTP
+axum = { version = "0.8", features = ["json"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Tokenizer
+tokenizers = "0.22"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Utils
+half = { version = "2", features = ["num-traits"] }
+byteorder = "1"
+memmap2 = "0.9"
+parking_lot = "0.12"
+dashmap = "6"
+uuid = { version = "1", features = ["v4"] }
