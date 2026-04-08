@@ -5,6 +5,7 @@ edition.workspace = true
 description = "CUDA kernels — dequant, RMSNorm, RoPE, SiLU, Softmax, GEMM via cuBLAS"
 
 [dependencies]
+chew-gguf.workspace = true
 chew-vram.workspace = true
 cudarc.workspace = true
 half.workspace = true

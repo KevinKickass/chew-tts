@@ -21,7 +21,7 @@ chew-kernel = { path = "crates/kernel" }
 chew-engine = { path = "crates/engine" }
 
 # CUDA
-cudarc = { version = "0.19", features = ["std", "driver", "cublas", "cuda-12080"] }
+cudarc = { version = "0.19", features = ["std", "driver", "cublas", "nvrtc", "cuda-13000", "f16"] }
 
 # Async
 tokio = { version = "1", features = ["full"] }

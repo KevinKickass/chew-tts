@@ -12,6 +12,7 @@ path = "src/main.rs"
 chew-engine.workspace = true
 chew-vram.workspace = true
 chew-gguf.workspace = true
+tokenizers.workspace = true
 tokio.workspace = true
 axum.workspace = true
 tower-http.workspace = true
