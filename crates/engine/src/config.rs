@@ -70,7 +70,7 @@ impl ModelConfig {
         // Per-layer head_dim: read from GGUF key_length, then compute per layer
         // For Gemma 4: full attention layers use key_length (512), SWA uses head_dim (256 = dim/n_heads)
         let full_attn_head_dim = header.get_u32(&format!("{arch}.attention.key_length")).unwrap_or(head_dim);
-        let swa_head_dim = dim / n_heads; // 2560/8 = 320... but actual model has 256 for SWA
+        let swa_head_dim = header.get_u32(&format!("{arch}.attention.key_length_swa")).unwrap_or(dim / n_heads);
 
         let head_dims: Vec<u32> = if is_gemma4 {
             // Determine head_dim per layer from SWA pattern
