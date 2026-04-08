@@ -283,11 +283,12 @@ checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 [[package]]
 name = "cudarc"
 version = "0.19.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f071cd6a7b5d51607df76aa2d426aaabc7a74bc6bdb885b8afa63a880572ad9b"
 dependencies = [
+ "float4",
+ "float8",
  "half",
  "libloading",
+ "no-std-compat",
 ]
 
 [[package]]
@@ -421,6 +422,21 @@ name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
+
+[[package]]
+name = "float4"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9a5404bf31d22893d61cf24d4dda149d8e6b2ff07601c3cb3be651031f61a4ed"
+
+[[package]]
+name = "float8"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c2d1f04709a8ac06e8e8042875a3c466cc4832d3c1a18dbcb9dba3c6e83046bc"
+dependencies = [
+ "half",
+]
 
 [[package]]
 name = "fnv"
@@ -823,6 +839,12 @@ dependencies = [
  "quote",
  "syn",
 ]
+
+[[package]]
+name = "no-std-compat"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b93853da6d84c2e3c7d730d6473e8817692dd89be387eb01b94d7f108ecb5b8c"
 
 [[package]]
 name = "nom"

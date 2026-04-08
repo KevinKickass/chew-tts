@@ -1,4 +1,5 @@
 use crate::loader::{self, KernelError};
+use crate::fast_launch::{FastStream, slice_ptr, slice_ptr_mut, scalar_ptr};
 use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
 use std::sync::Arc;
 
@@ -8,6 +9,7 @@ const GEMV_CU: &str = include_str!("cuda/gemv.cu");
 ///
 /// Two-phase: quantize x to Q8_1 once, then GEMV reads int8 input.
 pub struct GemvKernels {
+    fast: FastStream,
     stream: Arc<CudaStream>,
     _module: Arc<CudaModule>,
     quantize_x: CudaFunction,
@@ -29,6 +31,7 @@ impl GemvKernels {
             .map_err(|e| KernelError::Launch(e.to_string()))?;
 
         Ok(Self {
+            fast: FastStream::new(stream),
             stream: Arc::clone(stream),
             quantize_x: loader::get_fn(&module, "quantize_x_q8_1")?,
             q4_k: loader::get_fn(&module, "gemv_q4_k")?,
@@ -48,16 +51,10 @@ impl GemvKernels {
             shared_mem_bytes: 0,
         };
         let k_i32 = k as i32;
-        unsafe {
-            self.stream
-                .launch_builder(&self.quantize_x)
-                .arg(x)
-                .arg(&mut self.x_q8)
-                .arg(&k_i32)
-                .launch(cfg)
-                .map_err(|e| KernelError::Launch(e.to_string()))?;
-        }
-        Ok(())
+        let mut args = [
+            slice_ptr(x), slice_ptr_mut(&mut self.x_q8), scalar_ptr(&k_i32),
+        ];
+        unsafe { self.fast.launch(&self.quantize_x, cfg, &mut args) }
     }
 
     /// Fused quantized GEMV: out[N] = W[N,K] @ x[K]
@@ -87,19 +84,11 @@ impl GemvKernels {
         let n_i32 = n as i32;
         let k_i32 = k as i32;
 
-        unsafe {
-            self.stream
-                .launch_builder(kernel)
-                .arg(w)
-                .arg(x)
-                .arg(out)
-                .arg(&n_i32)
-                .arg(&k_i32)
-                .arg(&self.x_q8)
-                .launch(cfg)
-                .map_err(|e| KernelError::Launch(e.to_string()))?;
-        }
-
+        let mut args = [
+            slice_ptr(w), slice_ptr(x), slice_ptr_mut(out),
+            scalar_ptr(&n_i32), scalar_ptr(&k_i32), slice_ptr(&self.x_q8),
+        ];
+        unsafe { self.fast.launch(kernel, cfg, &mut args)?; }
         Ok(true)
     }
 }

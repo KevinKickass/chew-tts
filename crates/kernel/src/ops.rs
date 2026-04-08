@@ -1,5 +1,7 @@
+use crate::fast_launch::{FastStream, slice_ptr, slice_ptr_mut, view_ptr, view_mut_ptr, scalar_ptr};
 use crate::loader::{self, KernelError};
 use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, CudaStream, CudaView, CudaViewMut, LaunchConfig, PushKernelArg};
+use std::ffi::c_void;
 use std::sync::Arc;
 
 const OPS_CU: &str = include_str!("cuda/ops.cu");
@@ -7,6 +9,7 @@ const OPS_CU: &str = include_str!("cuda/ops.cu");
 /// Transformer operation kernels — one set per GPU.
 pub struct OpsKernels {
     stream: Arc<CudaStream>,
+    fast: FastStream,
     _module: Arc<CudaModule>,
     rms_norm: CudaFunction,
     rms_norm_f32in: CudaFunction,
@@ -32,6 +35,7 @@ impl OpsKernels {
 
         Ok(Self {
             stream: Arc::clone(stream),
+            fast: FastStream::new(stream),
             rms_norm: loader::get_fn(&module, "rms_norm")?,
             rms_norm_f32in: loader::get_fn(&module, "rms_norm_f32in")?,
             rope: loader::get_fn(&module, "rope")?,
@@ -111,17 +115,11 @@ impl OpsKernels {
 
         let dim_i = dim as i32;
 
-        unsafe {
-            self.stream
-                .launch_builder(&self.rms_norm_f32in)
-                .arg(x)
-                .arg(weight)
-                .arg(out)
-                .arg(&dim_i)
-                .arg(&eps)
-                .launch(cfg)
-                .map_err(|e| KernelError::Launch(e.to_string()))?;
-        }
+        let mut args: [*mut c_void; 5] = [
+            slice_ptr(x), slice_ptr(weight), slice_ptr_mut(out),
+            scalar_ptr(&dim_i), scalar_ptr(&eps),
+        ];
+        unsafe { self.fast.launch(&self.rms_norm_f32in, cfg, &mut args)? }
 
         Ok(())
     }
@@ -147,17 +145,11 @@ impl OpsKernels {
         let nh = n_heads as i32;
         let p = pos as i32;
 
-        unsafe {
-            self.stream
-                .launch_builder(&self.rope)
-                .arg(x)
-                .arg(&hd)
-                .arg(&nh)
-                .arg(&p)
-                .arg(&theta_base)
-                .launch(cfg)
-                .map_err(|e| KernelError::Launch(e.to_string()))?;
-        }
+        let mut args: [*mut c_void; 5] = [
+            slice_ptr_mut(x), scalar_ptr(&hd), scalar_ptr(&nh),
+            scalar_ptr(&p), scalar_ptr(&theta_base),
+        ];
+        unsafe { self.fast.launch(&self.rope, cfg, &mut args)? }
 
         Ok(())
     }
@@ -180,16 +172,11 @@ impl OpsKernels {
 
         let n_i = n as i32;
 
-        unsafe {
-            self.stream
-                .launch_builder(&self.silu)
-                .arg(gate)
-                .arg(up)
-                .arg(out)
-                .arg(&n_i)
-                .launch(cfg)
-                .map_err(|e| KernelError::Launch(e.to_string()))?;
-        }
+        let mut args: [*mut c_void; 4] = [
+            slice_ptr(gate), slice_ptr(up), slice_ptr_mut(out),
+            scalar_ptr(&n_i),
+        ];
+        unsafe { self.fast.launch(&self.silu, cfg, &mut args)? }
 
         Ok(())
     }
@@ -338,18 +325,11 @@ impl OpsKernels {
             shared_mem_bytes: threads * 4,
         };
         let dim_i = dim as i32;
-        unsafe {
-            self.stream
-                .launch_builder(&self.fused_add_rmsnorm)
-                .arg(hidden)
-                .arg(delta)
-                .arg(weight)
-                .arg(norm_out)
-                .arg(&dim_i)
-                .arg(&eps)
-                .launch(cfg)
-                .map_err(|e| KernelError::Launch(e.to_string()))?;
-        }
+        let mut args: [*mut c_void; 6] = [
+            slice_ptr_mut(hidden), slice_ptr(delta), slice_ptr(weight),
+            slice_ptr_mut(norm_out), scalar_ptr(&dim_i), scalar_ptr(&eps),
+        ];
+        unsafe { self.fast.launch(&self.fused_add_rmsnorm, cfg, &mut args)? }
         Ok(())
     }
 
@@ -368,15 +348,10 @@ impl OpsKernels {
             shared_mem_bytes: 0,
         };
         let n_i = n as i32;
-        unsafe {
-            self.stream
-                .launch_builder(&self.add_inplace_f32_f16)
-                .arg(hidden)
-                .arg(delta)
-                .arg(&n_i)
-                .launch(cfg)
-                .map_err(|e| KernelError::Launch(e.to_string()))?;
-        }
+        let mut args: [*mut c_void; 3] = [
+            slice_ptr_mut(hidden), slice_ptr(delta), scalar_ptr(&n_i),
+        ];
+        unsafe { self.fast.launch(&self.add_inplace_f32_f16, cfg, &mut args)? }
         Ok(())
     }
 
@@ -427,15 +402,10 @@ impl OpsKernels {
 
         let n_i = n as i32;
 
-        unsafe {
-            self.stream
-                .launch_builder(&self.copy_f16)
-                .arg(src)
-                .arg(dst)
-                .arg(&n_i)
-                .launch(cfg)
-                .map_err(|e| KernelError::Launch(e.to_string()))?;
-        }
+        let mut args: [*mut c_void; 3] = [
+            slice_ptr(src), view_mut_ptr(dst), scalar_ptr(&n_i),
+        ];
+        unsafe { self.fast.launch(&self.copy_f16, cfg, &mut args)? }
 
         Ok(())
     }
@@ -503,15 +473,10 @@ impl OpsKernels {
             shared_mem_bytes: 0,
         };
         let n_i = n as i32;
-        unsafe {
-            self.stream
-                .launch_builder(&self.argmax_f16)
-                .arg(x)
-                .arg(out)
-                .arg(&n_i)
-                .launch(cfg)
-                .map_err(|e| KernelError::Launch(e.to_string()))?;
-        }
+        let mut args: [*mut c_void; 3] = [
+            slice_ptr(x), slice_ptr_mut(out), scalar_ptr(&n_i),
+        ];
+        unsafe { self.fast.launch(&self.argmax_f16, cfg, &mut args)? }
         Ok(())
     }
 
@@ -580,23 +545,13 @@ impl OpsKernels {
         let po = pos_offset as i32;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
 
-        unsafe {
-            self.stream
-                .launch_builder(&self.mha_fused)
-                .arg(q)
-                .arg(k)
-                .arg(v)
-                .arg(out)
-                .arg(&hd)
-                .arg(&nh)
-                .arg(&nkv)
-                .arg(&sl)
-                .arg(&kvl)
-                .arg(&po)
-                .arg(&scale)
-                .launch(cfg)
-                .map_err(|e| KernelError::Launch(e.to_string()))?;
-        }
+        let mut args: [*mut c_void; 11] = [
+            slice_ptr(q), view_ptr(k), view_ptr(v), slice_ptr_mut(out),
+            scalar_ptr(&hd), scalar_ptr(&nh), scalar_ptr(&nkv),
+            scalar_ptr(&sl), scalar_ptr(&kvl), scalar_ptr(&po),
+            scalar_ptr(&scale),
+        ];
+        unsafe { self.fast.launch(&self.mha_fused, cfg, &mut args)? }
 
         Ok(())
     }

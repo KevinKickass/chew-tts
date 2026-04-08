@@ -35,3 +35,5 @@ impl GpuKernels {
         })
     }
 }
+pub mod fast_launch;
+pub use fast_launch::FastStream;
