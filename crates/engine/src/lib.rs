@@ -277,63 +277,97 @@ impl ChewEngine {
         let use_graph = std::env::var("CHEW_NO_GRAPH").is_err() && max_new_tokens > 20;
         let mut decode_graph: Option<forward::DecodeGraph> = None;
 
-        for _step in 1..max_new_tokens {
-            let last = *all_tokens.last().unwrap();
-            let tok_i32 = [last as i32];
-            self.stream
-                .memcpy_htod(&tok_i32, &mut tok_gpu)
+        let greedy = params.temperature == 0.0;
+
+        if greedy {
+            // ZERO-SYNC GREEDY PATH:
+            // All tokens stay on GPU. argmax→tok_gpu→embed_tokens chain has no host roundtrip.
+            // GPU token buffer stores all generated token IDs. Batch download at end.
+            let mut token_buf_gpu = self.stream
+                .alloc_zeros::<i32>(max_new_tokens as usize)
                 .map_err(EngineError::Driver)?;
+            let mut n_generated = 0u32;
 
-            self.kernels.ops.embed_tokens_f32(
-                &self.weights.token_embd,
-                &tok_gpu,
-                &mut decode_hidden,
-                1,
-                self.config.dim,
-            )?;
-
-            if use_graph {
-                if let Some(ref mut dg) = decode_graph {
-                    // Replay: update params + single graph launch
-                    let pos = self.kv_cache.pos();
-                    dg.replay(pos, self.kv_cache.kv_stride(), &self.stream)?;
-                    self.kv_cache.advance(1);
-                } else {
-                    // First decode step: capture the graph
-                    let pos = self.kv_cache.pos();
-                    decode_graph = Some(forward::DecodeGraph::capture(
-                        &mut decode_hidden,
-                        &self.weights,
-                        &self.config,
-                        &mut self.kernels,
-                        &mut self.kv_cache,
-                        &mut self.scratch,
-                        pos,
-                        &self.stream,
-                    )?);
+            for _step in 1..max_new_tokens {
+                if _step == 1 {
+                    // First decode: upload token from host
+                    let last = *all_tokens.last().unwrap();
+                    let tok_i32 = [last as i32];
+                    self.stream.memcpy_htod(&tok_i32, &mut tok_gpu)
+                        .map_err(EngineError::Driver)?;
                 }
-            } else {
-                forward::forward(
-                    &mut decode_hidden,
-                    &self.weights,
-                    &self.config,
-                    &mut self.kernels,
-                    &mut self.kv_cache,
-                    &mut self.scratch,
-                    1,
-                )?;
-            }
+                // else: tok_gpu already has argmax from previous step
 
-            // Greedy: GPU argmax (4 bytes). Non-greedy: CPU sampling with heap-based top-K.
-            if params.temperature == 0.0 {
+                self.kernels.ops.embed_tokens_f32(
+                    &self.weights.token_embd, &tok_gpu, &mut decode_hidden, 1, self.config.dim,
+                )?;
+
+                if use_graph {
+                    if let Some(ref mut dg) = decode_graph {
+                        let pos = self.kv_cache.pos();
+                        dg.replay(pos, self.kv_cache.kv_stride(), &self.stream)?;
+                        self.kv_cache.advance(1);
+                    } else {
+                        let pos = self.kv_cache.pos();
+                        decode_graph = Some(forward::DecodeGraph::capture(
+                            &mut decode_hidden, &self.weights, &self.config,
+                            &mut self.kernels, &mut self.kv_cache, &mut self.scratch,
+                            pos, &self.stream,
+                        )?);
+                    }
+                } else {
+                    forward::forward(
+                        &mut decode_hidden, &self.weights, &self.config,
+                        &mut self.kernels, &mut self.kv_cache, &mut self.scratch, 1,
+                    )?;
+                }
+
+                // GPU argmax → tok_gpu (stays on GPU)
                 self.kernels.ops.argmax_f16(
                     &self.scratch.logits, &mut tok_gpu, self.config.vocab_size,
                 )?;
-                let mut result = [0i32];
-                self.stream.memcpy_dtoh(&tok_gpu, &mut result)
+
+                // Copy token to GPU buffer (1 int, async, no sync)
+                // Use a tiny device-to-device copy
+                {
+                    let mut dst = token_buf_gpu.slice_mut(n_generated as usize..(n_generated + 1) as usize);
+                    self.stream.memcpy_dtod(&tok_gpu, &mut dst)
+                        .map_err(EngineError::Driver)?;
+                }
+                n_generated += 1;
+
+                // NO HOST SYNC — entire loop runs without host-GPU synchronization
+            }
+
+            // Batch download ALL tokens at end (one sync for all)
+            if n_generated > 0 {
+                let mut host_tokens = vec![0i32; n_generated as usize];
+                let src = token_buf_gpu.slice(0..n_generated as usize);
+                self.stream.memcpy_dtoh(&src, &mut host_tokens)
                     .map_err(EngineError::Driver)?;
-                next_token = result[0] as u32;
-            } else {
+                for &t in &host_tokens {
+                    let tok = t as u32;
+                    generated.push(tok);
+                    if tok == eos_token { break; } // truncate at EOS
+                }
+            }
+        } else {
+            // Non-greedy: CPU sampling, per-step sync (slower but supports top-k/top-p)
+            for _step in 1..max_new_tokens {
+                let last = *all_tokens.last().unwrap();
+                let tok_i32 = [last as i32];
+                self.stream.memcpy_htod(&tok_i32, &mut tok_gpu)
+                    .map_err(EngineError::Driver)?;
+
+                self.kernels.ops.embed_tokens_f32(
+                    &self.weights.token_embd, &tok_gpu, &mut decode_hidden, 1, self.config.dim,
+                )?;
+
+                forward::forward(
+                    &mut decode_hidden, &self.weights, &self.config,
+                    &mut self.kernels, &mut self.kv_cache, &mut self.scratch, 1,
+                )?;
+
                 self.stream.memcpy_dtoh(
                     &self.scratch.logits.slice(0..vocab), &mut logits_f16,
                 ).map_err(EngineError::Driver)?;
@@ -341,12 +375,9 @@ impl ChewEngine {
                     logits_f32[i] = v.to_f32();
                 }
                 next_token = sample::sample_token(&mut logits_f32, params, &all_tokens);
-            }
-            generated.push(next_token);
-            all_tokens.push(next_token);
-
-            if next_token == eos_token {
-                break;
+                generated.push(next_token);
+                all_tokens.push(next_token);
+                if next_token == eos_token { break; }
             }
         }
 
