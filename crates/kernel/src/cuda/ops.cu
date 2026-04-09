@@ -378,25 +378,27 @@ __global__ void fused_rope_kv(
 }
 
 // --- SiLU + Q8_1 quantize fused ---
-// Computes SiLU(gate) * up and simultaneously quantizes the result to Q8_1.
-// Each warp handles 32 elements (= 1 Q8_1 block).
-// Grid: ((n+31)/32,), Block: (256,) — 8 warps, each handles 1 Q8_1 block.
+// Computes SiLU(gate) * up, writes f16 output, AND quantizes to Q8_1.
+// Quantizes from the f16 round-tripped value (matching separate silu+quantize pipeline).
+// Grid: ((n+255)/256,), Block: (256,)
 __global__ void silu_q8(const __half* __restrict__ gate,
                          const __half* __restrict__ up,
                          __half* __restrict__ out,
                          void* __restrict__ x_q8,
                          int n) {
-    const int block_base = (blockIdx.x * blockDim.x + threadIdx.x) / 32 * 32;
-    const int in_block = threadIdx.x % 32;
-    const int idx = block_base + in_block;
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
 
+    // SiLU(gate) * up
     float g = __half2float(gate[idx]);
     float u = __half2float(up[idx]);
-    float val = g / (1.0f + expf(-g)) * u;  // SiLU(gate) * up
-    out[idx] = __float2half(val);
+    __half val_f16 = __float2half(g / (1.0f + expf(-g)) * u);
+    out[idx] = val_f16;
 
-    // Q8_1 quantize — warp-level reduction for this block of 32
+    // Q8_1 quantize from f16 (matches separate quantize_input precision)
+    float val = __half2float(val_f16);
+    const int lane = threadIdx.x % 32;
+
     float amax = fabsf(val);
     float wsum = val;
     #pragma unroll
@@ -407,14 +409,93 @@ __global__ void silu_q8(const __half* __restrict__ gate,
 
     float d = amax / 127.0f;
     float id = (d != 0.0f) ? 1.0f / d : 0.0f;
-    signed char q = (signed char)__float2int_rn(val * id);
+    int8_t q = (int8_t)__float2int_rn(val * id);
 
-    int q8_block = block_base / 32;
-    unsigned char* block_ptr = (unsigned char*)x_q8 + q8_block * 36;
-    if (in_block == 0) {
+    int q8_block = idx / 32;
+    uint8_t* block_ptr = (uint8_t*)x_q8 + q8_block * 36;
+    if (lane == 0) {
         *(half2*)(block_ptr) = make_half2(__float2half(d), __float2half(wsum));
     }
-    ((signed char*)(block_ptr + 4))[in_block] = q;
+    ((int8_t*)(block_ptr + 4))[lane] = q;
+}
+
+// --- MHA output quantize fused ---
+// After MHA writes to attn_mha_out, quantize it to Q8_1 for the output projection GEMV.
+// This fuses the separate quantize_input call.
+// Grid: ((n+255)/256,), Block: (256,)
+__global__ void quantize_f16_q8_1(const __half* __restrict__ x,
+                                    void* __restrict__ x_q8,
+                                    int n) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+
+    const float val = __half2float(x[idx]);
+    const int lane = threadIdx.x % 32;
+
+    float amax = fabsf(val);
+    float wsum = val;
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, offset));
+        wsum += __shfl_xor_sync(0xFFFFFFFF, wsum, offset);
+    }
+
+    float d = amax / 127.0f;
+    float id = (d != 0.0f) ? 1.0f / d : 0.0f;
+    int8_t q = (int8_t)__float2int_rn(val * id);
+
+    int q8_block = idx / 32;
+    uint8_t* block_ptr = (uint8_t*)x_q8 + q8_block * 36;
+    if (lane == 0) {
+        *(half2*)(block_ptr) = make_half2(__float2half(d), __float2half(wsum));
+    }
+    ((int8_t*)(block_ptr + 4))[lane] = q;
+}
+
+// --- RoPE + KV cache write fused ---
+// One block per (seq_pos, head). Threads iterate over pairs.
+// Grid: (seq_len, n_heads + n_kv_heads,), Block: (min(head_dim/2, 256),)
+__global__ void rope_kv_write(
+    __half* __restrict__ q,
+    __half* __restrict__ k,
+    const __half* __restrict__ v,
+    __half* __restrict__ k_cache_base,
+    __half* __restrict__ v_cache_base,
+    int head_dim, int n_heads, int n_kv_heads,
+    int pos, float theta_base,
+    int kv_stride, int kv_offset) {
+    int seq_idx = blockIdx.x;
+    int head_idx = blockIdx.y;
+    int half_dim = head_dim / 2;
+
+    for (int pair_idx = threadIdx.x; pair_idx < half_dim; pair_idx += blockDim.x) {
+        float freq = 1.0f / powf(theta_base, (float)(2 * pair_idx) / (float)head_dim);
+        float angle = (float)(pos + seq_idx) * freq;
+        float cos_a = cosf(angle);
+        float sin_a = sinf(angle);
+
+        if (head_idx < n_heads) {
+            int off = seq_idx * n_heads * head_dim + head_idx * head_dim + pair_idx * 2;
+            float x0 = __half2float(q[off]);
+            float x1 = __half2float(q[off + 1]);
+            q[off]     = __float2half(x0 * cos_a - x1 * sin_a);
+            q[off + 1] = __float2half(x0 * sin_a + x1 * cos_a);
+        } else {
+            int kv_head = head_idx - n_heads;
+            int scratch_off = seq_idx * n_kv_heads * head_dim + kv_head * head_dim + pair_idx * 2;
+            float x0 = __half2float(k[scratch_off]);
+            float x1 = __half2float(k[scratch_off + 1]);
+            float k0 = x0 * cos_a - x1 * sin_a;
+            float k1 = x0 * sin_a + x1 * cos_a;
+            k[scratch_off]     = __float2half(k0);
+            k[scratch_off + 1] = __float2half(k1);
+            int cache_off = kv_offset + seq_idx * kv_stride + kv_head * head_dim + pair_idx * 2;
+            k_cache_base[cache_off]     = __float2half(k0);
+            k_cache_base[cache_off + 1] = __float2half(k1);
+            v_cache_base[cache_off]     = v[scratch_off];
+            v_cache_base[cache_off + 1] = v[scratch_off + 1];
+        }
+    }
 }
 
 // --- SiLU (Sigmoid Linear Unit) --- f16 version

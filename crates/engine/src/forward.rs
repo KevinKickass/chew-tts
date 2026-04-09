@@ -253,10 +253,11 @@ pub fn forward(
             )
         })?;
 
-        // 6. Output projection — quantize mha_out for GEMV
+        // 6. Output projection — quantize mha_out for GEMV (reuse existing quantize_input)
         if seq_len == 1 {
             kernels.gemv.quantize_input(&scratch.attn_mha_out, config.n_heads * config.head_dim)?;
         }
+        // Note: quantize_input is cheap (~1µs) and hard to fuse with MHA output write
         timed!(t_gemm, gemm_q(kernels, &scratch.attn_mha_out, &layer.attn_output, &mut scratch.attn_out,
             seq_len, config.dim, config.n_heads * config.head_dim))?;
 
@@ -302,7 +303,7 @@ pub fn forward(
             seq_len * config.ff_dim,
         ))?;
 
-        // 11. Down projection — quantize silu_out for GEMV
+        // 11. Quantize for down projection GEMV
         if seq_len == 1 {
             kernels.gemv.quantize_input(&scratch.ffn_silu_out, config.ff_dim)?;
         }

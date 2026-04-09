@@ -49,6 +49,8 @@ pub struct OpsKernels {
     gelu_act: CudaFunction,
     gather_rows_quant: CudaFunction,
     pe_strided_mul: CudaFunction,
+    // Fused kernels for launch reduction
+    rope_kv_write: CudaFunction,
 }
 
 impl OpsKernels {
@@ -95,6 +97,7 @@ impl OpsKernels {
             gelu_act: loader::get_fn(&module, "gelu_act")?,
             gather_rows_quant: loader::get_fn(&module, "gather_rows_quant")?,
             pe_strided_mul: loader::get_fn(&module, "pe_strided_mul")?,
+            rope_kv_write: loader::get_fn(&module, "rope_kv_write")?,
             _module: module,
         })
     }
@@ -1098,6 +1101,47 @@ impl OpsKernels {
             scalar_ptr(&lo_i), scalar_ptr(&nt_i),
         ];
         unsafe { self.fast.launch(&self.pe_strided_mul, cfg, &mut args)? }
+        Ok(())
+    }
+
+    /// Fused RoPE Q+K + KV cache write (4 ops → 1 launch).
+    /// Takes BASE pointers for K/V cache to avoid Rust double-borrow issues.
+    pub fn rope_kv_write(
+        &self,
+        q: &mut CudaSlice<half::f16>,
+        k: &mut CudaSlice<half::f16>,
+        v: &CudaSlice<half::f16>,
+        k_cache_base: &mut CudaSlice<half::f16>,
+        v_cache_base: &mut CudaSlice<half::f16>,
+        head_dim: u32,
+        n_heads: u32,
+        n_kv_heads: u32,
+        seq_len: u32,
+        pos: u32,
+        theta_base: f32,
+        kv_stride: u32,
+        kv_offset: u32,
+    ) -> Result<(), KernelError> {
+        let threads = 256u32.min(head_dim / 2);
+        let cfg = LaunchConfig {
+            grid_dim: (seq_len, n_heads + n_kv_heads, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let hd = head_dim as i32;
+        let nh = n_heads as i32;
+        let nkv = n_kv_heads as i32;
+        let p = pos as i32;
+        let kvs = kv_stride as i32;
+        let kvo = kv_offset as i32;
+        let mut args: [*mut c_void; 12] = [
+            slice_ptr_mut(q), slice_ptr_mut(k), slice_ptr(v),
+            slice_ptr_mut(k_cache_base), slice_ptr_mut(v_cache_base),
+            scalar_ptr(&hd), scalar_ptr(&nh), scalar_ptr(&nkv),
+            scalar_ptr(&p), scalar_ptr(&theta_base),
+            scalar_ptr(&kvs), scalar_ptr(&kvo),
+        ];
+        unsafe { self.fast.launch(&self.rope_kv_write, cfg, &mut args)? }
         Ok(())
     }
 
