@@ -600,11 +600,25 @@ pub fn forward_moe_streaming(
 
         info!(layer_idx, hd, kv_heads, is_swa, q_dim = config.n_heads * hd, kv_dim = kv_heads * hd, "MoE layer start");
 
+        // Decode debug: sync after every op to find MISALIGNED source
+        let dbg_sync = seq_len == 1 && layer_idx == 0;
+        macro_rules! sync_check {
+            ($label:expr) => {
+                if dbg_sync {
+                    if let Err(e) = stream.synchronize() {
+                        tracing::error!(%e, label = $label, "CUDA ERROR in decode L0");
+                        return Err(KernelError::Launch(format!("{}: {e}", $label)));
+                    }
+                }
+            }
+        }
+
         // ── 1. Attention norm: f32 hidden → f16 norm_out ──
         kernels.ops.rms_norm_f32in(
             hidden, &layer.attn_norm, &mut scratch.norm_out,
             seq_len, config.dim, config.rms_norm_eps,
         )?;
+        sync_check!("attn_norm");
 
         // ── 2. QKV projections ──
         let q_dim = config.n_heads * hd;
@@ -615,13 +629,11 @@ pub fn forward_moe_streaming(
         }
 
         gemm_q(kernels, &scratch.norm_out, &layer.attn_q, &mut scratch.q,
-            seq_len, q_dim, config.dim)
-            .map_err(|e| { tracing::error!(layer_idx, m=seq_len, n=q_dim, k=config.dim, qtype=?layer.attn_q.quant_type, nelems=layer.attn_q.n_elements, "Q proj failed"); e })?;
-        info!(layer_idx, "Q proj OK");
+            seq_len, q_dim, config.dim)?;
+        sync_check!("Q_proj");
         gemm_q(kernels, &scratch.norm_out, &layer.attn_k, &mut scratch.k,
-            seq_len, kv_dim, config.dim)
-            .map_err(|e| { tracing::error!(layer_idx, m=seq_len, n=kv_dim, k=config.dim, qtype=?layer.attn_k.quant_type, nelems=layer.attn_k.n_elements, "K proj failed"); e })?;
-        info!(layer_idx, "K proj OK");
+            seq_len, kv_dim, config.dim)?;
+        sync_check!("K_proj");
 
         // V = K for shared-KV layers (full attention), or separate V
         if let Some(ref attn_v) = layer.attn_v {
@@ -653,6 +665,7 @@ pub fn forward_moe_streaming(
             info!(?d, "L0 decode Q first 4");
         }
 
+        sync_check!("V_proj");
         // ── 3. QK norms ──
         {
             let src_ptr = &scratch.q as *const CudaSlice<half::f16>;
@@ -686,6 +699,7 @@ pub fn forward_moe_streaming(
             }
         }
 
+        sync_check!("QKV_norms");
         // ── 4. RoPE ──
         if !is_swa {
             if let Some(ref ff) = moe_weights.rope_freq_factors {
@@ -700,6 +714,7 @@ pub fn forward_moe_streaming(
             kernels.ops.rope_neox(&mut scratch.k, seq_len, kv_heads, hd, pos, rope_theta)?;
         }
 
+        sync_check!("RoPE");
         // ── 5. KV cache write ──
         let kv_source = config.kv_source_layer(layer_idx);
         if has_kv {
@@ -714,6 +729,7 @@ pub fn forward_moe_streaming(
             }
         }
 
+        sync_check!("KV_write");
         // ── 6. Multi-Head Attention ──
         {
             let k_full = kv_cache.k_full(kv_source, total_kv_len);
