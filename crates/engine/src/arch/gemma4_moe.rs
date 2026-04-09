@@ -936,12 +936,11 @@ pub fn forward_moe_streaming(
                 let mut indexed: Vec<(usize, f32)> = probs.iter().cloned().enumerate().collect();
                 indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
                 let selected: Vec<(usize, f32)> = indexed.into_iter().take(top_k as usize).collect();
-                let sel_sum: f32 = selected.iter().map(|(_, w)| w).sum();
-
                 // ── 9e. Expert computation ──
+                // Use raw softmax weights (no renormalization — matches llama.cpp)
                 let mut first_expert = true;
                 for &(expert_id, weight) in &selected {
-                    let w_norm = weight / sel_sum;
+                    let w_norm = weight; // raw softmax probability
 
                     // Copy expert gate_up slice to scratch
                     let gu_info = expert_slice_info(&layer.moe_gate_up_exps, expert_id as u32, n_experts);
