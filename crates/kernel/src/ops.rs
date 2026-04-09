@@ -1177,8 +1177,9 @@ impl OpsKernels {
         scale: f32,
     ) -> Result<(), KernelError> {
         let threads = 128u32.min(head_dim);
-        // Parallel softmax: kv_len floats for scores + threads floats for reduction scratch
-        let smem = (kv_len + threads) * 4;
+        // Tiled MHA: fixed smem = (TILE_KV + threads) floats, independent of kv_len
+        let tile_kv = 128u32;
+        let smem = (tile_kv + threads) * 4;
         let cfg = LaunchConfig {
             grid_dim: (n_heads, seq_len, 1),
             block_dim: (threads, 1, 1),

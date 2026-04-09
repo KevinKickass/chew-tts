@@ -595,6 +595,13 @@ __global__ void copy_f16(const __half* __restrict__ src,
 //
 // --- Fused MHA with parallel softmax ---
 // Score materialization in shared memory, parallel softmax, weighted V sum.
+// --- Tiled MHA (used for both regular and graph paths) ---
+// Processes KV in tiles of MHA_TILE_KV with online softmax across tiles.
+// Fixed shared memory: (MHA_TILE_KV + blockDim.x) floats.
+// This replaces the old score-materializing MHA that needed kv_len * 4 bytes smem.
+#ifndef MHA_TILE_KV
+#define MHA_TILE_KV 128
+#endif
 __global__ void mha_fused(const __half* __restrict__ q,
                            const __half* __restrict__ k,
                            const __half* __restrict__ v,
@@ -609,90 +616,98 @@ __global__ void mha_fused(const __half* __restrict__ q,
     int head = blockIdx.x;
     int q_pos_local = blockIdx.y;
     int q_pos_global = pos_offset + q_pos_local;
-
     int kv_head = head / (n_heads / n_kv_heads);
 
     const __half* q_vec = q + q_pos_local * n_heads * head_dim + head * head_dim;
 
-    // Shared memory: kv_len floats for scores + blockDim.x for scratch
     extern __shared__ float smem[];
-    float* scores = smem;
-    float* scratch = smem + kv_len;
+    float* tile_scores = smem;
+    float* scratch = smem + MHA_TILE_KV;
 
-    // --- Step 1: Compute attention scores ---
-    for (int kp = 0; kp < kv_len; kp++) {
-        if (kp > q_pos_global) {
-            if (threadIdx.x == 0) scores[kp] = -1e30f;
-            continue;
-        }
+    // Online softmax state
+    float global_max = -1e30f;
+    float global_sum = 0.0f;
 
-        const __half* k_vec = k + kp * n_kv_heads * head_dim + kv_head * head_dim;
+    // Per-thread V accumulator
+    float v_acc[4] = {0,0,0,0};
+    int elems = (head_dim + (int)blockDim.x - 1) / (int)blockDim.x;
 
-        float dot = 0.0f;
-        for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
-            dot += __half2float(q_vec[d]) * __half2float(k_vec[d]);
-        }
-        scratch[threadIdx.x] = dot;
-        __syncthreads();
+    for (int tile_start = 0; tile_start < kv_len; tile_start += MHA_TILE_KV) {
+        int tile_end = tile_start + MHA_TILE_KV;
+        if (tile_end > kv_len) tile_end = kv_len;
+        int tile_size = tile_end - tile_start;
 
-        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-            if (threadIdx.x < s) scratch[threadIdx.x] += scratch[threadIdx.x + s];
+        // Compute scores for this tile
+        for (int t = 0; t < tile_size; t++) {
+            int kp = tile_start + t;
+            if (kp > q_pos_global) {
+                if (threadIdx.x == 0) tile_scores[t] = -1e30f;
+                __syncthreads();
+                continue;
+            }
+            const __half* k_vec = k + kp * n_kv_heads * head_dim + kv_head * head_dim;
+            float dot = 0.0f;
+            for (int d = threadIdx.x; d < head_dim; d += blockDim.x)
+                dot += __half2float(q_vec[d]) * __half2float(k_vec[d]);
+            scratch[threadIdx.x] = dot;
+            __syncthreads();
+            for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+                if (threadIdx.x < s) scratch[threadIdx.x] += scratch[threadIdx.x + s];
+                __syncthreads();
+            }
+            if (threadIdx.x == 0) tile_scores[t] = scratch[0] * scale;
             __syncthreads();
         }
 
-        if (threadIdx.x == 0) scores[kp] = scratch[0] * scale;
-        __syncthreads();
-    }
-
-    // --- Step 2: Parallel softmax ---
-    // Find max (parallel)
-    {
-        float local_max = -1e30f;
-        for (int kp = threadIdx.x; kp < kv_len; kp += blockDim.x) {
-            if (scores[kp] > local_max) local_max = scores[kp];
-        }
-        scratch[threadIdx.x] = local_max;
+        // Tile max
+        float tile_max = -1e30f;
+        for (int t = threadIdx.x; t < tile_size; t += blockDim.x)
+            if (tile_scores[t] > tile_max) tile_max = tile_scores[t];
+        scratch[threadIdx.x] = tile_max;
         __syncthreads();
         for (int s = blockDim.x / 2; s > 0; s >>= 1) {
             if (threadIdx.x < s) scratch[threadIdx.x] = fmaxf(scratch[threadIdx.x], scratch[threadIdx.x + s]);
             __syncthreads();
         }
-    }
-    float max_val = scratch[0];
+        tile_max = scratch[0];
 
-    // Exp + parallel sum
-    {
-        float local_sum = 0.0f;
-        for (int kp = threadIdx.x; kp < kv_len; kp += blockDim.x) {
-            float e = expf(scores[kp] - max_val);
-            scores[kp] = e;
-            local_sum += e;
-        }
-        scratch[threadIdx.x] = local_sum;
+        // Online softmax merge
+        float new_max = fmaxf(global_max, tile_max);
+        float old_scale_factor = expf(global_max - new_max);
+        float tile_scale_factor = expf(tile_max - new_max);
+
+        for (int e = 0; e < elems; e++) v_acc[e] *= old_scale_factor;
+        global_sum *= old_scale_factor;
+
+        for (int t = threadIdx.x; t < tile_size; t += blockDim.x)
+            tile_scores[t] = expf(tile_scores[t] - tile_max) * tile_scale_factor;
         __syncthreads();
-        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-            if (threadIdx.x < s) scratch[threadIdx.x] += scratch[threadIdx.x + s];
-            __syncthreads();
+
+        float tile_sum = 0.0f;
+        for (int t = 0; t < tile_size; t++) tile_sum += tile_scores[t];
+        global_sum += tile_sum;
+
+        // Accumulate weighted V
+        for (int e = 0; e < elems; e++) {
+            int d = threadIdx.x + e * blockDim.x;
+            if (d < head_dim) {
+                float acc = 0.0f;
+                for (int t = 0; t < tile_size; t++) {
+                    int kp = tile_start + t;
+                    acc += tile_scores[t] * __half2float(v[kp * n_kv_heads * head_dim + kv_head * head_dim + d]);
+                }
+                v_acc[e] += acc;
+            }
         }
+        global_max = new_max;
     }
-    float inv_sum = 1.0f / scratch[0];
 
-    // Normalize
-    for (int kp = threadIdx.x; kp < kv_len; kp += blockDim.x) {
-        scores[kp] *= inv_sum;
-    }
-    __syncthreads();
-
-    // --- Step 3: Weighted sum of V ---
+    // Write output
     __half* out_vec = out + q_pos_local * n_heads * head_dim + head * head_dim;
-
-    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
-        float acc = 0.0f;
-        for (int kp = 0; kp < kv_len; kp++) {
-            const __half* v_vec = v + kp * n_kv_heads * head_dim + kv_head * head_dim;
-            acc += scores[kp] * __half2float(v_vec[d]);
-        }
-        out_vec[d] = __float2half(acc);
+    float inv = (global_sum > 0.0f) ? 1.0f / global_sum : 0.0f;
+    for (int e = 0; e < elems; e++) {
+        int d = threadIdx.x + e * blockDim.x;
+        if (d < head_dim) out_vec[d] = __float2half(v_acc[e] * inv);
     }
 }
 
