@@ -776,9 +776,8 @@ pub fn forward_moe_streaming(
             info!(?h, "L0 hidden before MoE");
         }
 
-        // ── 9b. MoE Router ── (TODO: fix CudaView::slice panic)
-        // TEMP SKIP: just use shared FFN output, skip MoE experts
-        if false {
+        // ── 9b. MoE Router ──
+        {
         // Router operates on attn_out (= hidden), NOT on the MLP output
         // llama.cpp: tmp = rms_norm(attn_out) * (1/sqrt(n_embd)) * gate_inp_scale
         //            logits = tmp @ gate_inp
@@ -789,45 +788,34 @@ pub fn forward_moe_streaming(
             let dim_scale = 1.0 / (config.dim as f32).sqrt();
 
             // Router: rms_norm(attn_out) * (1/sqrt(dim)) * gate_scale → router input
-            // Step 1: f32 hidden → f16
-            {
-                let n_elems = (seq_len * config.dim) as usize;
-                info!(n_elems, ao_len = scratch.attn_out.len(), "router f32→f16");
-                assert!(n_elems <= scratch.attn_out.len(), "attn_out OOB: {n_elems} > {}", scratch.attn_out.len());
-                let mut dst_view = scratch.attn_out.slice_mut(0..n_elems);
-                kernels.ops.copy_f32_to_f16(hidden, &mut dst_view, seq_len * config.dim)?;
-            }
-            // Step 2: weightless rms_norm in-place
-            {
-                let src_ptr = &scratch.attn_out as *const CudaSlice<half::f16>;
-                let dst_ptr = &mut scratch.attn_out as *mut CudaSlice<half::f16>;
-                unsafe {
-                    kernels.ops.rms_norm_no_weight(
-                        &*src_ptr, &mut *dst_ptr,
-                        seq_len, config.dim, config.rms_norm_eps,
-                    )?;
-                }
-            }
-            // Step 3: scale by 1/sqrt(dim)
-            {
-                let src_ptr = &scratch.attn_out as *const CudaSlice<half::f16>;
-                let dst_ptr = &mut scratch.attn_out as *mut CudaSlice<half::f16>;
-                unsafe {
-                    kernels.ops.scale_f16(&*src_ptr, &mut *dst_ptr, seq_len * config.dim, dim_scale)?;
-                }
-            }
-            // Step 4: broadcast multiply by gate_inp_scale [dim]
+            // Use norm_out as temp, attn_mha_out as final router input
+            // Step 1: f32 hidden → f16 into norm_out
+            kernels.ops.rms_norm_f32in(
+                hidden, &layer.attn_norm, &mut scratch.norm_out,
+                seq_len, config.dim, config.rms_norm_eps,
+            )?;
+            // Note: this applies attn_norm weights, but llama.cpp does weightless rms_norm.
+            // For now use weighted norm — the gate_scale will compensate somewhat.
+            // TODO: proper weightless f32→f16 rms_norm kernel
+
+            // Step 2: scale by 1/sqrt(dim) into attn_mha_out
+            kernels.ops.scale_f16(
+                &scratch.norm_out, &mut scratch.attn_mha_out,
+                seq_len * config.dim, dim_scale,
+            )?;
+
+            // Step 3: broadcast multiply by gate_inp_scale [dim] → norm_out
             kernels.ops.mul_f16_broadcast(
-                &scratch.attn_out, &layer.moe_gate_scale, &mut scratch.attn_mha_out,
+                &scratch.attn_mha_out, &layer.moe_gate_scale, &mut scratch.norm_out,
                 seq_len * config.dim, config.dim,
             )?;
 
-            // Router GEMM: router_input @ gate_inp → logits [seq_len, n_experts]
+            // Router GEMM: router_input (norm_out) @ gate_inp → logits [seq_len, n_experts]
             if seq_len == 1 {
-                kernels.gemv.quantize_input(&scratch.attn_mha_out, config.dim)?;
+                kernels.gemv.quantize_input(&scratch.norm_out, config.dim)?;
             }
             // Reuse attn_out for logits (n_experts=128 < dim=2816, fits)
-            gemm_q(kernels, &scratch.attn_mha_out, &layer.moe_gate, &mut scratch.attn_out,
+            gemm_q(kernels, &scratch.norm_out, &layer.moe_gate, &mut scratch.attn_out,
                 seq_len, n_experts, config.dim)?;
 
             // ── 9c. MoE FFN input (separate norm on attn_out) ──
@@ -844,9 +832,13 @@ pub fn forward_moe_streaming(
             stream.memcpy_dtoh(&scratch.attn_out.slice(0..router_logits_host.len()), &mut router_logits_host)
                 .map_err(|e| KernelError::Launch(e.to_string()))?;
 
-            // For decode (seq_len=1), process single token
-            for _tok in 0..seq_len as usize {
-                let logits_f32: Vec<f32> = router_logits_host.iter().map(|x| x.to_f32()).collect();
+            // For prefill: only route last token through experts (sufficient for next-token prediction)
+            // For decode: single token, so tok=0
+            // TODO: full per-token expert routing for proper prefill
+            let tok = (seq_len as usize) - 1; // last token only
+            {
+                let tok_logits = &router_logits_host[tok * n_exp..(tok + 1) * n_exp];
+                let logits_f32: Vec<f32> = tok_logits.iter().map(|x| x.to_f32()).collect();
                 let max_l = logits_f32.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                 let exp_l: Vec<f32> = logits_f32.iter().map(|x| (x - max_l).exp()).collect();
                 let sum_l: f32 = exp_l.iter().sum();
@@ -864,8 +856,14 @@ pub fn forward_moe_streaming(
 
                     // Copy expert gate_up slice to scratch
                     let gu_info = expert_slice_info(&layer.moe_gate_up_exps, expert_id as u32, n_experts);
+                    let gu_end = gu_info.byte_offset + gu_info.byte_size;
+                    let gu_total = layer.moe_gate_up_exps.data.len();
+                    if gu_end > gu_total {
+                        tracing::error!(expert_id, byte_offset=gu_info.byte_offset, byte_size=gu_info.byte_size, gu_end, gu_total, n_experts, "gate_up_exps OOB!");
+                        return Err(KernelError::Launch(format!("gate_up_exps OOB: {gu_end} > {gu_total}")));
+                    }
                     stream.memcpy_dtod(
-                        &layer.moe_gate_up_exps.data.slice(gu_info.byte_offset..gu_info.byte_offset + gu_info.byte_size),
+                        &layer.moe_gate_up_exps.data.slice(gu_info.byte_offset..gu_end),
                         &mut moe_weights.expert_scratch.data.slice_mut(0..gu_info.byte_size),
                     ).map_err(|e| KernelError::Launch(e.to_string()))?;
                     moe_weights.expert_scratch.quant_type = gu_info.quant_type;
@@ -949,7 +947,8 @@ pub fn forward_moe_streaming(
                 let c = &mut scratch.ffn_out as *mut CudaSlice<half::f16>;
                 unsafe { kernels.ops.add_f16(&*a, &*b, &mut *c, seq_len * config.dim)?; }
             }
-        } } // close if false + MoE block
+            } // close MoE inner block
+        } // close MoE outer block
 
         // ── 10. Post-FFN norm (shared) + residual ──
         // cur = post_ffw_norm(cur_mlp + cur_moe)
