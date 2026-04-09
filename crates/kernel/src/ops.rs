@@ -165,7 +165,7 @@ impl OpsKernels {
             slice_ptr(x), slice_ptr(weight), slice_ptr_mut(out),
             scalar_ptr(&dim_i), scalar_ptr(&eps),
         ];
-        unsafe { self.fast.launch(&self.rms_norm_f32in, cfg, &mut args)? }
+        unsafe { self.fast.fire(&self.rms_norm_f32in, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
 
         Ok(())
     }
@@ -195,7 +195,7 @@ impl OpsKernels {
             slice_ptr_mut(x), scalar_ptr(&hd), scalar_ptr(&nh),
             scalar_ptr(&p), scalar_ptr(&theta_base),
         ];
-        unsafe { self.fast.launch(&self.rope, cfg, &mut args)? }
+        unsafe { self.fast.fire(&self.rope, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
 
         Ok(())
     }
@@ -222,7 +222,7 @@ impl OpsKernels {
             slice_ptr(gate), slice_ptr(up), slice_ptr_mut(out),
             scalar_ptr(&n_i),
         ];
-        unsafe { self.fast.launch(&self.silu, cfg, &mut args)? }
+        unsafe { self.fast.fire(&self.silu, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
         Ok(())
     }
 
@@ -248,7 +248,7 @@ impl OpsKernels {
             slice_ptr(gate), slice_ptr(up), slice_ptr_mut(out),
             slice_ptr_mut(x_q8), scalar_ptr(&n_i),
         ];
-        unsafe { self.fast.launch(&self.silu_q8, cfg, &mut args)? }
+        unsafe { self.fast.fire(&self.silu_q8, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
 
         Ok(())
     }
@@ -401,7 +401,7 @@ impl OpsKernels {
             slice_ptr_mut(hidden), slice_ptr(delta), slice_ptr(weight),
             slice_ptr_mut(norm_out), scalar_ptr(&dim_i), scalar_ptr(&eps),
         ];
-        unsafe { self.fast.launch(&self.fused_add_rmsnorm, cfg, &mut args)? }
+        unsafe { self.fast.fire(&self.fused_add_rmsnorm, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
         Ok(())
     }
 
@@ -428,7 +428,7 @@ impl OpsKernels {
             slice_ptr(x), slice_ptr(weight), slice_ptr_mut(out),
             slice_ptr_mut(x_q8), scalar_ptr(&dim_i), scalar_ptr(&eps),
         ];
-        unsafe { self.fast.launch(&self.rms_norm_f32in_q8, cfg, &mut args)? }
+        unsafe { self.fast.fire(&self.rms_norm_f32in_q8, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
         Ok(())
     }
 
@@ -457,7 +457,7 @@ impl OpsKernels {
             slice_ptr_mut(norm_out), slice_ptr_mut(x_q8),
             scalar_ptr(&dim_i), scalar_ptr(&eps),
         ];
-        unsafe { self.fast.launch(&self.fused_add_rmsnorm_q8, cfg, &mut args)? }
+        unsafe { self.fast.fire(&self.fused_add_rmsnorm_q8, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
         Ok(())
     }
 
@@ -479,7 +479,7 @@ impl OpsKernels {
         let mut args: [*mut c_void; 3] = [
             slice_ptr_mut(hidden), slice_ptr(delta), scalar_ptr(&n_i),
         ];
-        unsafe { self.fast.launch(&self.add_inplace_f32_f16, cfg, &mut args)? }
+        unsafe { self.fast.fire(&self.add_inplace_f32_f16, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
         Ok(())
     }
 
@@ -533,7 +533,7 @@ impl OpsKernels {
         let mut args: [*mut c_void; 3] = [
             slice_ptr(src), view_mut_ptr(dst), scalar_ptr(&n_i),
         ];
-        unsafe { self.fast.launch(&self.copy_f16, cfg, &mut args)? }
+        unsafe { self.fast.fire(&self.copy_f16, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
 
         Ok(())
     }
@@ -604,7 +604,7 @@ impl OpsKernels {
         let mut args: [*mut c_void; 3] = [
             slice_ptr(x), slice_ptr_mut(out), scalar_ptr(&n_i),
         ];
-        unsafe { self.fast.launch(&self.argmax_f16, cfg, &mut args)? }
+        unsafe { self.fast.fire(&self.argmax_f16, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
         Ok(())
     }
 
@@ -666,7 +666,7 @@ impl OpsKernels {
             slice_ptr_mut(x), slice_ptr(decode_params),
             scalar_ptr(&hd), scalar_ptr(&nh), scalar_ptr(&theta_base),
         ];
-        unsafe { self.fast.launch(&self.rope_graph, cfg, &mut args)? }
+        unsafe { self.fast.fire(&self.rope_graph, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
         Ok(())
     }
 
@@ -692,7 +692,7 @@ impl OpsKernels {
             slice_ptr(src), slice_ptr_mut(dst_base), slice_ptr(decode_params),
             scalar_ptr(&n_i),
         ];
-        unsafe { self.fast.launch(&self.copy_f16_with_offset, cfg, &mut args)? }
+        unsafe { self.fast.fire(&self.copy_f16_with_offset, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
         Ok(())
     }
 
@@ -730,7 +730,7 @@ impl OpsKernels {
             scalar_ptr(&hd), scalar_ptr(&nh), scalar_ptr(&nkv),
             scalar_ptr(&sl), scalar_ptr(&scale),
         ];
-        unsafe { self.fast.launch(&self.mha_fused_graph, cfg, &mut args)? }
+        unsafe { self.fast.fire(&self.mha_fused_graph, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
         Ok(())
     }
 
@@ -758,7 +758,7 @@ impl OpsKernels {
             slice_ptr(gate), slice_ptr(up), slice_ptr_mut(out),
             scalar_ptr(&n_i),
         ];
-        unsafe { self.fast.launch(&self.gelu, cfg, &mut args)? }
+        unsafe { self.fast.fire(&self.gelu, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
         Ok(())
     }
 
@@ -782,7 +782,7 @@ impl OpsKernels {
             slice_ptr(x), slice_ptr_mut(out),
             scalar_ptr(&dim_i), scalar_ptr(&eps),
         ];
-        unsafe { self.fast.launch(&self.rms_norm_no_weight, cfg, &mut args)? }
+        unsafe { self.fast.fire(&self.rms_norm_no_weight, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
         Ok(())
     }
 
@@ -806,7 +806,7 @@ impl OpsKernels {
             slice_ptr(x), slice_ptr_mut(out),
             scalar_ptr(&n_i), scalar_ptr(&scale),
         ];
-        unsafe { self.fast.launch(&self.scale_f16, cfg, &mut args)? }
+        unsafe { self.fast.fire(&self.scale_f16, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
         Ok(())
     }
 
@@ -828,7 +828,7 @@ impl OpsKernels {
         let mut args: [*mut c_void; 3] = [
             slice_ptr_mut(x), scalar_ptr(&n_i), scalar_ptr(&scale),
         ];
-        unsafe { self.fast.launch(&self.scale_f32_inplace, cfg, &mut args)? }
+        unsafe { self.fast.fire(&self.scale_f32_inplace, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
         Ok(())
     }
 
@@ -852,7 +852,7 @@ impl OpsKernels {
             slice_ptr(x), slice_ptr_mut(out),
             scalar_ptr(&n_i), scalar_ptr(&cap),
         ];
-        unsafe { self.fast.launch(&self.logit_softcap, cfg, &mut args)? }
+        unsafe { self.fast.fire(&self.logit_softcap, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
         Ok(())
     }
 
@@ -875,7 +875,8 @@ impl OpsKernels {
             slice_ptr_mut(x),
             scalar_ptr(&n_i), scalar_ptr(&cap),
         ];
-        unsafe { self.fast.launch(&self.logit_softcap_inplace, cfg, &mut args) }
+        unsafe { self.fast.fire(&self.logit_softcap_inplace, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
+        Ok(())
     }
 
     /// RoPE NeoX-style: pairs are (x[i], x[i+d/2]) instead of (x[2i], x[2i+1]).
@@ -901,7 +902,7 @@ impl OpsKernels {
             slice_ptr_mut(x), scalar_ptr(&hd), scalar_ptr(&nh),
             scalar_ptr(&p), scalar_ptr(&theta_base),
         ];
-        unsafe { self.fast.launch(&self.rope_neox, cfg, &mut args)? }
+        unsafe { self.fast.fire(&self.rope_neox, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
         Ok(())
     }
 
@@ -930,7 +931,7 @@ impl OpsKernels {
             scalar_ptr(&hd), scalar_ptr(&nh),
             scalar_ptr(&p), scalar_ptr(&theta_base),
         ];
-        unsafe { self.fast.launch(&self.rope_neox_freqs, cfg, &mut args)? }
+        unsafe { self.fast.fire(&self.rope_neox_freqs, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
         Ok(())
     }
 
@@ -955,7 +956,7 @@ impl OpsKernels {
             slice_ptr_mut(x), slice_ptr(decode_params),
             scalar_ptr(&hd), scalar_ptr(&nh), scalar_ptr(&theta_base),
         ];
-        unsafe { self.fast.launch(&self.rope_neox_graph, cfg, &mut args)? }
+        unsafe { self.fast.fire(&self.rope_neox_graph, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
         Ok(())
     }
 
@@ -982,7 +983,7 @@ impl OpsKernels {
             slice_ptr_mut(hidden), slice_ptr(delta), slice_ptr(weight),
             slice_ptr_mut(norm_out), scalar_ptr(&dim_i), scalar_ptr(&eps),
         ];
-        unsafe { self.fast.launch(&self.post_norm_add, cfg, &mut args)? }
+        unsafe { self.fast.fire(&self.post_norm_add, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
         Ok(())
     }
 
@@ -1006,7 +1007,7 @@ impl OpsKernels {
             slice_ptr(a), slice_ptr(b), slice_ptr_mut(out),
             scalar_ptr(&n_i),
         ];
-        unsafe { self.fast.launch(&self.mul_f16, cfg, &mut args)? }
+        unsafe { self.fast.fire(&self.mul_f16, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
         Ok(())
     }
 
@@ -1030,7 +1031,7 @@ impl OpsKernels {
             slice_ptr(x), slice_ptr_mut(out),
             scalar_ptr(&n_i),
         ];
-        unsafe { self.fast.launch(&self.gelu_act, cfg, &mut args)? }
+        unsafe { self.fast.fire(&self.gelu_act, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
         Ok(())
     }
 
@@ -1063,7 +1064,7 @@ impl OpsKernels {
             slice_ptr(src), slice_ptr(token_ids), slice_ptr_mut(dst),
             scalar_ptr(&rb), scalar_ptr(&nt),
         ];
-        unsafe { self.fast.launch(&self.gather_rows_quant, cfg, &mut args)? }
+        unsafe { self.fast.fire(&self.gather_rows_quant, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
         Ok(())
     }
 
@@ -1100,7 +1101,7 @@ impl OpsKernels {
             scalar_ptr(&epl_i), scalar_ptr(&rw_i),
             scalar_ptr(&lo_i), scalar_ptr(&nt_i),
         ];
-        unsafe { self.fast.launch(&self.pe_strided_mul, cfg, &mut args)? }
+        unsafe { self.fast.fire(&self.pe_strided_mul, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
         Ok(())
     }
 
@@ -1141,7 +1142,7 @@ impl OpsKernels {
             scalar_ptr(&p), scalar_ptr(&theta_base),
             scalar_ptr(&kvs), scalar_ptr(&kvo),
         ];
-        unsafe { self.fast.launch(&self.rope_kv_write, cfg, &mut args)? }
+        unsafe { self.fast.fire(&self.rope_kv_write, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
         Ok(())
     }
 
@@ -1200,7 +1201,7 @@ impl OpsKernels {
             scalar_ptr(&sl), scalar_ptr(&kvl), scalar_ptr(&po),
             scalar_ptr(&scale),
         ];
-        unsafe { self.fast.launch(&self.mha_fused, cfg, &mut args)? }
+        unsafe { self.fast.fire(&self.mha_fused, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
 
         Ok(())
     }

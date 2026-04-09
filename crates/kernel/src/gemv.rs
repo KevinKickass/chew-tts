@@ -53,20 +53,17 @@ impl GemvKernels {
     /// Quantize input vector x (f16) to Q8_1 format.
     /// Must be called once before any gemv calls with the same x.
     pub fn quantize_input(&mut self, x: &CudaSlice<half::f16>, k: u32) -> Result<(), KernelError> {
-        let cfg = LaunchConfig {
-            grid_dim: ((k + 255) / 256, 1, 1),
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: 0,
-        };
         let k_i32 = k as i32;
         let mut args = [
             slice_ptr(x), slice_ptr_mut(&mut self.x_q8), scalar_ptr(&k_i32),
         ];
-        unsafe { self.fast.launch(&self.quantize_x, cfg, &mut args) }
+        unsafe { self.fast.fire(&self.quantize_x, ((k+255)/256, 1, 1), (256, 1, 1), 0, &mut args); }
+        Ok(())
     }
 
     /// Fused quantized GEMV: out[N] = W[N,K] @ x[K]
     /// Assumes quantize_input was called with the current x.
+    /// Uses fire-and-forget launch (no per-call error check).
     pub fn gemv(
         &self,
         w: &CudaSlice<u8>,
@@ -83,13 +80,6 @@ impl GemvKernels {
             _ => return Ok(false),
         };
 
-        // 1 row per block, 128 threads (4 warps)
-        let cfg = LaunchConfig {
-            grid_dim: (n, 1, 1),
-            block_dim: (128, 1, 1),
-            shared_mem_bytes: 0,
-        };
-
         let n_i32 = n as i32;
         let k_i32 = k as i32;
 
@@ -97,7 +87,7 @@ impl GemvKernels {
             slice_ptr(w), slice_ptr(x), slice_ptr_mut(out),
             scalar_ptr(&n_i32), scalar_ptr(&k_i32), slice_ptr(&self.x_q8),
         ];
-        unsafe { self.fast.launch(kernel, cfg, &mut args)?; }
+        unsafe { self.fast.fire(kernel, (n, 1, 1), (128, 1, 1), 0, &mut args); }
         Ok(true)
     }
 
@@ -132,7 +122,7 @@ impl GemvKernels {
             slice_ptr_mut(out_gate), slice_ptr_mut(out_up),
             scalar_ptr(&n_i32), scalar_ptr(&k_i32), slice_ptr(&self.x_q8),
         ];
-        unsafe { self.fast.launch(&self.dual_q4_k, cfg, &mut args)?; }
+        unsafe { self.fast.fire(&self.dual_q4_k, (n, 1, 1), (128, 1, 1), 0, &mut args); }
         Ok(true)
     }
 
