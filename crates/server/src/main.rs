@@ -21,6 +21,7 @@ struct AppState {
     engine: Mutex<ChewEngine>,
     tokenizer: Tokenizer,
     model_name: String,
+    arch: String,
     eos_token_id: u32,
 }
 
@@ -86,10 +87,12 @@ async fn main() -> anyhow::Result<()> {
     let model_name = engine.config().arch.clone();
     info!(arch = %model_name, "model loaded, starting server");
 
+    let arch = model_name.clone();
     let state = Arc::new(AppState {
         engine: Mutex::new(engine),
         tokenizer,
         model_name,
+        arch,
         eos_token_id,
     });
 
@@ -208,7 +211,13 @@ async fn chat_completions(
         .encode(prompt.as_str(), false)
         .map_err(|e| AppError(format!("tokenize: {e}")))?;
 
-    let input_tokens: Vec<u32> = encoding.get_ids().to_vec();
+    let mut input_tokens: Vec<u32> = encoding.get_ids().to_vec();
+    // Add BOS token for models that need it (Gemma, etc.)
+    if state.arch != "llama" {
+        // Llama chat template already includes <|begin_of_text|> (BOS)
+        // Gemma needs explicit BOS=2
+        input_tokens.insert(0, 2); // BOS token
+    }
     let prompt_len = input_tokens.len() as u32;
 
     info!(prompt_tokens = prompt_len, max_tokens = req.max_tokens, "generating");
@@ -233,7 +242,7 @@ async fn chat_completions(
         .decode(&generated, true)
         .map_err(|e| AppError(format!("detokenize: {e}")))?;
 
-    info!(completion_tokens = completion_len, "done");
+    info!(completion_tokens = completion_len, ?generated, "done");
 
     let model = if req.model.is_empty() {
         state.model_name.clone()

@@ -368,13 +368,11 @@ pub fn forward_gemma4(
         gemm_q(kernels, &scratch.norm_out, &layer.attn_q, &mut scratch.q,
             seq_len, q_dim, config.dim)?;
 
-        // K and V: only compute if this layer owns its KV cache
-        if has_kv {
-            gemm_q(kernels, &scratch.norm_out, &layer.attn_k, &mut scratch.k,
-                seq_len, kv_dim, config.dim)?;
-            gemm_q(kernels, &scratch.norm_out, &layer.attn_v, &mut scratch.v,
-                seq_len, kv_dim, config.dim)?;
-        }
+        // K and V: always compute (even for shared-KV layers — they have their own weights)
+        gemm_q(kernels, &scratch.norm_out, &layer.attn_k, &mut scratch.k,
+            seq_len, kv_dim, config.dim)?;
+        gemm_q(kernels, &scratch.norm_out, &layer.attn_v, &mut scratch.v,
+            seq_len, kv_dim, config.dim)?;
 
         // 3. QK norms (RMSNorm with learned weights)
         // The rms_norm kernel requires different src and dst pointers.
@@ -392,19 +390,19 @@ pub fn forward_gemma4(
                 )?;
             }
         }
-        if has_kv {
-            if let Some(ref k_norm) = layer.attn_k_norm {
-                let src_ptr = &scratch.k as *const CudaSlice<half::f16>;
-                let dst_ptr = &mut scratch.k as *mut CudaSlice<half::f16>;
-                unsafe {
-                    kernels.ops.rms_norm(
-                        &*src_ptr, k_norm, &mut *dst_ptr,
-                        seq_len * config.n_kv_heads, hd, config.rms_norm_eps,
-                    )?;
-                }
+        if let Some(ref k_norm) = layer.attn_k_norm {
+            let src_ptr = &scratch.k as *const CudaSlice<half::f16>;
+            let dst_ptr = &mut scratch.k as *mut CudaSlice<half::f16>;
+            unsafe {
+                kernels.ops.rms_norm(
+                    &*src_ptr, k_norm, &mut *dst_ptr,
+                    seq_len * config.n_kv_heads, hd, config.rms_norm_eps,
+                )?;
             }
+        }
 
-            // V norm (no weight — just normalize by RMS)
+        // V norm (no weight — just normalize by RMS)
+        {
             let src_ptr = &scratch.v as *const CudaSlice<half::f16>;
             let dst_ptr = &mut scratch.v as *mut CudaSlice<half::f16>;
             unsafe {
@@ -417,12 +415,10 @@ pub fn forward_gemma4(
 
         // 4. RoPE NeoX on Q (and K if this layer owns KV)
         kernels.ops.rope_neox(&mut scratch.q, seq_len, config.n_heads, hd, pos, rope_theta)?;
-        if has_kv {
-            kernels.ops.rope_neox(&mut scratch.k, seq_len, config.n_kv_heads, hd, pos, rope_theta)?;
-        }
+        kernels.ops.rope_neox(&mut scratch.k, seq_len, config.n_kv_heads, hd, pos, rope_theta)?;
 
-        // 5. Write K, V into KV cache (only for KV-owning layers)
-        if has_kv {
+        // 5. Write K, V into KV cache (every layer gets its own cache)
+        {
             let kv_elems = seq_len * kv_dim;
             {
                 let mut k_cache = kv_cache.k_mut(layer_idx, seq_len);
@@ -434,10 +430,7 @@ pub fn forward_gemma4(
             }
         }
 
-        // 6. Multi-Head Attention
-        // Use KV from this layer's cache source (may be shared)
-        let kv_source = config.kv_source_layer(layer_idx);
-        let kv_hd = config.layer_head_dim(kv_source);
+        // 6. Multi-Head Attention (use this layer's own KV cache)
         {
             let k_full = kv_cache.k_full(layer_idx, total_kv_len);
             let v_full = kv_cache.v_full(layer_idx, total_kv_len);
@@ -445,7 +438,7 @@ pub fn forward_gemma4(
             // Gemma 4 uses attention_scale=1.0 (QK norms handle scaling)
             kernels.ops.mha_fused_scaled(
                 &scratch.q, &k_full, &v_full, &mut scratch.attn_mha_out,
-                kv_hd, config.n_heads, config.n_kv_heads,
+                hd, config.n_heads, config.n_kv_heads,
                 seq_len, total_kv_len, pos,
                 config.attention_scale,
             )?;
@@ -498,6 +491,16 @@ pub fn forward_gemma4(
             kernels.ops.add_inplace_f32_f16(hidden, &scratch.ffn_out, seq_len * config.dim)?;
         }
 
+        // DEBUG: check for NaN after each layer
+        if seq_len > 1 {
+            let n = (seq_len * config.dim) as usize;
+            let mut dbg = vec![0.0f32; n.min(8)];
+            let _ = stream_ref.memcpy_dtoh(&hidden.slice(0..dbg.len()), &mut dbg);
+            let has_nan = dbg.iter().any(|x| x.is_nan());
+            let maxv = dbg.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+            tracing::info!(layer = layer_idx, has_nan, maxv, first4 = ?&dbg[..4], "layer check");
+        }
+
         // 14. Layer output scale
         if let Some(scale) = layer.layer_output_scale {
             if (scale - 1.0).abs() > 1e-6 {
@@ -514,9 +517,41 @@ pub fn forward_gemma4(
         seq_len, config.dim, config.rms_norm_eps,
     )?;
 
+    // DEBUG: check norm_out for NaN
+    {
+        let mut dbg = vec![half::f16::ZERO; 8];
+        let _ = stream_ref.memcpy_dtoh(&scratch.norm_out.slice(0..8), &mut dbg);
+        let has_nan = dbg.iter().any(|x| x.to_f32().is_nan());
+        let maxv = dbg.iter().map(|x| x.to_f32().abs()).fold(0.0f32, f32::max);
+        tracing::info!(has_nan, maxv, "final_norm_out check");
+    }
+
     // Output logits
     gemm_q(kernels, &scratch.norm_out, &weights.output, &mut scratch.logits,
         seq_len, config.vocab_size, config.dim)?;
+
+    // DEBUG: check logits for NaN (both first and last position)
+    {
+        let mut dbg0 = vec![half::f16::ZERO; 8];
+        let _ = stream_ref.memcpy_dtoh(&scratch.logits.slice(0..8), &mut dbg0);
+        let nan0 = dbg0.iter().any(|x| x.to_f32().is_nan());
+        let max0 = dbg0.iter().map(|x| x.to_f32().abs()).fold(0.0f32, f32::max);
+
+        let last_off = ((seq_len - 1) * config.vocab_size) as usize;
+        let end_off = last_off + config.vocab_size as usize;
+        // Check: does the buffer have enough space?
+        let buf_len = scratch.logits.len();
+        let mut dbg_last = vec![half::f16::ZERO; 8];
+        if end_off <= buf_len {
+            let _ = stream_ref.memcpy_dtoh(&scratch.logits.slice(last_off..last_off+8), &mut dbg_last);
+        } else {
+            tracing::error!(last_off, end_off, buf_len, "LOGIT BUFFER OVERFLOW!");
+        }
+        let nan_last = dbg_last.iter().any(|x| x.to_f32().is_nan());
+        let max_last = dbg_last.iter().map(|x| x.to_f32().abs()).fold(0.0f32, f32::max);
+
+        tracing::info!(nan0, max0, nan_last, max_last, seq_len, vocab=config.vocab_size, last_off, "logits check");
+    }
 
     // Logit softcapping: tanh(logits / cap) * cap
     // The kernel supports different src/dst, but we want in-place.

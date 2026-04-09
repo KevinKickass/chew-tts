@@ -85,6 +85,12 @@ impl ModelConfig {
 
         let max_head_dim = *head_dims.iter().max().unwrap_or(&head_dim);
 
+        if is_gemma4 {
+            let swa_count = swa_layers.iter().filter(|&&x| x).count();
+            let full_count = swa_layers.len() - swa_count;
+            tracing::info!(swa_count, full_count, swa_head_dim, full_attn_head_dim, max_head_dim, "Gemma4 layer config");
+        }
+
         // Number of layers that own their own KV cache
         // shared_kv_layers layers at the end reuse KV from layer (n_layers - shared_kv_layers - 1)
         let n_kv_layers = n_layers - n_kv_shared_layers;

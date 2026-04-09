@@ -35,7 +35,8 @@ impl KvCache {
         max_seq: u32,
         stream: &Arc<CudaStream>,
     ) -> Result<Self, cudarc::driver::DriverError> {
-        let n_kv_layers = config.n_kv_layers;
+        // Allocate KV cache for ALL layers (even shared ones — they compute their own K/V)
+        let n_kv_layers = config.n_layers;
         let mut layers = Vec::with_capacity(n_kv_layers as usize);
         let mut total_bytes: u64 = 0;
 
