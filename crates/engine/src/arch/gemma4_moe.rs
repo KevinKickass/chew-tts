@@ -264,20 +264,17 @@ pub fn load_layer_to_host(
 // ─── Streaming shell ────────────────────────────────────────────────────────
 
 /// Allocate a MoE shell with pre-sized GPU buffers for streaming.
+/// Sizes are computed from actual GGUF tensor byte sizes (worst case across layers).
 pub fn allocate_shell(
     config: &ModelConfig,
+    gguf: &GgufFile,
     stream: &Arc<CudaStream>,
 ) -> Result<MoeLayerWeights, LoadError> {
     let d = config.dim as usize;
-    let ff = config.ff_dim as usize;
-    let nh = config.n_heads as usize;
-    let nkv = config.n_kv_heads as usize; // max kv heads
     let hd = config.max_head_dim as usize;
-    let n_exp = config.n_experts as usize;
-    let exp_ff = config.expert_ff_dim as usize;
 
     let alloc_u8 = |size: usize| -> Result<CudaSlice<u8>, LoadError> {
-        stream.alloc_zeros::<u8>(size)
+        stream.alloc_zeros::<u8>(size.max(64)) // minimum 64 bytes
             .map_err(|e| LoadError::Vram(chew_vram::VramError::Alloc(e.to_string())))
     };
     let alloc_f16 = |size: usize| -> Result<CudaSlice<half::f16>, LoadError> {
@@ -292,24 +289,46 @@ pub fn allocate_shell(
         })
     };
 
-    // Use f16 size (2 bytes/elem) as upper bound for quantized tensor sizes
+    // Compute max byte size for each tensor role across all layers
+    let tensor_names = [
+        "attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight",
+        "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight",
+        "ffn_gate_inp.weight", "ffn_gate_up_exps.weight", "ffn_down_exps.weight",
+    ];
+    let mut max_sizes = [0usize; 10];
+    for layer in 0..config.n_layers {
+        for (i, name) in tensor_names.iter().enumerate() {
+            let full_name = format!("blk.{layer}.{name}");
+            if let Some(ti) = gguf.find_tensor(&full_name) {
+                max_sizes[i] = max_sizes[i].max(ti.data_size() as usize);
+            }
+        }
+    }
+
+    info!(
+        attn_q_mb = max_sizes[0] / (1024*1024),
+        gate_up_exps_mb = max_sizes[8] / (1024*1024),
+        down_exps_mb = max_sizes[9] / (1024*1024),
+        "MoE shell sizes from GGUF"
+    );
+
     Ok(MoeLayerWeights {
         attn_norm: alloc_f16(d)?,
-        attn_q: mk_qw(nh * hd * d * 2)?,
-        attn_k: mk_qw(nkv * hd * d * 2)?,
-        attn_v: Some(mk_qw(nkv * hd * d * 2)?), // allocate max; Some layers won't use it
-        attn_output: mk_qw(d * nh * hd * 2)?,
+        attn_q: mk_qw(max_sizes[0])?,          // attn_q
+        attn_k: mk_qw(max_sizes[1])?,          // attn_k
+        attn_v: Some(mk_qw(max_sizes[2].max(64))?), // attn_v (0 for full-attn layers)
+        attn_output: mk_qw(max_sizes[3])?,     // attn_output
         attn_q_norm: alloc_f16(hd)?,
         attn_k_norm: alloc_f16(hd)?,
         post_attention_norm: alloc_f16(d)?,
         ffn_norm: alloc_f16(d)?,
-        ffn_gate: mk_qw(ff * d * 2)?,
-        ffn_up: mk_qw(ff * d * 2)?,
-        ffn_down: mk_qw(d * ff * 2)?,
+        ffn_gate: mk_qw(max_sizes[4])?,        // ffn_gate (shared)
+        ffn_up: mk_qw(max_sizes[5])?,          // ffn_up (shared)
+        ffn_down: mk_qw(max_sizes[6])?,        // ffn_down (shared)
         post_ffw_norm: alloc_f16(d)?,
-        moe_gate: mk_qw(d * n_exp * 2)?,
-        moe_gate_up_exps: mk_qw(d * exp_ff * 2 * n_exp * 2)?,
-        moe_down_exps: mk_qw(exp_ff * d * n_exp * 2)?,
+        moe_gate: mk_qw(max_sizes[7])?,        // ffn_gate_inp (router)
+        moe_gate_up_exps: mk_qw(max_sizes[8])?, // ffn_gate_up_exps (3D)
+        moe_down_exps: mk_qw(max_sizes[9])?,   // ffn_down_exps (3D)
         pre_ffw_norm_2: alloc_f16(d)?,
         post_ffw_norm_2: alloc_f16(d)?,
         layer_output_scale: None,
@@ -458,8 +477,8 @@ impl MoeModelWeights {
         info!(host_mb = host_layer_data.len() / (1024 * 1024), "MoE streamed layer data loaded");
 
         // Allocate double-buffer shells
-        let shell_a = allocate_shell(config, &stream)?;
-        let shell_b = allocate_shell(config, &stream)?;
+        let shell_a = allocate_shell(config, gguf, &stream)?;
+        let shell_b = allocate_shell(config, gguf, &stream)?;
 
         // Expert scratch: big enough for largest expert slice
         // gate_up_exps per expert: dim * expert_ff_dim * 2 * 2 bytes (f16 upper bound)
@@ -576,8 +595,11 @@ pub fn forward_moe_streaming(
             gemm_q(kernels, &scratch.norm_out, attn_v, &mut scratch.v,
                 seq_len, kv_dim, config.dim)?;
         } else {
-            // Shared KV: V = K — dtod copy
-            stream.memcpy_dtod(&scratch.k, &mut scratch.v)
+            // Shared KV: V = K — copy only kv_dim * seq_len elements
+            let n = (seq_len * kv_dim) as usize;
+            let k_view = scratch.k.slice(0..n);
+            let mut v_view = scratch.v.slice_mut(0..n);
+            stream.memcpy_dtod(&k_view, &mut v_view)
                 .map_err(|e| KernelError::Launch(e.to_string()))?;
         }
 
@@ -741,7 +763,7 @@ pub fn forward_moe_streaming(
 
                 // Top-k selection
                 let mut indexed: Vec<(usize, f32)> = probs.iter().cloned().enumerate().collect();
-                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
                 let selected: Vec<(usize, f32)> = indexed.into_iter().take(top_k as usize).collect();
 
                 // Normalize selected weights

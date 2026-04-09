@@ -57,6 +57,39 @@ __global__ void dequant_q4_0(const void* __restrict__ src,
     dst[idx] = __float2half(d * (float)q);
 }
 
+// --- Q5_1: 32 weights per block, 24 bytes/block ---
+// Layout: f16 d (scale), f16 m (min), u32 qh (high bits), 16 bytes qs (4-bit low)
+// val = d * (q_low + 16 * q_high) + m
+__global__ void dequant_q5_1(const void* __restrict__ src,
+                              __half* __restrict__ dst,
+                              int n_elements) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_elements) return;
+
+    int block_idx = idx / 32;
+    int in_block  = idx % 32;
+
+    const uint8_t* block = (const uint8_t*)src + block_idx * 24;
+    float d = __half2float(*(const __half*)block);
+    float m = __half2float(*(const __half*)(block + 2));
+    uint32_t qh = *(const uint32_t*)(block + 4);
+    const uint8_t* qs = block + 8;
+
+    // Low 4 bits from qs
+    uint8_t byte = qs[in_block / 2];
+    int q_low;
+    if (in_block % 2 == 0) {
+        q_low = byte & 0x0F;
+    } else {
+        q_low = (byte >> 4) & 0x0F;
+    }
+
+    // High bit from qh
+    int q_high = (qh >> in_block) & 1;
+
+    dst[idx] = __float2half(d * (float)(q_low + 16 * q_high) + m);
+}
+
 // --- Q4_K: 256 weights per super-block ---
 __global__ void dequant_q4_k(const void* __restrict__ src,
                               __half* __restrict__ dst,
