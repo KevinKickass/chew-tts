@@ -39,6 +39,7 @@ pub struct OpsKernels {
     scale_f16: CudaFunction,
     scale_f32_inplace: CudaFunction,
     logit_softcap: CudaFunction,
+    logit_softcap_inplace: CudaFunction,
     rope_neox: CudaFunction,
     rope_neox_graph: CudaFunction,
     post_norm_add: CudaFunction,
@@ -78,6 +79,7 @@ impl OpsKernels {
             scale_f16: loader::get_fn(&module, "scale_f16")?,
             scale_f32_inplace: loader::get_fn(&module, "scale_f32_inplace")?,
             logit_softcap: loader::get_fn(&module, "logit_softcap")?,
+            logit_softcap_inplace: loader::get_fn(&module, "logit_softcap_inplace")?,
             rope_neox: loader::get_fn(&module, "rope_neox")?,
             rope_neox_graph: loader::get_fn(&module, "rope_neox_graph")?,
             post_norm_add: loader::get_fn(&module, "post_norm_add")?,
@@ -811,6 +813,28 @@ impl OpsKernels {
         ];
         unsafe { self.fast.launch(&self.logit_softcap, cfg, &mut args)? }
         Ok(())
+    }
+
+    /// Logit softcap in-place: x = tanh(x/cap) * cap
+    pub fn logit_softcap_inplace(
+        &self,
+        x: &mut CudaSlice<half::f16>,
+        n: u32,
+        cap: f32,
+    ) -> Result<(), KernelError> {
+        let threads = 256u32;
+        let blocks = (n + threads - 1) / threads;
+        let cfg = LaunchConfig {
+            grid_dim: (blocks, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let n_i = n as i32;
+        let mut args: [*mut c_void; 3] = [
+            slice_ptr_mut(x),
+            scalar_ptr(&n_i), scalar_ptr(&cap),
+        ];
+        unsafe { self.fast.launch(&self.logit_softcap_inplace, cfg, &mut args) }
     }
 
     /// RoPE NeoX-style: pairs are (x[i], x[i+d/2]) instead of (x[2i], x[2i+1]).

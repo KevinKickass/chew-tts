@@ -1028,5 +1028,12 @@ __global__ void post_norm_add(float* __restrict__ hidden,
     }
 }
 
-} // extern "C"
+// --- Logit softcap in-place ---
+__global__ void logit_softcap_inplace(__half* __restrict__ x, int n, float cap) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    float v = __half2float(x[idx]);
+    x[idx] = __float2half(tanhf(v / cap) * cap);
+}
 
+} // extern "C"

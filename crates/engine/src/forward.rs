@@ -345,7 +345,11 @@ pub fn forward_gemma4(
     let stream_ref = Arc::clone(kernels.ops.stream());
     let _ = &stream_ref;
 
-    let n_layers = config.n_layers as usize;
+    let max_layers = std::env::var("CHEW_MAX_LAYERS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(config.n_layers as usize);
+    let n_layers = max_layers.min(config.n_layers as usize);
 
     for layer_idx in 0..n_layers {
         let layer = &weights.layers[layer_idx];
@@ -361,14 +365,16 @@ pub fn forward_gemma4(
         )?;
 
         // 2. QKV projections
-        // Q: [seq_len, n_heads * hd]
         let q_dim = config.n_heads * hd;
         let kv_dim = config.n_kv_heads * hd;
 
+        // Quantize norm_out for GEMV (decode path, M=1)
+        if seq_len == 1 {
+            kernels.gemv.quantize_input(&scratch.norm_out, config.dim)?;
+        }
+
         gemm_q(kernels, &scratch.norm_out, &layer.attn_q, &mut scratch.q,
             seq_len, q_dim, config.dim)?;
-
-        // K and V: always compute (even for shared-KV layers — they have their own weights)
         gemm_q(kernels, &scratch.norm_out, &layer.attn_k, &mut scratch.k,
             seq_len, kv_dim, config.dim)?;
         gemm_q(kernels, &scratch.norm_out, &layer.attn_v, &mut scratch.v,
@@ -445,6 +451,9 @@ pub fn forward_gemma4(
         }
 
         // 7. Output projection
+        if seq_len == 1 {
+            kernels.gemv.quantize_input(&scratch.attn_mha_out, q_dim)?;
+        }
         gemm_q(kernels, &scratch.attn_mha_out, &layer.attn_output, &mut scratch.attn_out,
             seq_len, config.dim, q_dim)?;
 
@@ -466,6 +475,9 @@ pub fn forward_gemma4(
         )?;
 
         // 10. Gate + Up projections
+        if seq_len == 1 {
+            kernels.gemv.quantize_input(&scratch.norm_out, config.dim)?;
+        }
         gemm_q(kernels, &scratch.norm_out, &layer.ffn_gate, &mut scratch.ffn_gate_out,
             seq_len, config.ff_dim, config.dim)?;
         gemm_q(kernels, &scratch.norm_out, &layer.ffn_up, &mut scratch.ffn_up_out,
@@ -478,6 +490,9 @@ pub fn forward_gemma4(
         )?;
 
         // 12. Down projection
+        if seq_len == 1 {
+            kernels.gemv.quantize_input(&scratch.ffn_silu_out, config.ff_dim)?;
+        }
         gemm_q(kernels, &scratch.ffn_silu_out, &layer.ffn_down, &mut scratch.ffn_out,
             seq_len, config.dim, config.ff_dim)?;
 
@@ -527,6 +542,9 @@ pub fn forward_gemma4(
     }
 
     // Output logits
+    if seq_len == 1 {
+        kernels.gemv.quantize_input(&scratch.norm_out, config.dim)?;
+    }
     gemm_q(kernels, &scratch.norm_out, &weights.output, &mut scratch.logits,
         seq_len, config.vocab_size, config.dim)?;
 
@@ -561,13 +579,7 @@ pub fn forward_gemma4(
     // so same-buffer is safe. Use unsafe to work around the borrow checker.
     if let Some(cap) = config.logit_softcap {
         let n_logits = seq_len * config.vocab_size;
-        // SAFETY: logit_softcap is an element-wise kernel that reads element [i]
-        // and writes element [i] — no aliasing conflict within the kernel.
-        let src_ptr = &scratch.logits as *const CudaSlice<half::f16>;
-        let dst_ptr = &mut scratch.logits as *mut CudaSlice<half::f16>;
-        unsafe {
-            kernels.ops.logit_softcap(&*src_ptr, &mut *dst_ptr, n_logits, cap)?;
-        }
+        kernels.ops.logit_softcap_inplace(&mut scratch.logits, n_logits, cap)?;
     }
 
     kv_cache.advance(seq_len);
