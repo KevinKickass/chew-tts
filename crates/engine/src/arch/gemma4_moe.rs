@@ -40,14 +40,17 @@ pub struct MoeLayerWeights {
     pub post_ffw_norm: CudaSlice<half::f16>,
 
     // MoE expert FFN
-    /// Router: [dim, n_experts]
+    /// Router weights: [dim, n_experts]
     pub moe_gate: QuantWeight,
+    /// Router scale: [dim] — applied to rms_norm(attn_out) / sqrt(dim) before router
+    pub moe_gate_scale: CudaSlice<half::f16>,
     /// Fused gate+up for all experts: [dim, expert_ff_dim*2, n_experts]
     pub moe_gate_up_exps: QuantWeight,
     /// Down projection for all experts: [expert_ff_dim, dim, n_experts]
     pub moe_down_exps: QuantWeight,
     /// MoE norms
     pub pre_ffw_norm_2: CudaSlice<half::f16>,
+    pub post_ffw_norm_1: CudaSlice<half::f16>,
     pub post_ffw_norm_2: CudaSlice<half::f16>,
 
     pub layer_output_scale: Option<f32>,
@@ -61,7 +64,9 @@ pub struct MoeStreamingNorms {
     pub post_attention_norm: CudaSlice<half::f16>,
     pub ffn_norm: CudaSlice<half::f16>,
     pub post_ffw_norm: CudaSlice<half::f16>,
+    pub moe_gate_scale: CudaSlice<half::f16>,
     pub pre_ffw_norm_2: CudaSlice<half::f16>,
+    pub post_ffw_norm_1: CudaSlice<half::f16>,
     pub post_ffw_norm_2: CudaSlice<half::f16>,
 }
 
@@ -129,11 +134,13 @@ pub fn load_layer_to_gpu(
 
     // MoE expert weights
     let moe_gate = upload_quantized(gguf, &format!("{pfx}.ffn_gate_inp.weight"), alloc, gpu_idx)?;
+    let moe_gate_scale = upload_and_dequant(gguf, &format!("{pfx}.ffn_gate_inp.scale"), alloc, dequant, gpu_idx)?;
     let moe_gate_up_exps = upload_quantized(gguf, &format!("{pfx}.ffn_gate_up_exps.weight"), alloc, gpu_idx)?;
     let moe_down_exps = upload_quantized(gguf, &format!("{pfx}.ffn_down_exps.weight"), alloc, gpu_idx)?;
 
     // MoE norms
     let pre_ffw_norm_2 = upload_and_dequant(gguf, &format!("{pfx}.pre_ffw_norm_2.weight"), alloc, dequant, gpu_idx)?;
+    let post_ffw_norm_1 = upload_and_dequant(gguf, &format!("{pfx}.post_ffw_norm_1.weight"), alloc, dequant, gpu_idx)?;
     let post_ffw_norm_2 = upload_and_dequant(gguf, &format!("{pfx}.post_ffw_norm_2.weight"), alloc, dequant, gpu_idx)?;
 
     // Layer output scale
@@ -162,9 +169,11 @@ pub fn load_layer_to_gpu(
         ffn_down,
         post_ffw_norm,
         moe_gate,
+        moe_gate_scale,
         moe_gate_up_exps,
         moe_down_exps,
         pre_ffw_norm_2,
+        post_ffw_norm_1,
         post_ffw_norm_2,
         layer_output_scale,
     })
@@ -186,7 +195,9 @@ pub fn load_layer_norms(
         post_attention_norm: upload_and_dequant(gguf, &format!("{pfx}.post_attention_norm.weight"), alloc, dequant, gpu_idx)?,
         ffn_norm: upload_and_dequant(gguf, &format!("{pfx}.ffn_norm.weight"), alloc, dequant, gpu_idx)?,
         post_ffw_norm: upload_and_dequant(gguf, &format!("{pfx}.post_ffw_norm.weight"), alloc, dequant, gpu_idx)?,
+        moe_gate_scale: upload_and_dequant(gguf, &format!("{pfx}.ffn_gate_inp.scale"), alloc, dequant, gpu_idx)?,
         pre_ffw_norm_2: upload_and_dequant(gguf, &format!("{pfx}.pre_ffw_norm_2.weight"), alloc, dequant, gpu_idx)?,
+        post_ffw_norm_1: upload_and_dequant(gguf, &format!("{pfx}.post_ffw_norm_1.weight"), alloc, dequant, gpu_idx)?,
         post_ffw_norm_2: upload_and_dequant(gguf, &format!("{pfx}.post_ffw_norm_2.weight"), alloc, dequant, gpu_idx)?,
     })
 }
@@ -327,9 +338,11 @@ pub fn allocate_shell(
         ffn_down: mk_qw(max_sizes[6])?,        // ffn_down (shared)
         post_ffw_norm: alloc_f16(d)?,
         moe_gate: mk_qw(max_sizes[7])?,        // ffn_gate_inp (router)
+        moe_gate_scale: alloc_f16(d)?,
         moe_gate_up_exps: mk_qw(max_sizes[8])?, // ffn_gate_up_exps (3D)
         moe_down_exps: mk_qw(max_sizes[9])?,   // ffn_down_exps (3D)
         pre_ffw_norm_2: alloc_f16(d)?,
+        post_ffw_norm_1: alloc_f16(d)?,
         post_ffw_norm_2: alloc_f16(d)?,
         layer_output_scale: None,
     })
@@ -381,7 +394,9 @@ pub fn copy_norms_to_shell(
     stream.memcpy_dtod(&norms.post_attention_norm, &mut shell.post_attention_norm).map_err(|e| e.to_string())?;
     stream.memcpy_dtod(&norms.ffn_norm, &mut shell.ffn_norm).map_err(|e| e.to_string())?;
     stream.memcpy_dtod(&norms.post_ffw_norm, &mut shell.post_ffw_norm).map_err(|e| e.to_string())?;
+    stream.memcpy_dtod(&norms.moe_gate_scale, &mut shell.moe_gate_scale).map_err(|e| e.to_string())?;
     stream.memcpy_dtod(&norms.pre_ffw_norm_2, &mut shell.pre_ffw_norm_2).map_err(|e| e.to_string())?;
+    stream.memcpy_dtod(&norms.post_ffw_norm_1, &mut shell.post_ffw_norm_1).map_err(|e| e.to_string())?;
     stream.memcpy_dtod(&norms.post_ffw_norm_2, &mut shell.post_ffw_norm_2).map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -571,6 +586,8 @@ pub fn forward_moe_streaming(
             shell_ref
         };
 
+        info!(layer_idx, hd, kv_heads, is_swa, q_dim = config.n_heads * hd, kv_dim = kv_heads * hd, "MoE layer start");
+
         // ── 1. Attention norm: f32 hidden → f16 norm_out ──
         kernels.ops.rms_norm_f32in(
             hidden, &layer.attn_norm, &mut scratch.norm_out,
@@ -586,9 +603,13 @@ pub fn forward_moe_streaming(
         }
 
         gemm_q(kernels, &scratch.norm_out, &layer.attn_q, &mut scratch.q,
-            seq_len, q_dim, config.dim)?;
+            seq_len, q_dim, config.dim)
+            .map_err(|e| { tracing::error!(layer_idx, m=seq_len, n=q_dim, k=config.dim, qtype=?layer.attn_q.quant_type, nelems=layer.attn_q.n_elements, "Q proj failed"); e })?;
+        info!(layer_idx, "Q proj OK");
         gemm_q(kernels, &scratch.norm_out, &layer.attn_k, &mut scratch.k,
-            seq_len, kv_dim, config.dim)?;
+            seq_len, kv_dim, config.dim)
+            .map_err(|e| { tracing::error!(layer_idx, m=seq_len, n=kv_dim, k=config.dim, qtype=?layer.attn_k.quant_type, nelems=layer.attn_k.n_elements, "K proj failed"); e })?;
+        info!(layer_idx, "K proj OK");
 
         // V = K for shared-KV layers (full attention), or separate V
         if let Some(ref attn_v) = layer.attn_v {
@@ -689,7 +710,12 @@ pub fn forward_moe_streaming(
             seq_len, config.dim, config.rms_norm_eps,
         )?;
 
-        // ── 9. Shared dense FFN ──
+        // ══════════════════════════════════════════════════════════════
+        // FFN: Shared MLP + MoE run in PARALLEL on attn_out (= hidden)
+        // Following llama.cpp gemma4-iswa.cpp exactly
+        // ══════════════════════════════════════════════════════════════
+
+        // ── 9a. Shared MLP: norm(attn_out) → gate+up → GELU → down → post_ffw_norm_1 ──
         kernels.ops.rms_norm_f32in(
             hidden, &layer.ffn_norm, &mut scratch.norm_out,
             seq_len, config.dim, config.rms_norm_eps,
@@ -711,87 +737,103 @@ pub fn forward_moe_streaming(
         if seq_len == 1 {
             kernels.gemv.quantize_input(&scratch.ffn_silu_out, config.ff_dim)?;
         }
+        // cur_mlp → ffn_out
         gemm_q(kernels, &scratch.ffn_silu_out, &layer.ffn_down, &mut scratch.ffn_out,
             seq_len, config.dim, config.ff_dim)?;
 
-        // Post shared FFN norm + residual
-        kernels.ops.post_norm_add(
-            hidden, &scratch.ffn_out, &layer.post_ffw_norm, &mut scratch.norm_out,
-            seq_len, config.dim, config.rms_norm_eps,
-        )?;
+        // RMSNorm the shared MLP output (post_ffw_norm_1)
+        {
+            let src_ptr = &scratch.ffn_out as *const CudaSlice<half::f16>;
+            let dst_ptr = &mut scratch.ffn_out as *mut CudaSlice<half::f16>;
+            unsafe {
+                kernels.ops.rms_norm(
+                    &*src_ptr, &layer.post_ffw_norm_1, &mut *dst_ptr,
+                    seq_len, config.dim, config.rms_norm_eps,
+                )?;
+            }
+        }
+        // ffn_out now holds cur_mlp (normed shared MLP output)
 
-        // ── 10. MoE expert FFN ──
-        // For decode (seq_len=1): route on CPU, compute selected experts on GPU
+        // ── 9b. MoE Router ──
+        // Router operates on attn_out (= hidden), NOT on the MLP output
+        // llama.cpp: tmp = rms_norm(attn_out) * (1/sqrt(n_embd)) * gate_inp_scale
+        //            logits = tmp @ gate_inp
         {
             let expert_ff = config.expert_ff_dim;
             let n_experts = config.n_experts;
             let top_k = config.n_experts_per_tok;
+            let dim_scale = 1.0 / (config.dim as f32).sqrt();
 
-            // 10a. Norm before MoE
+            // Router norm: rms_norm(hidden) → norm_out, then scale by 1/sqrt(dim) and mul by gate_scale
+            // We reuse attn_out as temp for router computation
+            kernels.ops.rms_norm_f32in(
+                hidden, &layer.attn_norm, &mut scratch.attn_out, // reuse attn_out as temp
+                seq_len, config.dim, config.rms_norm_eps,
+            )?;
+            // Scale by 1/sqrt(dim)
+            {
+                let src_ptr = &scratch.attn_out as *const CudaSlice<half::f16>;
+                let dst_ptr = &mut scratch.attn_out as *mut CudaSlice<half::f16>;
+                unsafe {
+                    kernels.ops.scale_f16(&*src_ptr, &mut *dst_ptr, seq_len * config.dim, dim_scale)?;
+                }
+            }
+            // Multiply by gate_inp_scale (element-wise)
+            kernels.ops.mul_f16(
+                &scratch.attn_out, &layer.moe_gate_scale, &mut scratch.attn_mha_out,
+                seq_len * config.dim,
+            )?;
+
+            // Router GEMM: router_input @ gate_inp → logits [seq_len, n_experts]
+            if seq_len == 1 {
+                kernels.gemv.quantize_input(&scratch.attn_mha_out, config.dim)?;
+            }
+            // Reuse attn_out for logits (n_experts=128 < dim=2816, fits)
+            gemm_q(kernels, &scratch.attn_mha_out, &layer.moe_gate, &mut scratch.attn_out,
+                seq_len, n_experts, config.dim)?;
+
+            // ── 9c. MoE FFN input (separate norm on attn_out) ──
+            // cur_moe_input = pre_ffw_norm_2(attn_out)
             kernels.ops.rms_norm_f32in(
                 hidden, &layer.pre_ffw_norm_2, &mut scratch.norm_out,
                 seq_len, config.dim, config.rms_norm_eps,
             )?;
+            // norm_out now holds cur_moe input
 
-            // 10b. Router: norm_out @ moe_gate^T → router_logits [seq_len, n_experts]
-            // For decode (M=1): use CPU for routing since it's tiny
-            if seq_len == 1 {
-                kernels.gemv.quantize_input(&scratch.norm_out, config.dim)?;
-            }
-
-            // We need a scratch buffer for router logits. Reuse attn_out (dim-sized, but we need n_experts).
-            // n_experts=128 < dim=2816, so attn_out is big enough.
-            gemm_q(kernels, &scratch.norm_out, &layer.moe_gate, &mut scratch.attn_out,
-                seq_len, n_experts, config.dim)?;
-
-            // 10c. Read router logits to CPU, select top-k experts
+            // ── 9d. Expert selection (CPU for decode) ──
             let n_exp = n_experts as usize;
-            let mut router_logits = vec![half::f16::ZERO; n_exp * seq_len as usize];
-            stream.memcpy_dtoh(&scratch.attn_out.slice(0..router_logits.len()), &mut router_logits)
+            let mut router_logits_host = vec![half::f16::ZERO; n_exp * seq_len as usize];
+            stream.memcpy_dtoh(&scratch.attn_out.slice(0..router_logits_host.len()), &mut router_logits_host)
                 .map_err(|e| KernelError::Launch(e.to_string()))?;
 
-            // Process each token in sequence (for decode, seq_len=1)
-            for tok in 0..seq_len as usize {
-                let logits = &router_logits[tok * n_exp..(tok + 1) * n_exp];
+            // For decode (seq_len=1), process single token
+            for _tok in 0..seq_len as usize {
+                let logits_f32: Vec<f32> = router_logits_host.iter().map(|x| x.to_f32()).collect();
+                let max_l = logits_f32.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let exp_l: Vec<f32> = logits_f32.iter().map(|x| (x - max_l).exp()).collect();
+                let sum_l: f32 = exp_l.iter().sum();
+                let probs: Vec<f32> = exp_l.iter().map(|x| x / sum_l).collect();
 
-                // Softmax + top-k on CPU
-                let logits_f32: Vec<f32> = logits.iter().map(|x| x.to_f32()).collect();
-                let max_logit = logits_f32.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let exp_logits: Vec<f32> = logits_f32.iter().map(|x| (x - max_logit).exp()).collect();
-                let sum: f32 = exp_logits.iter().sum();
-                let probs: Vec<f32> = exp_logits.iter().map(|x| x / sum).collect();
-
-                // Top-k selection
                 let mut indexed: Vec<(usize, f32)> = probs.iter().cloned().enumerate().collect();
                 indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
                 let selected: Vec<(usize, f32)> = indexed.into_iter().take(top_k as usize).collect();
-
-                // Normalize selected weights
                 let sel_sum: f32 = selected.iter().map(|(_, w)| w).sum();
 
-                // 10d. For each selected expert: gate_up → GELU → down, weighted accumulate
-                // Zero the output accumulator (reuse ffn_out)
-                // We accumulate expert outputs into ffn_out
+                // ── 9e. Expert computation ──
                 let mut first_expert = true;
-
                 for &(expert_id, weight) in &selected {
                     let w_norm = weight / sel_sum;
 
-                    // Expert gate_up: copy slice into scratch buffer
-                    let gate_up_info = expert_slice_info(
-                        &layer.moe_gate_up_exps, expert_id as u32, n_experts,
-                    );
-                    {
-                        let src = layer.moe_gate_up_exps.data.slice(
-                            gate_up_info.byte_offset..gate_up_info.byte_offset + gate_up_info.byte_size
-                        );
-                        stream.memcpy_dtod(&src, &mut moe_weights.expert_scratch.data.slice_mut(0..gate_up_info.byte_size))
-                            .map_err(|e| KernelError::Launch(e.to_string()))?;
-                        moe_weights.expert_scratch.quant_type = gate_up_info.quant_type;
-                        moe_weights.expert_scratch.n_elements = gate_up_info.n_elements;
-                    }
+                    // Copy expert gate_up slice to scratch
+                    let gu_info = expert_slice_info(&layer.moe_gate_up_exps, expert_id as u32, n_experts);
+                    stream.memcpy_dtod(
+                        &layer.moe_gate_up_exps.data.slice(gu_info.byte_offset..gu_info.byte_offset + gu_info.byte_size),
+                        &mut moe_weights.expert_scratch.data.slice_mut(0..gu_info.byte_size),
+                    ).map_err(|e| KernelError::Launch(e.to_string()))?;
+                    moe_weights.expert_scratch.quant_type = gu_info.quant_type;
+                    moe_weights.expert_scratch.n_elements = gu_info.n_elements;
 
-                    // norm_out @ expert_gate_up → ffn_gate_out [1, expert_ff*2]
+                    // norm_out @ expert_gate_up → [1, expert_ff*2]
                     let fused_dim = expert_ff * 2;
                     if seq_len == 1 {
                         kernels.gemv.quantize_input(&scratch.norm_out, config.dim)?;
@@ -799,75 +841,85 @@ pub fn forward_moe_streaming(
                     gemm_q(kernels, &scratch.norm_out, &moe_weights.expert_scratch, &mut scratch.ffn_gate_out,
                         1, fused_dim, config.dim)?;
 
-                    // GELU(gate) * up: gate_up output is [1, expert_ff*2] = [gate | up]
-                    // Split: gate → ffn_silu_out, up → ffn_up_out, then gelu(gate)*up → ffn_gate_out
+                    // Split gate/up and GELU
                     let n = expert_ff as usize;
-                    // Gate half: first expert_ff elements
                     stream.memcpy_dtod(
                         &scratch.ffn_gate_out.slice(0..n),
                         &mut scratch.ffn_silu_out.slice_mut(0..n),
                     ).map_err(|e| KernelError::Launch(e.to_string()))?;
-                    // Up half: second expert_ff elements
                     stream.memcpy_dtod(
                         &scratch.ffn_gate_out.slice(n..n*2),
                         &mut scratch.ffn_up_out.slice_mut(0..n),
                     ).map_err(|e| KernelError::Launch(e.to_string()))?;
-                    // GELU(gate) * up → ffn_gate_out
                     kernels.ops.gelu(
                         &scratch.ffn_silu_out, &scratch.ffn_up_out, &mut scratch.ffn_gate_out,
                         expert_ff,
                     )?;
 
-                    // Expert down: copy slice into scratch buffer
-                    let down_info = expert_slice_info(
-                        &layer.moe_down_exps, expert_id as u32, n_experts,
-                    );
-                    {
-                        let src = layer.moe_down_exps.data.slice(
-                            down_info.byte_offset..down_info.byte_offset + down_info.byte_size
-                        );
-                        stream.memcpy_dtod(&src, &mut moe_weights.expert_scratch.data.slice_mut(0..down_info.byte_size))
-                            .map_err(|e| KernelError::Launch(e.to_string()))?;
-                        moe_weights.expert_scratch.quant_type = down_info.quant_type;
-                        moe_weights.expert_scratch.n_elements = down_info.n_elements;
-                    }
+                    // Copy expert down slice to scratch
+                    let dn_info = expert_slice_info(&layer.moe_down_exps, expert_id as u32, n_experts);
+                    stream.memcpy_dtod(
+                        &layer.moe_down_exps.data.slice(dn_info.byte_offset..dn_info.byte_offset + dn_info.byte_size),
+                        &mut moe_weights.expert_scratch.data.slice_mut(0..dn_info.byte_size),
+                    ).map_err(|e| KernelError::Launch(e.to_string()))?;
+                    moe_weights.expert_scratch.quant_type = dn_info.quant_type;
+                    moe_weights.expert_scratch.n_elements = dn_info.n_elements;
 
-                    // ffn_gate_out[0..expert_ff] @ expert_down → attn_out [1, dim]
+                    // expert_result @ down → [1, dim]
                     if seq_len == 1 {
                         kernels.gemv.quantize_input(&scratch.ffn_gate_out, expert_ff)?;
                     }
                     gemm_q(kernels, &scratch.ffn_gate_out, &moe_weights.expert_scratch, &mut scratch.attn_out,
                         1, config.dim, expert_ff)?;
 
-                    // Weighted accumulate into ffn_out
+                    // Weighted accumulate into attn_mha_out (reuse as moe accumulator)
                     if first_expert {
-                        // First expert: scale and store
-                        kernels.ops.scale_f16(&scratch.attn_out, &mut scratch.ffn_out,
+                        kernels.ops.scale_f16(&scratch.attn_out, &mut scratch.attn_mha_out,
                             config.dim, w_norm)?;
                         first_expert = false;
                     } else {
-                        // Subsequent: scale attn_out in place, add to ffn_out
                         let src_ptr = &scratch.attn_out as *const CudaSlice<half::f16>;
                         let dst_ptr = &mut scratch.attn_out as *mut CudaSlice<half::f16>;
-                        unsafe {
-                            kernels.ops.scale_f16(&*src_ptr, &mut *dst_ptr, config.dim, w_norm)?;
-                        }
-                        let a_ptr = &scratch.attn_out as *const CudaSlice<half::f16>;
-                        let b_ptr = &scratch.ffn_out as *const CudaSlice<half::f16>;
-                        let c_ptr = &mut scratch.ffn_out as *mut CudaSlice<half::f16>;
-                        unsafe {
-                            kernels.ops.add_f16(&*a_ptr, &*b_ptr, &mut *c_ptr, config.dim)?;
-                        }
+                        unsafe { kernels.ops.scale_f16(&*src_ptr, &mut *dst_ptr, config.dim, w_norm)?; }
+                        let a = &scratch.attn_out as *const CudaSlice<half::f16>;
+                        let b = &scratch.attn_mha_out as *const CudaSlice<half::f16>;
+                        let c = &mut scratch.attn_mha_out as *mut CudaSlice<half::f16>;
+                        unsafe { kernels.ops.add_f16(&*a, &*b, &mut *c, config.dim)?; }
                     }
                 }
             }
+            // attn_mha_out now holds cur_moe (weighted expert sum)
 
-            // 10e. Post MoE norm + residual
-            kernels.ops.post_norm_add(
-                hidden, &scratch.ffn_out, &layer.post_ffw_norm_2, &mut scratch.norm_out,
-                seq_len, config.dim, config.rms_norm_eps,
-            )?;
+            // RMSNorm cur_moe (post_ffw_norm_2)
+            {
+                let src_ptr = &scratch.attn_mha_out as *const CudaSlice<half::f16>;
+                let dst_ptr = &mut scratch.attn_mha_out as *mut CudaSlice<half::f16>;
+                unsafe {
+                    kernels.ops.rms_norm(
+                        &*src_ptr, &layer.post_ffw_norm_2, &mut *dst_ptr,
+                        seq_len, config.dim, config.rms_norm_eps,
+                    )?;
+                }
+            }
+
+            // ── 9f. Combine: cur = cur_mlp + cur_moe ──
+            // ffn_out = cur_mlp, attn_mha_out = cur_moe
+            // Result into ffn_out
+            {
+                let a = &scratch.attn_mha_out as *const CudaSlice<half::f16>;
+                let b = &scratch.ffn_out as *const CudaSlice<half::f16>;
+                let c = &mut scratch.ffn_out as *mut CudaSlice<half::f16>;
+                unsafe { kernels.ops.add_f16(&*a, &*b, &mut *c, seq_len * config.dim)?; }
+            }
         }
+
+        // ── 10. Post-FFN norm (shared) + residual ──
+        // cur = post_ffw_norm(cur_mlp + cur_moe)
+        // hidden = cur + attn_out (residual)
+        kernels.ops.post_norm_add(
+            hidden, &scratch.ffn_out, &layer.post_ffw_norm, &mut scratch.norm_out,
+            seq_len, config.dim, config.rms_norm_eps,
+        )?;
 
         // ── 11. Layer output scale ──
         if let Some(scale) = layer.layer_output_scale {
