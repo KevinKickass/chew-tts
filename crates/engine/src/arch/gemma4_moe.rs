@@ -776,7 +776,9 @@ pub fn forward_moe_streaming(
             info!(?h, "L0 hidden before MoE");
         }
 
-        // ── 9b. MoE Router ──
+        // ── 9b. MoE Router ── (TODO: fix CudaView::slice panic)
+        // TEMP SKIP: just use shared FFN output, skip MoE experts
+        if false {
         // Router operates on attn_out (= hidden), NOT on the MLP output
         // llama.cpp: tmp = rms_norm(attn_out) * (1/sqrt(n_embd)) * gate_inp_scale
         //            logits = tmp @ gate_inp
@@ -947,7 +949,7 @@ pub fn forward_moe_streaming(
                 let c = &mut scratch.ffn_out as *mut CudaSlice<half::f16>;
                 unsafe { kernels.ops.add_f16(&*a, &*b, &mut *c, seq_len * config.dim)?; }
             }
-        }
+        } } // close if false + MoE block
 
         // ── 10. Post-FFN norm (shared) + residual ──
         // cur = post_ffw_norm(cur_mlp + cur_moe)
