@@ -1,3 +1,4 @@
+pub mod arch;
 pub mod config;
 pub mod forward;
 pub mod kv_cache;

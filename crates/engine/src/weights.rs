@@ -696,7 +696,7 @@ fn allocate_layer_shell(
 }
 
 /// Upload raw quantized tensor bytes to GPU — no dequantization.
-fn upload_quantized(
+pub(crate) fn upload_quantized(
     gguf: &GgufFile,
     name: &str,
     alloc: &VramAllocator,
@@ -725,7 +725,7 @@ fn upload_quantized(
 /// Upload raw quantized tensor data to GPU and dequantize directly to f16.
 /// Used for small tensors (norms, embeddings) that need f16 for kernels.
 /// Dequant kernels output f16 directly, so no extra conversion needed.
-fn upload_and_dequant(
+pub(crate) fn upload_and_dequant(
     gguf: &GgufFile,
     name: &str,
     alloc: &VramAllocator,

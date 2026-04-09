@@ -7,6 +7,8 @@ pub struct ModelConfig {
     pub n_layers: u32,
     pub n_heads: u32,
     pub n_kv_heads: u32,
+    /// Per-layer KV heads (Gemma 4 MoE: varies between SWA=8, Full=2)
+    pub n_kv_heads_per_layer: Vec<u32>,
     pub dim: u32,
     pub head_dim: u32,
     pub ff_dim: u32,
@@ -25,6 +27,13 @@ pub struct ModelConfig {
     pub head_dims: Vec<u32>,
     /// Per-layer embedding dimension (Gemma 4: 256)
     pub embd_per_layer: Option<u32>,
+    // MoE (Mixture of Experts)
+    /// Number of experts (0 = dense model)
+    pub n_experts: u32,
+    /// Number of experts activated per token
+    pub n_experts_per_tok: u32,
+    /// Expert FFN hidden dim (per expert)
+    pub expert_ff_dim: u32,
     /// Max head_dim across all layers (for scratch buffer sizing)
     pub max_head_dim: u32,
     /// Number of layers that own KV caches (rest reuse from earlier layers)
@@ -40,7 +49,20 @@ impl ModelConfig {
 
         let n_layers = header.block_count().unwrap_or(32);
         let n_heads = header.head_count().unwrap_or(32);
-        let n_kv_heads = header.head_count_kv().unwrap_or(n_heads);
+        // head_count_kv can be scalar or per-layer array (Gemma 4 MoE)
+        let n_kv_heads_per_layer = header.get_u32_array(&format!("{arch}.attention.head_count_kv"))
+            .unwrap_or_default();
+        let n_kv_heads = if !n_kv_heads_per_layer.is_empty() {
+            // Use max as the "default" scalar value
+            *n_kv_heads_per_layer.iter().max().unwrap()
+        } else {
+            header.head_count_kv().unwrap_or(n_heads)
+        };
+        let n_kv_heads_per_layer = if n_kv_heads_per_layer.is_empty() {
+            vec![n_kv_heads; n_layers as usize]
+        } else {
+            n_kv_heads_per_layer
+        };
         let dim = header.embedding_length().unwrap_or(4096);
         let head_dim = dim / n_heads;
         let ff_dim = header.feed_forward_length().unwrap_or(dim * 4);
@@ -59,7 +81,13 @@ impl ModelConfig {
         let attention_scale = if is_gemma4 { 1.0 } else { 1.0 / (head_dim as f32).sqrt() };
         let logit_softcap = header.get_f32(&format!("{arch}.final_logit_softcapping")).ok();
         let rope_theta_swa = header.get_f32(&format!("{arch}.rope.freq_base_swa")).ok();
-        let embd_per_layer = header.get_u32(&format!("{arch}.embedding_length_per_layer_input")).ok();
+        let embd_per_layer = header.get_u32(&format!("{arch}.embedding_length_per_layer_input")).ok()
+            .filter(|&v| v > 0);  // 0 means no per-layer embeddings
+
+        // MoE
+        let n_experts = header.get_u32(&format!("{arch}.expert_count")).unwrap_or(0);
+        let n_experts_per_tok = header.get_u32(&format!("{arch}.expert_used_count")).unwrap_or(0);
+        let expert_ff_dim = header.get_u32(&format!("{arch}.expert_feed_forward_length")).unwrap_or(0);
 
         // SWA layer pattern (if present) — bool array in GGUF
         let swa_layers = if let Ok(pattern) = header.get_bool_array(&format!("{arch}.attention.sliding_window_pattern")) {
@@ -92,6 +120,9 @@ impl ModelConfig {
             let swa_count = swa_layers.iter().filter(|&&x| x).count();
             let full_count = swa_layers.len() - swa_count;
             tracing::info!(swa_count, full_count, swa_head_dim, full_attn_head_dim, max_head_dim, "Gemma4 layer config");
+            if n_experts > 0 {
+                tracing::info!(n_experts, n_experts_per_tok, expert_ff_dim, "MoE config");
+            }
         }
 
         // Number of layers that own their own KV cache
@@ -103,6 +134,7 @@ impl ModelConfig {
             n_layers,
             n_heads,
             n_kv_heads,
+            n_kv_heads_per_layer,
             dim,
             head_dim,
             ff_dim,
@@ -118,6 +150,9 @@ impl ModelConfig {
             rope_theta_swa,
             head_dims,
             embd_per_layer,
+            n_experts,
+            n_experts_per_tok,
+            expert_ff_dim,
             max_head_dim,
             n_kv_layers,
         })
@@ -136,6 +171,16 @@ impl ModelConfig {
     /// Whether this is a Gemma 4 architecture.
     pub fn is_gemma4(&self) -> bool {
         self.arch == "gemma4"
+    }
+
+    /// Whether this model uses MoE.
+    pub fn is_moe(&self) -> bool {
+        self.n_experts > 0
+    }
+
+    /// KV heads for a specific layer.
+    pub fn layer_kv_heads(&self, layer: usize) -> u32 {
+        self.n_kv_heads_per_layer.get(layer).copied().unwrap_or(self.n_kv_heads)
     }
 
     /// Head dim for a specific layer.
