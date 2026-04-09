@@ -15,7 +15,6 @@ pub struct GemvKernels {
     quantize_x: CudaFunction,
     q4_k: CudaFunction,
     dual_q4_k: CudaFunction,
-    qkv_q4_k: CudaFunction,
     q6_k: CudaFunction,
     q8_0: CudaFunction,
     /// Pre-allocated Q8_1 buffer for input vector (max_k / 32 * 36 bytes)
@@ -38,7 +37,6 @@ impl GemvKernels {
             quantize_x: loader::get_fn(&module, "quantize_x_q8_1")?,
             q4_k: loader::get_fn(&module, "gemv_q4_k")?,
             dual_q4_k: loader::get_fn(&module, "gemv_dual_q4_k")?,
-            qkv_q4_k: loader::get_fn(&module, "gemv_qkv_q4_k")?,
             q6_k: loader::get_fn(&module, "gemv_q6_k")?,
             q8_0: loader::get_fn(&module, "gemv_q8_0")?,
             _module: module,
@@ -138,51 +136,4 @@ impl GemvKernels {
         Ok(true)
     }
 
-    /// Fused Q+K+V GEMV for GQA: Q[Nq,K], K[Nk,K], V[Nk,K] in one kernel.
-    /// Nq = n_heads * head_dim, Nk = n_kv_heads * head_dim.
-    /// Only for Q4_K. Assumes quantize_input was called.
-    pub fn gemv_qkv(
-        &self,
-        w_q: &CudaSlice<u8>,
-        w_k: &CudaSlice<u8>,
-        w_v: &CudaSlice<u8>,
-        out_q: &mut CudaSlice<half::f16>,
-        out_k: &mut CudaSlice<half::f16>,
-        out_v: &mut CudaSlice<half::f16>,
-        nq: u32,
-        nk: u32,
-        k: u32,
-        quant_type: chew_gguf::GgmlType,
-    ) -> Result<bool, KernelError> {
-        if quant_type != chew_gguf::GgmlType::Q4_K {
-            return Ok(false);
-        }
-
-        // Launch with Nq blocks (Q has more rows due to GQA)
-        let cfg = LaunchConfig {
-            grid_dim: (nq, 1, 1),
-            block_dim: (128, 1, 1),
-            shared_mem_bytes: 0,
-        };
-
-        let nq_i32 = nq as i32;
-        let nk_i32 = nk as i32;
-        let k_i32 = k as i32;
-
-        let mut args: [*mut std::ffi::c_void; 9] = [
-            slice_ptr(w_q), slice_ptr(w_k), slice_ptr(w_v),
-            slice_ptr_mut(out_q), slice_ptr_mut(out_k), slice_ptr_mut(out_v),
-            scalar_ptr(&nq_i32), scalar_ptr(&nk_i32), scalar_ptr(&k_i32),
-        ];
-        // QKV kernel reads x_q8 as last implicit arg — need to add it
-        // Actually the kernel signature takes x_q8 as the last param
-        let mut args: [*mut std::ffi::c_void; 10] = [
-            slice_ptr(w_q), slice_ptr(w_k), slice_ptr(w_v),
-            slice_ptr_mut(out_q), slice_ptr_mut(out_k), slice_ptr_mut(out_v),
-            scalar_ptr(&nq_i32), scalar_ptr(&nk_i32), scalar_ptr(&k_i32),
-            slice_ptr(&self.x_q8),
-        ];
-        unsafe { self.fast.launch(&self.qkv_q4_k, cfg, &mut args)?; }
-        Ok(true)
-    }
 }

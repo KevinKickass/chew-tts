@@ -202,12 +202,28 @@ pub fn forward(
         } else if seq_len > 1 {
             // Prefill path: no GEMV quantization needed
         }
+        // Q projection (separate) + K+V projection (fused dual GEMV for decode)
         timed!(t_gemm, gemm_q(kernels, &scratch.norm_out, &layer.attn_q, &mut scratch.q,
             seq_len, config.n_heads * config.head_dim, config.dim))?;
-        timed!(t_gemm, gemm_q(kernels, &scratch.norm_out, &layer.attn_k, &mut scratch.k,
-            seq_len, config.n_kv_heads * config.head_dim, config.dim))?;
-        timed!(t_gemm, gemm_q(kernels, &scratch.norm_out, &layer.attn_v, &mut scratch.v,
-            seq_len, config.n_kv_heads * config.head_dim, config.dim))?;
+        if seq_len == 1 && layer.attn_k.quant_type == layer.attn_v.quant_type {
+            let nk = config.n_kv_heads * config.head_dim;
+            let used = timed!(t_gemm, kernels.gemv.gemv_dual(
+                &layer.attn_k.data, &layer.attn_v.data,
+                &mut scratch.k, &mut scratch.v,
+                nk, config.dim, layer.attn_k.quant_type,
+            ))?;
+            if !used {
+                timed!(t_gemm, gemm_q(kernels, &scratch.norm_out, &layer.attn_k, &mut scratch.k,
+                    seq_len, config.n_kv_heads * config.head_dim, config.dim))?;
+                timed!(t_gemm, gemm_q(kernels, &scratch.norm_out, &layer.attn_v, &mut scratch.v,
+                    seq_len, config.n_kv_heads * config.head_dim, config.dim))?;
+            }
+        } else {
+            timed!(t_gemm, gemm_q(kernels, &scratch.norm_out, &layer.attn_k, &mut scratch.k,
+                seq_len, config.n_kv_heads * config.head_dim, config.dim))?;
+            timed!(t_gemm, gemm_q(kernels, &scratch.norm_out, &layer.attn_v, &mut scratch.v,
+                seq_len, config.n_kv_heads * config.head_dim, config.dim))?;
+        }
 
         // 3. RoPE on Q and K
         timed!(t_rope, {

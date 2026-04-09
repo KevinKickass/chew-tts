@@ -1,0 +1,4 @@
+Error: load: missing tensor: not enough VRAM: need model + 256 ctx, have 542 MB free
+
+Caused by:
+    missing tensor: not enough VRAM: need model + 256 ctx, have 542 MB free
