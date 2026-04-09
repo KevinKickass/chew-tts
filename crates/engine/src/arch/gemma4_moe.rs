@@ -367,6 +367,115 @@ pub fn copy_norms_to_shell(
     Ok(())
 }
 
+// ─── Full model container ────────────────────────────────────────────────────
+
+/// All weights for a Gemma 4 MoE model in streaming mode.
+pub struct MoeModelWeights {
+    pub token_embd: CudaSlice<half::f16>,
+    pub output_norm: CudaSlice<half::f16>,
+    pub output: QuantWeight,
+    pub rope_freq_factors: Option<CudaSlice<f32>>,
+
+    pub layer_norms: Vec<MoeStreamingNorms>,
+    pub resident_layers: Vec<MoeLayerWeights>,
+    pub n_resident: usize,
+
+    pub host_layer_data: Vec<u8>,
+    pub host_layer_offsets: Vec<MoeHostLayout>,
+
+    pub shell_a: MoeLayerWeights,
+    pub shell_b: MoeLayerWeights,
+}
+
+impl MoeModelWeights {
+    /// Load the full MoE model with streaming support.
+    pub fn load(
+        gguf: &GgufFile,
+        config: &ModelConfig,
+        plan: &crate::vram_plan::StreamingPlan,
+        alloc: &VramAllocator,
+        dequant: &DequantKernels,
+        gpu_idx: usize,
+    ) -> Result<Self, LoadError> {
+        let stream = Arc::clone(alloc.stream(gpu_idx));
+        let n_layers = config.n_layers as usize;
+        let n_resident = plan.n_resident as usize;
+        let n_streamed = plan.n_streamed as usize;
+
+        info!(arch = "gemma4_moe", layers = n_layers, resident = n_resident, streamed = n_streamed,
+            "loading MoE streaming weights");
+
+        // Global tensors
+        let token_embd = upload_and_dequant(gguf, "token_embd.weight", alloc, dequant, gpu_idx)?;
+        let output_norm = upload_and_dequant(gguf, "output_norm.weight", alloc, dequant, gpu_idx)?;
+
+        // Output: try output.weight, fallback to tied embeddings
+        let output = if gguf.find_tensor("output.weight").is_some() {
+            upload_quantized(gguf, "output.weight", alloc, gpu_idx)?
+        } else {
+            info!("output.weight not found, using tied embeddings as f16 fallback");
+            upload_quantized(gguf, "token_embd.weight", alloc, gpu_idx)?
+        };
+
+        let rope_freq_factors = if gguf.find_tensor("rope_freqs.weight").is_some() {
+            let (_ti, host_data) = gguf.tensor_data_by_name("rope_freqs.weight")
+                .map_err(|_| LoadError::MissingTensor("rope_freqs.weight".into()))?;
+            let n = host_data.len() / 4;
+            let host_f32: Vec<f32> = host_data.chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            let mut gpu_buf = stream.alloc_zeros::<f32>(n)
+                .map_err(|e| LoadError::Vram(chew_vram::VramError::Alloc(e.to_string())))?;
+            stream.memcpy_htod(&host_f32, &mut gpu_buf)
+                .map_err(|e| LoadError::Vram(chew_vram::VramError::Alloc(e.to_string())))?;
+            Some(gpu_buf)
+        } else {
+            None
+        };
+
+        // Load all layer norms to GPU (always resident)
+        let mut layer_norms = Vec::with_capacity(n_layers);
+        for i in 0..n_layers {
+            layer_norms.push(load_layer_norms(gguf, i, alloc, dequant, gpu_idx)?);
+        }
+
+        // Load resident layers fully to GPU
+        let mut resident_layers = Vec::with_capacity(n_resident);
+        for i in 0..n_resident {
+            resident_layers.push(load_layer_to_gpu(gguf, i, config, alloc, dequant, gpu_idx)?);
+        }
+
+        // Load streamed layers to host RAM
+        let mut host_layer_data = Vec::new();
+        let mut host_layer_offsets = Vec::with_capacity(n_streamed);
+        for i in n_resident..n_layers {
+            info!(layer = i, "loading MoE streamed layer to host RAM");
+            host_layer_offsets.push(load_layer_to_host(gguf, i, &mut host_layer_data)?);
+        }
+        info!(host_mb = host_layer_data.len() / (1024 * 1024), "MoE streamed layer data loaded");
+
+        // Allocate double-buffer shells
+        let shell_a = allocate_shell(config, &stream)?;
+        let shell_b = allocate_shell(config, &stream)?;
+
+        info!(n_resident, n_streamed, "MoE streaming weights loaded");
+
+        Ok(Self {
+            token_embd,
+            output_norm,
+            output,
+            rope_freq_factors,
+            layer_norms,
+            resident_layers,
+            n_resident,
+            host_layer_data,
+            host_layer_offsets,
+            shell_a,
+            shell_b,
+        })
+    }
+}
+
 // ─── Expert slicing ─────────────────────────────────────────────────────────
 
 /// Info needed to address one expert's weights within a 3D tensor.

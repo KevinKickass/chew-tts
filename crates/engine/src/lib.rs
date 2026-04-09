@@ -26,6 +26,8 @@ pub enum WeightStorage {
     Normal(ModelWeights),
     /// Some layers streamed from host RAM — double-buffered DMA.
     Streaming(StreamingWeights),
+    /// Gemma 4 MoE — own layer structs + streaming.
+    Moe(arch::gemma4_moe::MoeModelWeights),
 }
 
 impl WeightStorage {
@@ -33,6 +35,7 @@ impl WeightStorage {
         match self {
             WeightStorage::Normal(w) => &w.token_embd,
             WeightStorage::Streaming(w) => &w.token_embd,
+            WeightStorage::Moe(w) => &w.token_embd,
         }
     }
 
@@ -40,6 +43,7 @@ impl WeightStorage {
         match self {
             WeightStorage::Normal(w) => &w.output_norm,
             WeightStorage::Streaming(w) => &w.output_norm,
+            WeightStorage::Moe(w) => &w.output_norm,
         }
     }
 
@@ -47,6 +51,7 @@ impl WeightStorage {
         match self {
             WeightStorage::Normal(w) => &w.output,
             WeightStorage::Streaming(w) => &w.output,
+            WeightStorage::Moe(w) => &w.output,
         }
     }
 
@@ -54,6 +59,7 @@ impl WeightStorage {
         match self {
             WeightStorage::Normal(w) => w.per_layer_token_embd.as_ref(),
             WeightStorage::Streaming(w) => w.per_layer_token_embd.as_ref(),
+            WeightStorage::Moe(_) => None, // MoE models have no per-layer embeddings
         }
     }
 
@@ -61,6 +67,7 @@ impl WeightStorage {
         match self {
             WeightStorage::Normal(w) => w.per_layer_model_proj.as_ref(),
             WeightStorage::Streaming(w) => w.per_layer_model_proj.as_ref(),
+            WeightStorage::Moe(_) => None,
         }
     }
 
@@ -68,6 +75,7 @@ impl WeightStorage {
         match self {
             WeightStorage::Normal(w) => w.per_layer_proj_norm.as_ref(),
             WeightStorage::Streaming(w) => w.per_layer_proj_norm.as_ref(),
+            WeightStorage::Moe(_) => None,
         }
     }
 
@@ -75,11 +83,12 @@ impl WeightStorage {
         match self {
             WeightStorage::Normal(w) => w.rope_freq_factors.as_ref(),
             WeightStorage::Streaming(w) => w.rope_freq_factors.as_ref(),
+            WeightStorage::Moe(w) => w.rope_freq_factors.as_ref(),
         }
     }
 
     pub fn is_streaming(&self) -> bool {
-        matches!(self, WeightStorage::Streaming(_))
+        matches!(self, WeightStorage::Streaming(_) | WeightStorage::Moe(_))
     }
 }
 
@@ -227,6 +236,17 @@ impl ChewEngine {
             // Largest matrices: ffn_gate/up [ff_dim, dim], output [vocab, dim]
             // For Gemma 4: per_layer_token_embd can be huge but stays quantized
             let mut max = [nh * hd * d, ff * d, v * d].into_iter().max().unwrap();
+            // MoE: expert tensors can be huge
+            if config.is_moe() {
+                let exp_ff = config.expert_ff_dim as usize;
+                let n_exp = config.n_experts as usize;
+                // gate_up_exps: [dim, expert_ff*2, n_experts] — we dequant one expert at a time
+                max = max.max(d * exp_ff * 2);
+                // down_exps: [expert_ff, dim, n_experts]
+                max = max.max(exp_ff * d);
+                // Full 3D tensor for GPU allocation sizing
+                let _ = n_exp; // used in VRAM plan, not here
+            }
             // per_layer_model_proj: [n_embd_per_layer * n_layers, dim]
             if let Some(epl) = config.embd_per_layer {
                 let proj_size = (epl as usize) * (config.n_layers as usize) * d;
@@ -238,8 +258,20 @@ impl ChewEngine {
         let max_k = config.ff_dim.max(config.dim) as usize;
         let kernels = GpuKernels::load(&stream, max_weight_elems, max_k)?;
 
-        // 4. Load + dequantize weights (normal or streaming)
-        let weights = if let Some(ref sp) = streaming_plan {
+        // 4. Load + dequantize weights (normal, streaming, or MoE)
+        let weights = if config.is_moe() {
+            // MoE always uses streaming (expert weights are huge)
+            let sp = streaming_plan.as_ref().ok_or_else(|| {
+                EngineError::Load(LoadError::MissingTensor(
+                    "MoE model requires streaming mode but VRAM plan failed".into()
+                ))
+            })?;
+            info!("loading MoE in STREAMING mode: {} resident, {} streamed",
+                sp.n_resident, sp.n_streamed);
+            WeightStorage::Moe(
+                arch::gemma4_moe::MoeModelWeights::load(&gguf, &config, sp, alloc, &kernels.dequant, gpu_idx)?
+            )
+        } else if let Some(ref sp) = streaming_plan {
             info!("loading in STREAMING mode: {} resident, {} streamed",
                 sp.n_resident, sp.n_streamed);
             WeightStorage::Streaming(
@@ -458,8 +490,8 @@ impl ChewEngine {
                                     pos, &self.stream,
                                 )?);
                             }
-                            WeightStorage::Streaming(_) => {
-                                unreachable!("CUDA graph disabled for streaming mode");
+                            WeightStorage::Streaming(_) | WeightStorage::Moe(_) => {
+                                unreachable!("CUDA graph disabled for streaming/MoE mode");
                             }
                         }
                     }
@@ -584,6 +616,10 @@ impl ChewEngine {
                     &mut self.kernels, &mut self.kv_cache, &mut self.scratch,
                     seq_len, pe, &self.stream,
                 )?;
+            }
+            WeightStorage::Moe(_) => {
+                // MoE uses its own forward pass with expert routing
+                todo!("MoE forward pass — next step");
             }
         }
         Ok(())

@@ -930,7 +930,7 @@ pub fn forward_streaming(
 ) -> Result<(), KernelError> {
     let sw = match weights {
         WeightStorage::Streaming(s) => s,
-        WeightStorage::Normal(_) => panic!("forward_streaming called with Normal weights"),
+        _ => panic!("forward_streaming called with non-Streaming weights"),
     };
 
     let is_gemma4 = config.is_gemma4();
