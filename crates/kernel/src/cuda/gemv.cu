@@ -271,9 +271,8 @@ __global__ void gemv_q8_0(const void* __restrict__ W,
     for (int blk = tid / 4; blk < blocks_per_row; blk += 32) {
         const uint8_t* w_block = row_data + blk * 34;
         const __half w_d = *(const __half*)w_block;
-        const int* w_qs = (const int*)(w_block + 2);
-        int v0 = w_qs[iqs + 0];
-        int v1 = w_qs[iqs + 1];
+        int v0 = get_int_b2(w_block + 2, iqs + 0);
+        int v1 = get_int_b2(w_block + 2, iqs + 1);
 
         const uint8_t* bq8 = (const uint8_t*)x_q8 + blk * Q8_1_BYTES;
         const __half x_d = __low2half(*(const half2*)bq8);

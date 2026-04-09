@@ -555,7 +555,7 @@ impl MoeModelWeights {
 
 // ─── Forward pass ───────────────────────────────────────────────────────────
 
-use crate::forward::ScratchBuffers;
+use crate::forward::{ScratchBuffers, gemm_q};
 use crate::kv_cache::KvCache;
 use chew_kernel::{GpuKernels, KernelError};
 
@@ -660,18 +660,24 @@ pub fn forward_moe_streaming(
         let q_dim = config.n_heads * hd;
         let kv_dim = kv_heads * hd;
 
-        // NOTE: skip quantize_input for MoE — GEMV has alignment issues with MoE weights
-        // All projections use dequant+cuBLAS fallback path instead of GEMV
-        gemm_no_gemv(kernels, &scratch.norm_out, &layer.attn_q, &mut scratch.q,
+        // GEMV for resident layers, cuBLAS for streamed (shell alignment issues)
+        let is_resident = layer_idx < moe_weights.n_resident;
+        if seq_len == 1 && is_resident {
+            kernels.gemv.quantize_input(&scratch.norm_out, config.dim)?;
+        }
+        let gemm = |k: &mut GpuKernels, a: &CudaSlice<half::f16>, w: &QuantWeight, c: &mut CudaSlice<half::f16>, m: u32, n: u32, kk: u32| -> Result<(), KernelError> {
+            if is_resident { gemm_q(k, a, w, c, m, n, kk) } else { gemm_no_gemv(k, a, w, c, m, n, kk) }
+        };
+        gemm(kernels, &scratch.norm_out, &layer.attn_q, &mut scratch.q,
             seq_len, q_dim, config.dim)?;
         sync_check!("Q_proj");
-        gemm_no_gemv(kernels, &scratch.norm_out, &layer.attn_k, &mut scratch.k,
+        gemm(kernels, &scratch.norm_out, &layer.attn_k, &mut scratch.k,
             seq_len, kv_dim, config.dim)?;
         sync_check!("K_proj");
 
         // V = K for shared-KV layers (full attention), or separate V
         if let Some(ref attn_v) = layer.attn_v {
-            gemm_no_gemv(kernels, &scratch.norm_out, attn_v, &mut scratch.v,
+            gemm(kernels, &scratch.norm_out, attn_v, &mut scratch.v,
                 seq_len, kv_dim, config.dim)?;
         } else {
             // Shared KV: V = K — copy only kv_dim * seq_len elements
@@ -786,7 +792,10 @@ pub fn forward_moe_streaming(
         if seq_len == 1 {
             kernels.gemv.quantize_input(&scratch.attn_mha_out, q_dim)?;
         }
-        gemm_no_gemv(kernels, &scratch.attn_mha_out, &layer.attn_output, &mut scratch.attn_out,
+        if seq_len == 1 && is_resident {
+            kernels.gemv.quantize_input(&scratch.attn_mha_out, q_dim)?;
+        }
+        gemm(kernels, &scratch.attn_mha_out, &layer.attn_output, &mut scratch.attn_out,
             seq_len, config.dim, q_dim)?;
 
         // ── 8. Post-attention norm + residual ──
@@ -819,9 +828,12 @@ pub fn forward_moe_streaming(
         if seq_len == 1 {
             kernels.gemv.quantize_input(&scratch.norm_out, config.dim)?;
         }
-        gemm_no_gemv(kernels, &scratch.norm_out, &layer.ffn_gate, &mut scratch.ffn_gate_out,
+        if seq_len == 1 && is_resident {
+            kernels.gemv.quantize_input(&scratch.norm_out, config.dim)?;
+        }
+        gemm(kernels, &scratch.norm_out, &layer.ffn_gate, &mut scratch.ffn_gate_out,
             seq_len, config.ff_dim, config.dim)?;
-        gemm_no_gemv(kernels, &scratch.norm_out, &layer.ffn_up, &mut scratch.ffn_up_out,
+        gemm(kernels, &scratch.norm_out, &layer.ffn_up, &mut scratch.ffn_up_out,
             seq_len, config.ff_dim, config.dim)?;
 
         kernels.ops.gelu(
@@ -833,20 +845,19 @@ pub fn forward_moe_streaming(
             kernels.gemv.quantize_input(&scratch.ffn_silu_out, config.ff_dim)?;
         }
         // cur_mlp → ffn_out
-        gemm_no_gemv(kernels, &scratch.ffn_silu_out, &layer.ffn_down, &mut scratch.ffn_out,
+        if seq_len == 1 && is_resident {
+            kernels.gemv.quantize_input(&scratch.ffn_silu_out, config.ff_dim)?;
+        }
+        gemm(kernels, &scratch.ffn_silu_out, &layer.ffn_down, &mut scratch.ffn_out,
             seq_len, config.dim, config.ff_dim)?;
 
-        // RMSNorm the shared MLP output (post_ffw_norm_1)
-        {
-            let src_ptr = &scratch.ffn_out as *const CudaSlice<half::f16>;
-            let dst_ptr = &mut scratch.ffn_out as *mut CudaSlice<half::f16>;
-            unsafe {
-                kernels.ops.rms_norm(
-                    &*src_ptr, &layer.post_ffw_norm_1, &mut *dst_ptr,
-                    seq_len, config.dim, config.rms_norm_eps,
-                )?;
-            }
-        }
+        // RMSNorm the shared MLP output (post_ffw_norm_1): ffn_out → attn_out → ffn_out
+        kernels.ops.rms_norm(
+            &scratch.ffn_out, &layer.post_ffw_norm_1, &mut scratch.attn_out,
+            seq_len, config.dim, config.rms_norm_eps,
+        )?;
+        stream.memcpy_dtod(&scratch.attn_out, &mut scratch.ffn_out)
+            .map_err(|e| KernelError::Launch(e.to_string()))?;
         // ffn_out now holds cur_mlp (normed shared MLP output)
         if layer_idx == 0 {
             let mut d = vec![half::f16::ZERO; 4];
@@ -892,7 +903,10 @@ pub fn forward_moe_streaming(
                 kernels.gemv.quantize_input(&scratch.norm_out, config.dim)?;
             }
             // Reuse attn_out for logits (n_experts=128 < dim=2816, fits)
-            gemm_no_gemv(kernels, &scratch.norm_out, &layer.moe_gate, &mut scratch.attn_out,
+            if seq_len == 1 && is_resident {
+                kernels.gemv.quantize_input(&scratch.attn_mha_out, config.dim)?;
+            }
+            gemm(kernels, &scratch.attn_mha_out, &layer.moe_gate, &mut scratch.attn_out,
                 seq_len, n_experts, config.dim)?;
 
             // ── 9c. MoE FFN input (separate norm on attn_out) ──
@@ -1089,6 +1103,9 @@ pub fn forward_moe_streaming(
         seq_len, config.dim, config.rms_norm_eps,
     )?;
 
+    if seq_len == 1 {
+        kernels.gemv.quantize_input(&scratch.norm_out, config.dim)?;
+    }
     if seq_len == 1 {
         kernels.gemv.quantize_input(&scratch.norm_out, config.dim)?;
     }
