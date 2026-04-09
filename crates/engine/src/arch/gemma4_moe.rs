@@ -562,6 +562,14 @@ pub fn forward_moe_streaming(
 
     let mut use_shell_a = true;
 
+    // Debug: check hidden at very start of decode forward
+    if seq_len == 1 {
+        let mut h = vec![0.0f32; 4];
+        stream.memcpy_dtoh(&hidden.slice(0..4), &mut h)
+            .map_err(|e| KernelError::Launch(e.to_string()))?;
+        info!(?h, "MoE forward START hidden (decode)");
+    }
+
     for layer_idx in 0..n_layers {
         let hd = config.layer_head_dim(layer_idx);
         let kv_heads = config.layer_kv_heads(layer_idx);
