@@ -867,12 +867,17 @@ __global__ void copy_f16_with_offset(const __half* __restrict__ src,
 // --- MHA reading kv_len and pos_offset from device memory ---
 // Uses base KV cache pointers (not views) — compatible with graph replay.
 // Shared memory must be allocated for max_kv_len at capture time.
+// --- Tiled MHA for CUDA Graph (fixed shared memory) ---
+// Processes KV positions in tiles of TILE_KV. Uses online softmax across tiles.
+// Shared memory: TILE_KV + blockDim.x floats = CONSTANT regardless of kv_len.
+// This is the key: CUDA Graph can capture this with fixed smem.
+#define MHA_TILE_KV 128
 __global__ void mha_fused_graph(
     const __half* __restrict__ q,
-    const __half* __restrict__ k_base,     // Full KV cache K base pointer
-    const __half* __restrict__ v_base,     // Full KV cache V base pointer
+    const __half* __restrict__ k_base,
+    const __half* __restrict__ v_base,
     __half* __restrict__ out,
-    const int* __restrict__ decode_params, // [pos, kv_len, kv_offset]
+    const int* __restrict__ decode_params,
     int head_dim,
     int n_heads,
     int n_kv_heads,
@@ -882,70 +887,122 @@ __global__ void mha_fused_graph(
     int q_pos_local = blockIdx.y;
 
     int kv_len = decode_params[1];
-    int pos_offset = decode_params[0]; // For decode, pos_offset = pos
-
+    int pos_offset = decode_params[0];
     int q_pos_global = pos_offset + q_pos_local;
     int kv_head = head / (n_heads / n_kv_heads);
 
     const __half* q_vec = q + q_pos_local * n_heads * head_dim + head * head_dim;
 
+    // Fixed shared memory: tile_scores[TILE_KV] + scratch[blockDim.x]
     extern __shared__ float smem[];
-    float* scores = smem;
-    float* scratch = smem + kv_len;
+    float* tile_scores = smem;
+    float* scratch = smem + MHA_TILE_KV;
 
-    // --- Step 1: Compute attention scores ---
-    for (int kp = 0; kp < kv_len; kp++) {
-        if (kp > q_pos_global) {
-            if (threadIdx.x == 0) scores[kp] = -1e30f;
-            continue;
-        }
-        const __half* k_vec = k_base + kp * n_kv_heads * head_dim + kv_head * head_dim;
-        float dot = 0.0f;
-        for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
-            dot += __half2float(q_vec[d]) * __half2float(k_vec[d]);
-        }
-        scratch[threadIdx.x] = dot;
-        __syncthreads();
-        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-            if (threadIdx.x < s) scratch[threadIdx.x] += scratch[threadIdx.x + s];
+    // Online softmax state per thread
+    float global_max = -1e30f;
+    float global_sum = 0.0f;
+
+    // Per-thread V accumulator (head_dim elements spread across threads)
+    // For head_dim=128, 128 threads: 1 element per thread
+    float v_acc[4] = {0,0,0,0}; // supports head_dim up to 512 with 128 threads
+    int elems = (head_dim + blockDim.x - 1) / (int)blockDim.x;
+
+    // Process KV in tiles
+    for (int tile_start = 0; tile_start < kv_len; tile_start += MHA_TILE_KV) {
+        int tile_end = tile_start + MHA_TILE_KV;
+        if (tile_end > kv_len) tile_end = kv_len;
+        int tile_size = tile_end - tile_start;
+
+        // --- Compute scores for this tile ---
+        for (int t = 0; t < tile_size; t++) {
+            int kp = tile_start + t;
+            if (kp > q_pos_global) {
+                if (threadIdx.x == 0) tile_scores[t] = -1e30f;
+                __syncthreads();
+                continue;
+            }
+
+            const __half* k_vec = k_base + kp * n_kv_heads * head_dim + kv_head * head_dim;
+            float dot = 0.0f;
+            for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+                dot += __half2float(q_vec[d]) * __half2float(k_vec[d]);
+            }
+            scratch[threadIdx.x] = dot;
+            __syncthreads();
+            for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+                if (threadIdx.x < s) scratch[threadIdx.x] += scratch[threadIdx.x + s];
+                __syncthreads();
+            }
+            if (threadIdx.x == 0) tile_scores[t] = scratch[0] * scale;
             __syncthreads();
         }
-        if (threadIdx.x == 0) scores[kp] = scratch[0] * scale;
+
+        // --- Tile max ---
+        float tile_max = -1e30f;
+        for (int t = threadIdx.x; t < tile_size; t += blockDim.x) {
+            if (tile_scores[t] > tile_max) tile_max = tile_scores[t];
+        }
+        scratch[threadIdx.x] = tile_max;
         __syncthreads();
-    }
-
-    // --- Step 2: Softmax ---
-    if (threadIdx.x == 0) {
-        float max_val = -1e30f;
-        for (int kp = 0; kp < kv_len; kp++)
-            if (scores[kp] > max_val) max_val = scores[kp];
-        scratch[0] = max_val;
-    }
-    __syncthreads();
-    float max_val = scratch[0];
-
-    if (threadIdx.x == 0) {
-        float sum = 0.0f;
-        for (int kp = 0; kp < kv_len; kp++) {
-            float e = expf(scores[kp] - max_val);
-            scores[kp] = e;
-            sum += e;
+        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+            if (threadIdx.x < s) scratch[threadIdx.x] = fmaxf(scratch[threadIdx.x], scratch[threadIdx.x + s]);
+            __syncthreads();
         }
-        for (int kp = 0; kp < kv_len; kp++) scores[kp] /= sum;
-    }
-    __syncthreads();
+        tile_max = scratch[0];
 
-    // --- Step 3: Weighted sum of V ---
+        // --- Online softmax: merge tile with global state ---
+        float new_max = fmaxf(global_max, tile_max);
+        float old_scale_factor = expf(global_max - new_max);
+        float tile_scale_factor = expf(tile_max - new_max);
+
+        // Rescale V accumulator from old max
+        for (int e = 0; e < elems; e++) {
+            v_acc[e] *= old_scale_factor;
+        }
+        global_sum *= old_scale_factor;
+
+        // Exp scores relative to tile_max, then scale to new_max
+        for (int t = threadIdx.x; t < tile_size; t += blockDim.x) {
+            tile_scores[t] = expf(tile_scores[t] - tile_max) * tile_scale_factor;
+        }
+        __syncthreads();
+
+        // Sum this tile's weights
+        float tile_sum = 0.0f;
+        for (int t = 0; t < tile_size; t++) {
+            tile_sum += tile_scores[t];
+        }
+        global_sum += tile_sum;
+
+        // Accumulate weighted V for this tile
+        for (int e = 0; e < elems; e++) {
+            int d = threadIdx.x + e * blockDim.x;
+            if (d < head_dim) {
+                float acc = 0.0f;
+                for (int t = 0; t < tile_size; t++) {
+                    int kp = tile_start + t;
+                    const __half* v_vec = v_base + kp * n_kv_heads * head_dim + kv_head * head_dim;
+                    acc += tile_scores[t] * __half2float(v_vec[d]);
+                }
+                v_acc[e] += acc;
+            }
+        }
+
+        global_max = new_max;
+    }
+
+    // --- Write output: v_acc / global_sum ---
     __half* out_vec = out + q_pos_local * n_heads * head_dim + head * head_dim;
-    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
-        float acc = 0.0f;
-        for (int kp = 0; kp < kv_len; kp++) {
-            const __half* v_vec = v_base + kp * n_kv_heads * head_dim + kv_head * head_dim;
-            acc += scores[kp] * __half2float(v_vec[d]);
+    float inv = (global_sum > 0.0f) ? 1.0f / global_sum : 0.0f;
+    for (int e = 0; e < elems; e++) {
+        int d = threadIdx.x + e * blockDim.x;
+        if (d < head_dim) {
+            out_vec[d] = __float2half(v_acc[e] * inv);
         }
-        out_vec[d] = __float2half(acc);
     }
 }
+
+// (Old mha_fused_graph with dynamic smem removed — replaced by tiled version above)
 
 // =============================================================
 // Gemma 4 kernels

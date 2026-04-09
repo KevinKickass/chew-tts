@@ -1012,25 +1012,36 @@ fn forward_for_graph(
 
     let n_layers = config.n_layers as usize;
 
-    // Layer 0: initial RMSNorm
-    kernels.ops.rms_norm_f32in(
-        hidden, &weights.layers[0].attn_norm, &mut scratch.norm_out,
-        seq_len, config.dim, config.rms_norm_eps,
-    )?;
+    // Layer 0: initial RMSNorm + Q8_1 quantize (fused)
+    {
+        let x_q8 = kernels.gemv.x_q8_mut();
+        kernels.ops.rms_norm_f32in_q8(
+            hidden, &weights.layers[0].attn_norm, &mut scratch.norm_out,
+            x_q8, seq_len, config.dim, config.rms_norm_eps,
+        )?;
+    }
 
     for layer_idx in 0..n_layers {
         let layer = &weights.layers[layer_idx];
 
-        // QKV projections
-        kernels.gemv.quantize_input(&scratch.norm_out, config.dim)?;
+        // QKV: Q separate + K+V dual (fused, x_q8 already set)
         gemm_q(kernels, &scratch.norm_out, &layer.attn_q, &mut scratch.q,
             seq_len, config.n_heads * config.head_dim, config.dim)?;
-        gemm_q(kernels, &scratch.norm_out, &layer.attn_k, &mut scratch.k,
-            seq_len, config.n_kv_heads * config.head_dim, config.dim)?;
-        gemm_q(kernels, &scratch.norm_out, &layer.attn_v, &mut scratch.v,
-            seq_len, config.n_kv_heads * config.head_dim, config.dim)?;
+        if layer.attn_k.quant_type == layer.attn_v.quant_type {
+            let nk = config.n_kv_heads * config.head_dim;
+            let _ = kernels.gemv.gemv_dual(
+                &layer.attn_k.data, &layer.attn_v.data,
+                &mut scratch.k, &mut scratch.v,
+                nk, config.dim, layer.attn_k.quant_type,
+            )?;
+        } else {
+            gemm_q(kernels, &scratch.norm_out, &layer.attn_k, &mut scratch.k,
+                seq_len, config.n_kv_heads * config.head_dim, config.dim)?;
+            gemm_q(kernels, &scratch.norm_out, &layer.attn_v, &mut scratch.v,
+                seq_len, config.n_kv_heads * config.head_dim, config.dim)?;
+        }
 
-        // RoPE on Q and K — using graph-compatible kernel (reads pos from device memory)
+        // RoPE (graph-compatible)
         kernels.ops.rope_graph(
             &mut scratch.q, decode_params, seq_len, config.n_heads, config.head_dim, config.rope_theta,
         )?;
@@ -1038,7 +1049,7 @@ fn forward_for_graph(
             &mut scratch.k, decode_params, seq_len, config.n_kv_heads, config.head_dim, config.rope_theta,
         )?;
 
-        // Write K, V into KV cache using offset-based copy (graph-compatible)
+        // KV cache write (graph-compatible offset-based copy)
         let kv_elems = seq_len * config.n_kv_heads * config.head_dim;
         {
             let k_base = kv_cache.k_base_mut(layer_idx);
@@ -1049,7 +1060,7 @@ fn forward_for_graph(
             kernels.ops.copy_f16_with_offset(&scratch.v, v_base, decode_params, kv_elems)?;
         }
 
-        // MHA — using graph-compatible kernel (reads kv_len from device memory, uses base pointers)
+        // MHA (tiled, graph-compatible, fixed smem)
         {
             let k_base = kv_cache.k_base(layer_idx);
             let v_base = kv_cache.v_base(layer_idx);
@@ -1066,18 +1077,28 @@ fn forward_for_graph(
         gemm_q(kernels, &scratch.attn_mha_out, &layer.attn_output, &mut scratch.attn_out,
             seq_len, config.dim, config.n_heads * config.head_dim)?;
 
-        // Fused add + RMSNorm
-        kernels.ops.fused_add_rmsnorm(
-            hidden, &scratch.attn_out, &layer.ffn_norm, &mut scratch.norm_out,
-            seq_len, config.dim, config.rms_norm_eps,
-        )?;
+        // Fused add + RMSNorm + Q8_1 quantize
+        {
+            let x_q8 = kernels.gemv.x_q8_mut();
+            kernels.ops.fused_add_rmsnorm_q8(
+                hidden, &scratch.attn_out, &layer.ffn_norm, &mut scratch.norm_out,
+                x_q8, seq_len, config.dim, config.rms_norm_eps,
+            )?;
+        }
 
-        // Gate + Up projections
-        kernels.gemv.quantize_input(&scratch.norm_out, config.dim)?;
-        gemm_q(kernels, &scratch.norm_out, &layer.ffn_gate, &mut scratch.ffn_gate_out,
-            seq_len, config.ff_dim, config.dim)?;
-        gemm_q(kernels, &scratch.norm_out, &layer.ffn_up, &mut scratch.ffn_up_out,
-            seq_len, config.ff_dim, config.dim)?;
+        // Gate+Up (dual fused, x_q8 already set)
+        if layer.ffn_gate.quant_type == layer.ffn_up.quant_type {
+            let _ = kernels.gemv.gemv_dual(
+                &layer.ffn_gate.data, &layer.ffn_up.data,
+                &mut scratch.ffn_gate_out, &mut scratch.ffn_up_out,
+                config.ff_dim, config.dim, layer.ffn_gate.quant_type,
+            )?;
+        } else {
+            gemm_q(kernels, &scratch.norm_out, &layer.ffn_gate, &mut scratch.ffn_gate_out,
+                seq_len, config.ff_dim, config.dim)?;
+            gemm_q(kernels, &scratch.norm_out, &layer.ffn_up, &mut scratch.ffn_up_out,
+                seq_len, config.ff_dim, config.dim)?;
+        }
 
         // SiLU
         kernels.ops.silu(
@@ -1090,12 +1111,13 @@ fn forward_for_graph(
         gemm_q(kernels, &scratch.ffn_silu_out, &layer.ffn_down, &mut scratch.ffn_out,
             seq_len, config.dim, config.ff_dim)?;
 
-        // Residual + next layer's norm (or just add for last layer)
+        // Residual + next layer's fused norm+Q8
         if layer_idx + 1 < n_layers {
-            kernels.ops.fused_add_rmsnorm(
+            let x_q8 = kernels.gemv.x_q8_mut();
+            kernels.ops.fused_add_rmsnorm_q8(
                 hidden, &scratch.ffn_out,
                 &weights.layers[layer_idx + 1].attn_norm, &mut scratch.norm_out,
-                seq_len, config.dim, config.rms_norm_eps,
+                x_q8, seq_len, config.dim, config.rms_norm_eps,
             )?;
         } else {
             kernels.ops.add_inplace_f32_f16(hidden, &scratch.ffn_out, n_elems)?;

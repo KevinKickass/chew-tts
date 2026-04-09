@@ -696,8 +696,9 @@ impl OpsKernels {
         Ok(())
     }
 
-    /// MHA reading kv_len/pos from device memory. Uses base KV cache pointers.
-    /// shared_mem_bytes must be pre-computed for max kv_len (allocated at capture time).
+    /// Tiled MHA reading kv_len/pos from device memory. Uses base KV cache pointers.
+    /// Fixed shared memory: (MHA_TILE_KV + threads) * 4 bytes — independent of kv_len.
+    /// This allows CUDA Graph capture without occupancy degradation.
     pub fn mha_fused_graph(
         &self,
         q: &CudaSlice<half::f16>,
@@ -709,16 +710,12 @@ impl OpsKernels {
         n_heads: u32,
         n_kv_heads: u32,
         seq_len: u32,
-        max_kv_len: u32,
+        _max_kv_len: u32,  // unused now — smem is fixed
     ) -> Result<(), KernelError> {
         let threads = 128u32.min(head_dim);
-        // Allocate shared memory for max_kv_len (graph-stable)
-        let smem = (max_kv_len + threads) * 4;
-        let cfg = LaunchConfig {
-            grid_dim: (n_heads, seq_len, 1),
-            block_dim: (threads, 1, 1),
-            shared_mem_bytes: smem,
-        };
+        // Fixed smem: TILE_KV(128) + threads for scratch
+        let tile_kv = 128u32;
+        let smem = (tile_kv + threads) * 4;
         let hd = head_dim as i32;
         let nh = n_heads as i32;
         let nkv = n_kv_heads as i32;
@@ -730,7 +727,7 @@ impl OpsKernels {
             scalar_ptr(&hd), scalar_ptr(&nh), scalar_ptr(&nkv),
             scalar_ptr(&sl), scalar_ptr(&scale),
         ];
-        unsafe { self.fast.fire(&self.mha_fused_graph, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
+        unsafe { self.fast.fire(&self.mha_fused_graph, (n_heads, seq_len, 1), (threads, 1, 1), smem, &mut args); }
         Ok(())
     }
 
