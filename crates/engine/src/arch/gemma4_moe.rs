@@ -964,27 +964,20 @@ pub fn forward_moe_streaming(
                 KernelError::Launch(e.to_string())
             })?;
 
-            // RMSNorm cur_moe (post_ffw_norm_2)
-            {
-                let src_ptr = &scratch.attn_mha_out as *const CudaSlice<half::f16>;
-                let dst_ptr = &mut scratch.attn_mha_out as *mut CudaSlice<half::f16>;
-                unsafe {
-                    kernels.ops.rms_norm(
-                        &*src_ptr, &layer.post_ffw_norm_2, &mut *dst_ptr,
-                        seq_len, config.dim, config.rms_norm_eps,
-                    )?;
-                }
-            }
+            // RMSNorm cur_moe (post_ffw_norm_2): attn_mha_out → norm_out
+            kernels.ops.rms_norm(
+                &scratch.attn_mha_out, &layer.post_ffw_norm_2, &mut scratch.norm_out,
+                seq_len, config.dim, config.rms_norm_eps,
+            )?;
 
             // ── 9f. Combine: cur = cur_mlp + cur_moe ──
-            // ffn_out = cur_mlp, attn_mha_out = cur_moe
+            // ffn_out = cur_mlp, norm_out = normed cur_moe
             // Result into ffn_out
-            {
-                let a = &scratch.attn_mha_out as *const CudaSlice<half::f16>;
-                let b = &scratch.ffn_out as *const CudaSlice<half::f16>;
-                let c = &mut scratch.ffn_out as *mut CudaSlice<half::f16>;
-                unsafe { kernels.ops.add_f16(&*a, &*b, &mut *c, seq_len * config.dim)?; }
-            }
+            kernels.ops.add_f16(&scratch.norm_out, &scratch.ffn_out, &mut scratch.attn_out,
+                seq_len * config.dim)?;
+            // Copy result back to ffn_out for post-FFN norm
+            stream.memcpy_dtod(&scratch.attn_out, &mut scratch.ffn_out)
+                .map_err(|e| KernelError::Launch(e.to_string()))?;
             } // close MoE inner block
         } // close MoE outer block
 
@@ -1023,6 +1016,12 @@ pub fn forward_moe_streaming(
     }
     gemm_q(kernels, &scratch.norm_out, &moe_weights.output, &mut scratch.logits,
         seq_len, config.vocab_size, config.dim)?;
+
+    // Sync after logit GEMM to catch errors
+    stream.synchronize().map_err(|e| {
+        tracing::error!(%e, "CUDA error after logit GEMM");
+        KernelError::Launch(e.to_string())
+    })?;
 
     // Logit softcap
     if let Some(cap) = config.logit_softcap {
