@@ -86,6 +86,40 @@ __global__ void rms_norm_f32in(const float* __restrict__ x,
     }
 }
 
+// --- RMS Norm f32 input, NO weight, output f16 ---
+// out[row,i] = x[row,i] / rms(x[row,:])
+__global__ void rms_norm_f32in_no_weight(const float* __restrict__ x,
+                                          __half* __restrict__ out,
+                                          int dim,
+                                          float eps) {
+    int row = blockIdx.x;
+    const float* x_row = x + row * dim;
+    __half* out_row = out + row * dim;
+
+    extern __shared__ float sdata[];
+
+    float local_sum = 0.0f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        float v = x_row[i];
+        local_sum += v * v;
+    }
+    sdata[threadIdx.x] = local_sum;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            sdata[threadIdx.x] += sdata[threadIdx.x + s];
+        }
+        __syncthreads();
+    }
+
+    float rms = sqrtf(sdata[0] / (float)dim + eps);
+
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        out_row[i] = __float2half(x_row[i] / rms);
+    }
+}
+
 // --- Element-wise Add: f16 + f16 -> f16 ---
 __global__ void add_f16(const __half* __restrict__ a,
                          const __half* __restrict__ b,

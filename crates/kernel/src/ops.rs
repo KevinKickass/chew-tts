@@ -37,6 +37,7 @@ pub struct OpsKernels {
     // Gemma 4 kernels
     gelu: CudaFunction,
     rms_norm_no_weight: CudaFunction,
+    rms_norm_f32in_no_weight: CudaFunction,
     scale_f16: CudaFunction,
     scale_f32_inplace: CudaFunction,
     logit_softcap: CudaFunction,
@@ -86,6 +87,7 @@ impl OpsKernels {
             // Gemma 4 kernels
             gelu: loader::get_fn(&module, "gelu")?,
             rms_norm_no_weight: loader::get_fn(&module, "rms_norm_no_weight")?,
+            rms_norm_f32in_no_weight: loader::get_fn(&module, "rms_norm_f32in_no_weight")?,
             scale_f16: loader::get_fn(&module, "scale_f16")?,
             scale_f32_inplace: loader::get_fn(&module, "scale_f32_inplace")?,
             logit_softcap: loader::get_fn(&module, "logit_softcap")?,
@@ -169,6 +171,30 @@ impl OpsKernels {
         ];
         unsafe { self.fast.fire(&self.rms_norm_f32in, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
 
+        Ok(())
+    }
+
+    /// RMSNorm f32 → f16 WITHOUT weight. Just normalize.
+    pub fn rms_norm_f32in_no_weight(
+        &self,
+        x: &CudaSlice<f32>,
+        out: &mut CudaSlice<half::f16>,
+        n_rows: u32,
+        dim: u32,
+        eps: f32,
+    ) -> Result<(), KernelError> {
+        let threads = 256u32.min(dim);
+        let cfg = LaunchConfig {
+            grid_dim: (n_rows, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: threads * 4,
+        };
+        let dim_i = dim as i32;
+        let mut args: [*mut c_void; 4] = [
+            slice_ptr(x), slice_ptr_mut(out),
+            scalar_ptr(&dim_i), scalar_ptr(&eps),
+        ];
+        unsafe { self.fast.fire(&self.rms_norm_f32in_no_weight, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
         Ok(())
     }
 

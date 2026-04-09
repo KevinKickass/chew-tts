@@ -54,6 +54,8 @@ pub struct MoeLayerWeights {
     pub post_ffw_norm_2: CudaSlice<half::f16>,
 
     pub layer_output_scale: Option<f32>,
+    /// Per-expert scale for down projection: [n_experts] on CPU
+    pub moe_down_scale: Vec<f32>,
 }
 
 /// Norms that stay GPU-resident during streaming (tiny, always loaded).
@@ -85,6 +87,7 @@ pub struct MoeHostLayout {
     pub moe_gate_up_exps: TensorSlot,
     pub moe_down_exps: TensorSlot,
     pub layer_output_scale: Option<f32>,
+    pub moe_down_scale: Vec<f32>,
 }
 
 /// Where a tensor lives within the host buffer.
@@ -154,6 +157,15 @@ pub fn load_layer_to_gpu(
             }
         });
 
+    // Per-expert down scale: [n_experts] F32
+    let moe_down_scale = gguf.tensor_data_by_name(&format!("{pfx}.ffn_down_exps.scale"))
+        .map(|(_ti, data)| {
+            data.chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect::<Vec<f32>>()
+        })
+        .unwrap_or_default();
+
     Ok(MoeLayerWeights {
         attn_norm,
         attn_q,
@@ -176,6 +188,7 @@ pub fn load_layer_to_gpu(
         post_ffw_norm_1,
         post_ffw_norm_2,
         layer_output_scale,
+        moe_down_scale,
     })
 }
 
@@ -253,6 +266,14 @@ pub fn load_layer_to_host(
             }
         });
 
+    let moe_down_scale = gguf.tensor_data_by_name(&format!("{pfx}.ffn_down_exps.scale"))
+        .map(|(_ti, data)| {
+            data.chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect::<Vec<f32>>()
+        })
+        .unwrap_or_default();
+
     let size = buf.len() - layer_start;
 
     Ok(MoeHostLayout {
@@ -269,6 +290,7 @@ pub fn load_layer_to_host(
         moe_gate_up_exps,
         moe_down_exps,
         layer_output_scale,
+        moe_down_scale,
     })
 }
 
@@ -345,6 +367,7 @@ pub fn allocate_shell(
         post_ffw_norm_1: alloc_f16(d)?,
         post_ffw_norm_2: alloc_f16(d)?,
         layer_output_scale: None,
+        moe_down_scale: Vec::new(),
     })
 }
 
@@ -378,6 +401,7 @@ pub fn upload_to_shell(
     upload_slot(host_data, base, &layout.moe_gate_up_exps, &mut shell.moe_gate_up_exps, stream)?;
     upload_slot(host_data, base, &layout.moe_down_exps, &mut shell.moe_down_exps, stream)?;
     shell.layer_output_scale = layout.layer_output_scale;
+    shell.moe_down_scale = layout.moe_down_scale.clone();
 
     Ok(())
 }
@@ -845,15 +869,11 @@ pub fn forward_moe_streaming(
             let dim_scale = 1.0 / (config.dim as f32).sqrt();
 
             // Router: rms_norm(attn_out) * (1/sqrt(dim)) * gate_scale → router input
-            // Use norm_out as temp, attn_mha_out as final router input
-            // Step 1: f32 hidden → f16 into norm_out
-            kernels.ops.rms_norm_f32in(
-                hidden, &layer.attn_norm, &mut scratch.norm_out,
+            // Step 1: weightless rms_norm f32→f16 (matches llama.cpp ggml_rms_norm)
+            kernels.ops.rms_norm_f32in_no_weight(
+                hidden, &mut scratch.norm_out,
                 seq_len, config.dim, config.rms_norm_eps,
             )?;
-            // Note: this applies attn_norm weights, but llama.cpp does weightless rms_norm.
-            // For now use weighted norm — the gate_scale will compensate somewhat.
-            // TODO: proper weightless f32→f16 rms_norm kernel
 
             // Step 2: scale by 1/sqrt(dim) into attn_mha_out
             kernels.ops.scale_f16(
@@ -889,12 +909,24 @@ pub fn forward_moe_streaming(
             stream.memcpy_dtoh(&scratch.attn_out.slice(0..router_logits_host.len()), &mut router_logits_host)
                 .map_err(|e| KernelError::Launch(e.to_string()))?;
 
-            // For prefill: only route last token through experts (sufficient for next-token prediction)
-            // For decode: single token, so tok=0
-            // TODO: full per-token expert routing for proper prefill
-            let tok = (seq_len as usize) - 1; // last token only
-            {
+            // Route each token through its top-k experts
+            for tok in 0..seq_len as usize {
                 let tok_logits = &router_logits_host[tok * n_exp..(tok + 1) * n_exp];
+
+                // For multi-token prefill: copy this token's MoE input to start of norm_out
+                // so Expert GEMMs (M=1) see the right data
+                if seq_len > 1 && tok > 0 {
+                    let d = config.dim as usize;
+                    let src = scratch.norm_out.slice(tok * d..(tok + 1) * d);
+                    let mut dst = scratch.attn_out.slice_mut(0..d);
+                    stream.memcpy_dtod(&src, &mut dst)
+                        .map_err(|e| KernelError::Launch(e.to_string()))?;
+                    // Copy back to norm_out[0..d] for Expert GEMMs
+                    let src2 = scratch.attn_out.slice(0..d);
+                    let mut dst2 = scratch.norm_out.slice_mut(0..d);
+                    stream.memcpy_dtod(&src2, &mut dst2)
+                        .map_err(|e| KernelError::Launch(e.to_string()))?;
+                }
                 let logits_f32: Vec<f32> = tok_logits.iter().map(|x| x.to_f32()).collect();
                 let max_l = logits_f32.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                 let exp_l: Vec<f32> = logits_f32.iter().map(|x| (x - max_l).exp()).collect();
@@ -966,6 +998,13 @@ pub fn forward_moe_streaming(
                         &mut scratch.attn_out, 1, config.dim, expert_ff, &kernels.dequant,
                     )?;
 
+                    // Apply per-expert down scale (ffn_down_exps.scale)
+                    if let Some(&exp_scale) = layer.moe_down_scale.get(expert_id) {
+                        let src_ptr = &scratch.attn_out as *const CudaSlice<half::f16>;
+                        let dst_ptr = &mut scratch.attn_out as *mut CudaSlice<half::f16>;
+                        unsafe { kernels.ops.scale_f16(&*src_ptr, &mut *dst_ptr, config.dim, exp_scale)?; }
+                    }
+
                     // Weighted accumulate into attn_mha_out (reuse as moe accumulator)
                     if first_expert {
                         kernels.ops.scale_f16(&scratch.attn_out, &mut scratch.attn_mha_out,
@@ -981,8 +1020,22 @@ pub fn forward_moe_streaming(
                         unsafe { kernels.ops.add_f16(&*a, &*b, &mut *c, config.dim)?; }
                     }
                 }
+
+                // For multi-token: copy MoE result from position 0 to correct token offset
+                if seq_len > 1 && tok > 0 {
+                    let d = config.dim as usize;
+                    // attn_mha_out[0..d] → attn_out[0..d] → attn_mha_out[tok*d..(tok+1)*d]
+                    let src = scratch.attn_mha_out.slice(0..d);
+                    let mut tmp = scratch.attn_out.slice_mut(0..d);
+                    stream.memcpy_dtod(&src, &mut tmp)
+                        .map_err(|e| KernelError::Launch(e.to_string()))?;
+                    let src2 = scratch.attn_out.slice(0..d);
+                    let mut dst = scratch.attn_mha_out.slice_mut(tok * d..(tok + 1) * d);
+                    stream.memcpy_dtod(&src2, &mut dst)
+                        .map_err(|e| KernelError::Launch(e.to_string()))?;
+                }
             }
-            // attn_mha_out now holds cur_moe (weighted expert sum)
+            // attn_mha_out now holds cur_moe (weighted expert sum) for all tokens
 
             // Sync to catch any pending CUDA errors from expert loop
             stream.synchronize().map_err(|e| {
