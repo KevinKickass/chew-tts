@@ -787,18 +787,26 @@ pub fn forward_moe_streaming(
             let dim_scale = 1.0 / (config.dim as f32).sqrt();
 
             // Router: rms_norm(attn_out) * (1/sqrt(dim)) * gate_scale → router input
-            // rms_norm without weight — just normalize hidden (f32) to f16
-            // We use rms_norm_f32in with a dummy weight of all 1.0 — but we don't have that.
-            // Actually: llama.cpp does ggml_rms_norm which is just normalization.
-            // Our rms_norm_f32in applies weight after norm. We need rms_norm_no_weight equivalent for f32in.
-            // Workaround: use rms_norm_f32in with attn_norm (weight), then the scale and gate_scale
-            // will effectively replace it. This is wrong but let's see.
-            // TODO: proper weightless f32→f16 rms_norm
-            kernels.ops.rms_norm_f32in(
-                hidden, &layer.attn_norm, &mut scratch.attn_out,
-                seq_len, config.dim, config.rms_norm_eps,
-            )?;
-            // Scale by 1/sqrt(dim)
+            // Step 1: f32 hidden → f16
+            {
+                let n_elems = (seq_len * config.dim) as usize;
+                info!(n_elems, ao_len = scratch.attn_out.len(), "router f32→f16");
+                assert!(n_elems <= scratch.attn_out.len(), "attn_out OOB: {n_elems} > {}", scratch.attn_out.len());
+                let mut dst_view = scratch.attn_out.slice_mut(0..n_elems);
+                kernels.ops.copy_f32_to_f16(hidden, &mut dst_view, seq_len * config.dim)?;
+            }
+            // Step 2: weightless rms_norm in-place
+            {
+                let src_ptr = &scratch.attn_out as *const CudaSlice<half::f16>;
+                let dst_ptr = &mut scratch.attn_out as *mut CudaSlice<half::f16>;
+                unsafe {
+                    kernels.ops.rms_norm_no_weight(
+                        &*src_ptr, &mut *dst_ptr,
+                        seq_len, config.dim, config.rms_norm_eps,
+                    )?;
+                }
+            }
+            // Step 3: scale by 1/sqrt(dim)
             {
                 let src_ptr = &scratch.attn_out as *const CudaSlice<half::f16>;
                 let dst_ptr = &mut scratch.attn_out as *mut CudaSlice<half::f16>;
@@ -806,7 +814,7 @@ pub fn forward_moe_streaming(
                     kernels.ops.scale_f16(&*src_ptr, &mut *dst_ptr, seq_len * config.dim, dim_scale)?;
                 }
             }
-            // Multiply by gate_inp_scale (broadcast over seq_len)
+            // Step 4: broadcast multiply by gate_inp_scale [dim]
             kernels.ops.mul_f16_broadcast(
                 &scratch.attn_out, &layer.moe_gate_scale, &mut scratch.attn_mha_out,
                 seq_len * config.dim, config.dim,
