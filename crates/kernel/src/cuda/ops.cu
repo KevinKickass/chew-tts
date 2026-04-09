@@ -975,6 +975,9 @@ __global__ void copy_f16_with_offset(const __half* __restrict__ src,
 // Shared memory: TILE_KV + blockDim.x floats = CONSTANT regardless of kv_len.
 // This is the key: CUDA Graph can capture this with fixed smem.
 #define MHA_TILE_KV 128
+// Graph-compatible Flash Attention: same algorithm as mha_fused but reads
+// kv_len and pos from device memory (decode_params) for CUDA Graph replay.
+// Block: (32, 4), smem: (8 + 4*D) floats.
 __global__ void mha_fused_graph(
     const __half* __restrict__ q,
     const __half* __restrict__ k_base,
@@ -986,126 +989,139 @@ __global__ void mha_fused_graph(
     int n_kv_heads,
     int seq_len,
     float scale) {
-    int head = blockIdx.x;
-    int q_pos_local = blockIdx.y;
+    const int head = blockIdx.x;
+    const int q_pos = blockIdx.y;
+    const int kv_len = decode_params[1];
+    const int pos_offset = decode_params[0];
+    const int causal_limit = pos_offset + q_pos;
+    const int kv_head = head / (n_heads / n_kv_heads);
+    const int lane = threadIdx.x;
+    const int warp = threadIdx.y;
+    const int kv_stride = n_kv_heads * head_dim;
+    const int D = head_dim;
 
-    int kv_len = decode_params[1];
-    int pos_offset = decode_params[0];
-    int q_pos_global = pos_offset + q_pos_local;
-    int kv_head = head / (n_heads / n_kv_heads);
+    const __half* Q_ptr = q + q_pos * n_heads * D + head * D;
 
-    const __half* q_vec = q + q_pos_local * n_heads * head_dim + head * head_dim;
-
-    // Fixed shared memory: tile_scores[TILE_KV] + scratch[blockDim.x]
-    extern __shared__ float smem[];
-    float* tile_scores = smem;
-    float* scratch = smem + MHA_TILE_KV;
-
-    // Online softmax state per thread
-    float global_max = -1e30f;
-    float global_sum = 0.0f;
-
-    // Per-thread V accumulator (head_dim elements spread across threads)
-    // For head_dim=128, 128 threads: 1 element per thread
-    float v_acc[4] = {0,0,0,0}; // supports head_dim up to 512 with 128 threads
-    int elems = (head_dim + blockDim.x - 1) / (int)blockDim.x;
-
-    // Process KV in tiles
-    for (int tile_start = 0; tile_start < kv_len; tile_start += MHA_TILE_KV) {
-        int tile_end = tile_start + MHA_TILE_KV;
-        if (tile_end > kv_len) tile_end = kv_len;
-        int tile_size = tile_end - tile_start;
-
-        // --- Compute scores for this tile ---
-        for (int t = 0; t < tile_size; t++) {
-            int kp = tile_start + t;
-            if (kp > q_pos_global) {
-                if (threadIdx.x == 0) tile_scores[t] = -1e30f;
-                __syncthreads();
-                continue;
-            }
-
-            const __half* k_vec = k_base + kp * n_kv_heads * head_dim + kv_head * head_dim;
-            float dot = 0.0f;
-            for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
-                dot += __half2float(q_vec[d]) * __half2float(k_vec[d]);
-            }
-            scratch[threadIdx.x] = dot;
-            __syncthreads();
-            for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-                if (threadIdx.x < s) scratch[threadIdx.x] += scratch[threadIdx.x + s];
-                __syncthreads();
-            }
-            if (threadIdx.x == 0) tile_scores[t] = scratch[0] * scale;
-            __syncthreads();
-        }
-
-        // --- Tile max ---
-        float tile_max = -1e30f;
-        for (int t = threadIdx.x; t < tile_size; t += blockDim.x) {
-            if (tile_scores[t] > tile_max) tile_max = tile_scores[t];
-        }
-        scratch[threadIdx.x] = tile_max;
-        __syncthreads();
-        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-            if (threadIdx.x < s) scratch[threadIdx.x] = fmaxf(scratch[threadIdx.x], scratch[threadIdx.x + s]);
-            __syncthreads();
-        }
-        tile_max = scratch[0];
-
-        // --- Online softmax: merge tile with global state ---
-        float new_max = fmaxf(global_max, tile_max);
-        float old_scale_factor = expf(global_max - new_max);
-        float tile_scale_factor = expf(tile_max - new_max);
-
-        // Rescale V accumulator from old max
-        for (int e = 0; e < elems; e++) {
-            v_acc[e] *= old_scale_factor;
-        }
-        global_sum *= old_scale_factor;
-
-        // Exp scores relative to tile_max, then scale to new_max
-        for (int t = threadIdx.x; t < tile_size; t += blockDim.x) {
-            tile_scores[t] = expf(tile_scores[t] - tile_max) * tile_scale_factor;
-        }
-        __syncthreads();
-
-        // Sum this tile's weights
-        float tile_sum = 0.0f;
-        for (int t = 0; t < tile_size; t++) {
-            tile_sum += tile_scores[t];
-        }
-        global_sum += tile_sum;
-
-        // Accumulate weighted V for this tile
-        for (int e = 0; e < elems; e++) {
-            int d = threadIdx.x + e * blockDim.x;
-            if (d < head_dim) {
-                float acc = 0.0f;
-                for (int t = 0; t < tile_size; t++) {
-                    int kp = tile_start + t;
-                    const __half* v_vec = v_base + kp * n_kv_heads * head_dim + kv_head * head_dim;
-                    acc += tile_scores[t] * __half2float(v_vec[d]);
-                }
-                v_acc[e] += acc;
-            }
-        }
-
-        global_max = new_max;
+    const int q_idx = lane % FA_NTH_KQ;
+    const int q_elems = D / (2 * FA_NTH_KQ);
+    float2 Q_reg[8];
+    #pragma unroll
+    for (int i = 0; i < q_elems; i++) {
+        int d = q_idx * q_elems + i;
+        Q_reg[i] = make_float2(
+            __half2float(Q_ptr[2*d]) * scale,
+            __half2float(Q_ptr[2*d + 1]) * scale);
     }
 
-    // --- Write output: v_acc / global_sum ---
-    __half* out_vec = out + q_pos_local * n_heads * head_dim + head * head_dim;
+    const int v_elems = D / (2 * 32);
+    float2 VKQ[8] = {{0,0},{0,0},{0,0},{0,0},{0,0},{0,0},{0,0},{0,0}};
+    float KQ_max = -1e30f;
+    float KQ_sum = 0.0f;
+
+    extern __shared__ float smem[];
+    float* KQ_smem = smem + warp * 32;
+
+    const __half* K_warp = k_base + warp * 32 * kv_stride + kv_head * D;
+    const __half* V_warp = v_base + warp * 32 * kv_stride + kv_head * D;
+
+    for (int kv_base = warp * 32; kv_base < kv_len; kv_base += 128,
+         K_warp += 128 * kv_stride, V_warp += 128 * kv_stride) {
+
+        float my_score = -1e30f;
+        float KQ_max_new = KQ_max;
+
+        #pragma unroll
+        for (int i_KQ = 0; i_KQ < FA_NTH_KQ; i_KQ++) {
+            int kp_local = (lane & ~(FA_NTH_KQ - 1)) + i_KQ;
+            int kp = kv_base + kp_local;
+            float dot = 0.0f;
+            if (kp < kv_len && kp <= causal_limit) {
+                const __half* k_ptr = K_warp + kp_local * kv_stride;
+                #pragma unroll
+                for (int i = 0; i < q_elems; i++) {
+                    int d = q_idx * q_elems + i;
+                    dot += Q_reg[i].x * __half2float(k_ptr[2*d]);
+                    dot += Q_reg[i].y * __half2float(k_ptr[2*d + 1]);
+                }
+            } else { dot = -1e30f; }
+            #pragma unroll
+            for (int off = FA_NTH_KQ / 2; off > 0; off >>= 1)
+                dot += __shfl_xor_sync(0xFFFFFFFF, dot, off);
+            KQ_max_new = fmaxf(KQ_max_new, dot);
+            if ((lane % FA_NTH_KQ) == i_KQ) my_score = dot;
+        }
+        KQ_smem[lane] = my_score;
+
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            KQ_max_new = fmaxf(KQ_max_new, __shfl_xor_sync(0xFFFFFFFF, KQ_max_new, off));
+
+        float rescale = expf(KQ_max - KQ_max_new);
+        KQ_sum *= rescale;
+        #pragma unroll
+        for (int i = 0; i < v_elems; i++) { VKQ[i].x *= rescale; VKQ[i].y *= rescale; }
+        KQ_max = KQ_max_new;
+
+        float w = (my_score > -1e20f) ? expf(my_score - KQ_max) : 0.0f;
+        KQ_sum += w;
+        KQ_smem[lane] = w;
+        __syncwarp();
+
+        for (int kp_local = 0; kp_local < 32; kp_local++) {
+            int kp = kv_base + kp_local;
+            float sw = KQ_smem[kp_local];
+            if (sw > 0.0f && kp < kv_len) {
+                const __half* v_ptr = V_warp + kp_local * kv_stride;
+                #pragma unroll
+                for (int i = 0; i < v_elems; i++) {
+                    int d = lane * v_elems + i;
+                    VKQ[i].x += sw * __half2float(v_ptr[2*d]);
+                    VKQ[i].y += sw * __half2float(v_ptr[2*d + 1]);
+                }
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        KQ_sum += __shfl_xor_sync(0xFFFFFFFF, KQ_sum, off);
+    __syncthreads();
+
+    if (lane == 0) { smem[warp] = KQ_max; smem[4 + warp] = KQ_sum; }
+    __syncthreads();
+
+    float global_max = smem[0];
+    for (int w = 1; w < 4; w++) global_max = fmaxf(global_max, smem[w]);
+    float warp_rescale = expf(KQ_max - global_max);
+    #pragma unroll
+    for (int i = 0; i < v_elems; i++) { VKQ[i].x *= warp_rescale; VKQ[i].y *= warp_rescale; }
+
+    float* vkq_smem = smem + 8;
+    for (int i = 0; i < v_elems; i++) {
+        int d = lane * v_elems + i;
+        vkq_smem[warp * D + 2*d] = VKQ[i].x;
+        vkq_smem[warp * D + 2*d + 1] = VKQ[i].y;
+    }
+    __syncthreads();
+
+    float global_sum = 0;
+    for (int w = 0; w < 4; w++) global_sum += smem[4 + w] * expf(smem[w] - global_max);
     float inv = (global_sum > 0.0f) ? 1.0f / global_sum : 0.0f;
-    for (int e = 0; e < elems; e++) {
-        int d = threadIdx.x + e * blockDim.x;
-        if (d < head_dim) {
-            out_vec[d] = __float2half(v_acc[e] * inv);
+
+    if (warp == 0) {
+        __half* out_ptr = out + q_pos * n_heads * D + head * D;
+        for (int i = 0; i < v_elems; i++) {
+            int d = lane * v_elems + i;
+            float sx = 0, sy = 0;
+            for (int w = 0; w < 4; w++) {
+                sx += vkq_smem[w * D + 2*d];
+                sy += vkq_smem[w * D + 2*d + 1];
+            }
+            out_ptr[2*d] = __float2half(sx * inv);
+            out_ptr[2*d + 1] = __float2half(sy * inv);
         }
     }
 }
-
-// (Old mha_fused_graph with dynamic smem removed — replaced by tiled version above)
 
 // =============================================================
 // Gemma 4 kernels

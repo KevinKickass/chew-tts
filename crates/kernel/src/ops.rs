@@ -712,10 +712,8 @@ impl OpsKernels {
         seq_len: u32,
         _max_kv_len: u32,  // unused now — smem is fixed
     ) -> Result<(), KernelError> {
-        let threads = 128u32.min(head_dim);
-        // Fixed smem: TILE_KV(128) + threads for scratch
-        let tile_kv = 128u32;
-        let smem = (tile_kv + threads) * 4;
+        // Flash Attention graph: 2D block (32, 4), same as mha_fused
+        let smem = (8 + 4 * head_dim) * 4;
         let hd = head_dim as i32;
         let nh = n_heads as i32;
         let nkv = n_kv_heads as i32;
@@ -727,7 +725,7 @@ impl OpsKernels {
             scalar_ptr(&hd), scalar_ptr(&nh), scalar_ptr(&nkv),
             scalar_ptr(&sl), scalar_ptr(&scale),
         ];
-        unsafe { self.fast.fire(&self.mha_fused_graph, (n_heads, seq_len, 1), (threads, 1, 1), smem, &mut args); }
+        unsafe { self.fast.fire(&self.mha_fused_graph, (n_heads, seq_len, 1), (32, 4, 1), smem, &mut args); }
         Ok(())
     }
 
