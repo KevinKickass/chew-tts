@@ -1176,13 +1176,11 @@ impl OpsKernels {
         pos_offset: u32,
         scale: f32,
     ) -> Result<(), KernelError> {
-        let threads = 128u32.min(head_dim);
-        // Tiled MHA: fixed smem = (TILE_KV + threads) floats, independent of kv_len
-        let tile_kv = 128u32;
-        let smem = (tile_kv + threads) * 4;
+        // Flash Attention: 2D block (32 lanes, 4 warps)
+        let smem = (8 + 4 * head_dim) * 4; // max/sum slots + VKQ combine buffer
         let cfg = LaunchConfig {
             grid_dim: (n_heads, seq_len, 1),
-            block_dim: (threads, 1, 1),
+            block_dim: (32, 4, 1),
             shared_mem_bytes: smem,
         };
 
