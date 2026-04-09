@@ -100,7 +100,7 @@ impl ScratchBuffers {
 /// ~3x less memory bandwidth). Falls back to dequant+cuBLAS for unsupported types.
 ///
 /// All buffers are f16.
-fn gemm_q(
+pub(crate) fn gemm_q(
     kernels: &mut GpuKernels,
     a: &CudaSlice<half::f16>,
     w: &QuantWeight,

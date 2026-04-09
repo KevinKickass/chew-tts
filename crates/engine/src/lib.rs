@@ -592,34 +592,33 @@ impl ChewEngine {
         pe: Option<&forward::PerLayerEmbeddings>,
         seq_len: u32,
     ) -> Result<(), EngineError> {
-        match &self.weights {
-            WeightStorage::Normal(w) => {
-                if self.config.is_gemma4() {
-                    forward::forward_gemma4(
-                        hidden, w, &self.config,
-                        &mut self.kernels, &mut self.kv_cache, &mut self.scratch,
-                        seq_len, pe,
-                    )?;
-                } else {
-                    forward::forward(
-                        hidden, w, &self.config,
-                        &mut self.kernels, &mut self.kv_cache, &mut self.scratch,
-                        seq_len,
-                    )?;
-                }
-            }
-            WeightStorage::Streaming(_) => {
-                // For streaming, we need mutable access to upload weights to shells.
-                // Use the streaming forward function.
-                forward::forward_streaming(
-                    hidden, &mut self.weights, &self.config,
+        // Dispatch by weight storage type
+        // Streaming and MoE need mutable access to weights (for shell uploads)
+        if matches!(self.weights, WeightStorage::Streaming(_)) {
+            forward::forward_streaming(
+                hidden, &mut self.weights, &self.config,
+                &mut self.kernels, &mut self.kv_cache, &mut self.scratch,
+                seq_len, pe, &self.stream,
+            )?;
+        } else if let WeightStorage::Moe(ref mut moe_w) = self.weights {
+            arch::gemma4_moe::forward_moe_streaming(
+                hidden, moe_w, &self.config,
+                &mut self.kernels, &mut self.kv_cache, &mut self.scratch,
+                seq_len, &self.stream,
+            )?;
+        } else if let WeightStorage::Normal(ref w) = self.weights {
+            if self.config.is_gemma4() {
+                forward::forward_gemma4(
+                    hidden, w, &self.config,
                     &mut self.kernels, &mut self.kv_cache, &mut self.scratch,
-                    seq_len, pe, &self.stream,
+                    seq_len, pe,
                 )?;
-            }
-            WeightStorage::Moe(_) => {
-                // MoE uses its own forward pass with expert routing
-                todo!("MoE forward pass — next step");
+            } else {
+                forward::forward(
+                    hidden, w, &self.config,
+                    &mut self.kernels, &mut self.kv_cache, &mut self.scratch,
+                    seq_len,
+                )?;
             }
         }
         Ok(())
