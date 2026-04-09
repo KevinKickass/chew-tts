@@ -221,9 +221,8 @@ pub fn forward(
                 seq_len, config.n_kv_heads * config.head_dim, config.dim))?;
         }
 
-        // 3. RoPE on Q and K — fused into one launch
+        // 3. RoPE on Q and K
         timed!(t_rope, {
-            // Use k_cache temporarily for both Q and K RoPE
             kernels.ops.rope(&mut scratch.q, seq_len, config.n_heads, config.head_dim, pos, config.rope_theta)?;
             kernels.ops.rope(&mut scratch.k, seq_len, config.n_kv_heads, config.head_dim, pos, config.rope_theta)
         })?;

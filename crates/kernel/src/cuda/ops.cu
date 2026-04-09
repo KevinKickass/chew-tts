@@ -377,6 +377,46 @@ __global__ void fused_rope_kv(
     }
 }
 
+// --- SiLU + Q8_1 quantize fused ---
+// Computes SiLU(gate) * up and simultaneously quantizes the result to Q8_1.
+// Each warp handles 32 elements (= 1 Q8_1 block).
+// Grid: ((n+31)/32,), Block: (256,) — 8 warps, each handles 1 Q8_1 block.
+__global__ void silu_q8(const __half* __restrict__ gate,
+                         const __half* __restrict__ up,
+                         __half* __restrict__ out,
+                         void* __restrict__ x_q8,
+                         int n) {
+    const int block_base = (blockIdx.x * blockDim.x + threadIdx.x) / 32 * 32;
+    const int in_block = threadIdx.x % 32;
+    const int idx = block_base + in_block;
+    if (idx >= n) return;
+
+    float g = __half2float(gate[idx]);
+    float u = __half2float(up[idx]);
+    float val = g / (1.0f + expf(-g)) * u;  // SiLU(gate) * up
+    out[idx] = __float2half(val);
+
+    // Q8_1 quantize — warp-level reduction for this block of 32
+    float amax = fabsf(val);
+    float wsum = val;
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, offset));
+        wsum += __shfl_xor_sync(0xFFFFFFFF, wsum, offset);
+    }
+
+    float d = amax / 127.0f;
+    float id = (d != 0.0f) ? 1.0f / d : 0.0f;
+    signed char q = (signed char)__float2int_rn(val * id);
+
+    int q8_block = block_base / 32;
+    unsigned char* block_ptr = (unsigned char*)x_q8 + q8_block * 36;
+    if (in_block == 0) {
+        *(half2*)(block_ptr) = make_half2(__float2half(d), __float2half(wsum));
+    }
+    ((signed char*)(block_ptr + 4))[in_block] = q;
+}
+
 // --- SiLU (Sigmoid Linear Unit) --- f16 version
 // out = SiLU(gate) * up
 __global__ void silu(const __half* __restrict__ gate,

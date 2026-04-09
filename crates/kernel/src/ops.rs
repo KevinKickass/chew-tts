@@ -15,6 +15,7 @@ pub struct OpsKernels {
     rms_norm_f32in: CudaFunction,
     rope: CudaFunction,
     silu: CudaFunction,
+    silu_q8: CudaFunction,
     softmax: CudaFunction,
     embed_tokens_f32: CudaFunction,
     add_f16: CudaFunction,
@@ -61,6 +62,7 @@ impl OpsKernels {
             rms_norm_f32in: loader::get_fn(&module, "rms_norm_f32in")?,
             rope: loader::get_fn(&module, "rope")?,
             silu: loader::get_fn(&module, "silu")?,
+            silu_q8: loader::get_fn(&module, "silu_q8")?,
             softmax: loader::get_fn(&module, "softmax")?,
             embed_tokens_f32: loader::get_fn(&module, "embed_tokens_f32")?,
             add_f16: loader::get_fn(&module, "add_f16")?,
@@ -218,6 +220,32 @@ impl OpsKernels {
             scalar_ptr(&n_i),
         ];
         unsafe { self.fast.launch(&self.silu, cfg, &mut args)? }
+        Ok(())
+    }
+
+    /// Fused SiLU + Q8_1 quantize: computes SiLU(gate)*up AND quantizes result to Q8_1.
+    /// Saves 1 kernel launch by combining silu + quantize_input.
+    pub fn silu_q8(
+        &self,
+        gate: &CudaSlice<half::f16>,
+        up: &CudaSlice<half::f16>,
+        out: &mut CudaSlice<half::f16>,
+        x_q8: &mut CudaSlice<u8>,
+        n: u32,
+    ) -> Result<(), KernelError> {
+        let threads = 256u32;
+        let blocks = (n + threads - 1) / threads;
+        let cfg = LaunchConfig {
+            grid_dim: (blocks, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let n_i = n as i32;
+        let mut args: [*mut c_void; 5] = [
+            slice_ptr(gate), slice_ptr(up), slice_ptr_mut(out),
+            slice_ptr_mut(x_q8), scalar_ptr(&n_i),
+        ];
+        unsafe { self.fast.launch(&self.silu_q8, cfg, &mut args)? }
 
         Ok(())
     }
