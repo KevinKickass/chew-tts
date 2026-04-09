@@ -38,6 +38,11 @@ pub struct ScratchBuffers {
     pub ffn_out: CudaSlice<half::f16>,
     /// Logits: [seq_len, vocab_size] (f16)
     pub logits: CudaSlice<half::f16>,
+    // Per-layer embedding scratch buffers (Gemma 4)
+    /// After inp_gate projection + GELU: [seq_len, epl] (f16)
+    pub pe_gate_out: Option<CudaSlice<half::f16>>,
+    /// After proj projection: [seq_len, dim] (f16)
+    pub pe_proj_out: Option<CudaSlice<half::f16>>,
 }
 
 impl ScratchBuffers {
@@ -56,12 +61,23 @@ impl ScratchBuffers {
         let v = config.vocab_size as usize;
         let _kv = max_kv_len as usize;
 
+        // Per-layer embedding buffers (Gemma 4 only)
+        let (pe_gate_out, pe_proj_out) = if let Some(epl) = config.embd_per_layer {
+            let epl = epl as usize;
+            (
+                Some(stream.alloc_zeros::<half::f16>(s * epl)?),
+                Some(stream.alloc_zeros::<half::f16>(s * d)?),
+            )
+        } else {
+            (None, None)
+        };
+
         Ok(Self {
             norm_out: stream.alloc_zeros::<half::f16>(s * d)?,
             q: stream.alloc_zeros::<half::f16>(s * nh * hd)?,
             k: stream.alloc_zeros::<half::f16>(s * nkv * hd)?,
             v: stream.alloc_zeros::<half::f16>(s * nkv * hd)?,
-            attn_mha_out: stream.alloc_zeros::<half::f16>(s * d)?,
+            attn_mha_out: stream.alloc_zeros::<half::f16>(s * nh * hd)?,
             attn_out: stream.alloc_zeros::<half::f16>(s * d)?,
             residual: stream.alloc_zeros::<f32>(s * d)?,
             ffn_gate_out: stream.alloc_zeros::<half::f16>(s * ff)?,
@@ -69,6 +85,8 @@ impl ScratchBuffers {
             ffn_silu_out: stream.alloc_zeros::<half::f16>(s * ff)?,
             ffn_out: stream.alloc_zeros::<half::f16>(s * d)?,
             logits: stream.alloc_zeros::<half::f16>(s * v)?,
+            pe_gate_out,
+            pe_proj_out,
         })
     }
 }
@@ -184,12 +202,24 @@ pub fn forward(
         } else if seq_len > 1 {
             // Prefill path: no GEMV quantization needed
         }
-        timed!(t_gemm, gemm_q(kernels, &scratch.norm_out, &layer.attn_q, &mut scratch.q,
-            seq_len, config.n_heads * config.head_dim, config.dim))?;
-        timed!(t_gemm, gemm_q(kernels, &scratch.norm_out, &layer.attn_k, &mut scratch.k,
-            seq_len, config.n_kv_heads * config.head_dim, config.dim))?;
-        timed!(t_gemm, gemm_q(kernels, &scratch.norm_out, &layer.attn_v, &mut scratch.v,
-            seq_len, config.n_kv_heads * config.head_dim, config.dim))?;
+        // Fused QKV GEMV for decode (M=1, Q4_K only)
+        if seq_len == 1 && layer.attn_q.quant_type == chew_gguf::GgmlType::Q4_K
+            && layer.attn_k.quant_type == chew_gguf::GgmlType::Q4_K {
+            let nq = config.n_heads * config.head_dim;
+            let nk = config.n_kv_heads * config.head_dim;
+            timed!(t_gemm, kernels.gemv.gemv_qkv(
+                &layer.attn_q.data, &layer.attn_k.data, &layer.attn_v.data,
+                &mut scratch.q, &mut scratch.k, &mut scratch.v,
+                nq, nk, config.dim, layer.attn_q.quant_type,
+            ))?;
+        } else {
+            timed!(t_gemm, gemm_q(kernels, &scratch.norm_out, &layer.attn_q, &mut scratch.q,
+                seq_len, config.n_heads * config.head_dim, config.dim))?;
+            timed!(t_gemm, gemm_q(kernels, &scratch.norm_out, &layer.attn_k, &mut scratch.k,
+                seq_len, config.n_kv_heads * config.head_dim, config.dim))?;
+            timed!(t_gemm, gemm_q(kernels, &scratch.norm_out, &layer.attn_v, &mut scratch.v,
+                seq_len, config.n_kv_heads * config.head_dim, config.dim))?;
+        }
 
         // 3. RoPE on Q and K — fused into one launch
         timed!(t_rope, {
@@ -242,11 +272,26 @@ pub fn forward(
             ))?;
         }
 
-        // 9. Gate + Up projections — for decode, x_q8 already has quantized norm_out
-        timed!(t_gemm, gemm_q(kernels, &scratch.norm_out, &layer.ffn_gate, &mut scratch.ffn_gate_out,
-            seq_len, config.ff_dim, config.dim))?;
-        timed!(t_gemm, gemm_q(kernels, &scratch.norm_out, &layer.ffn_up, &mut scratch.ffn_up_out,
-            seq_len, config.ff_dim, config.dim))?;
+        // 9. Gate + Up projections — fused dual GEMV for decode, separate for prefill
+        if seq_len == 1 && layer.ffn_gate.quant_type == layer.ffn_up.quant_type {
+            let used = timed!(t_gemm, kernels.gemv.gemv_dual(
+                &layer.ffn_gate.data, &layer.ffn_up.data,
+                &mut scratch.ffn_gate_out, &mut scratch.ffn_up_out,
+                config.ff_dim, config.dim, layer.ffn_gate.quant_type,
+            ))?;
+            if !used {
+                // Fallback for non-Q4_K types
+                timed!(t_gemm, gemm_q(kernels, &scratch.norm_out, &layer.ffn_gate, &mut scratch.ffn_gate_out,
+                    seq_len, config.ff_dim, config.dim))?;
+                timed!(t_gemm, gemm_q(kernels, &scratch.norm_out, &layer.ffn_up, &mut scratch.ffn_up_out,
+                    seq_len, config.ff_dim, config.dim))?;
+            }
+        } else {
+            timed!(t_gemm, gemm_q(kernels, &scratch.norm_out, &layer.ffn_gate, &mut scratch.ffn_gate_out,
+                seq_len, config.ff_dim, config.dim))?;
+            timed!(t_gemm, gemm_q(kernels, &scratch.norm_out, &layer.ffn_up, &mut scratch.ffn_up_out,
+                seq_len, config.ff_dim, config.dim))?;
+        }
 
         // 10. SiLU(gate) * up (f16)
         timed!(t_silu, kernels.ops.silu(
@@ -330,6 +375,35 @@ pub fn forward(
 /// - RoPE NeoX (interleaved first/second half)
 /// - Input embedding scaled by sqrt(dim)
 /// - Logit softcapping (applied after logit projection, in engine)
+/// Pre-computed per-layer token embeddings for the current batch.
+/// Shape: [seq_len, n_layers * epl] in f16 — computed once per forward call.
+/// At each layer l, the relevant slice is columns [l*epl : (l+1)*epl].
+pub struct PerLayerEmbeddings {
+    /// The full dequantized embedding data: [seq_len, n_layers * epl] in f16
+    pub data: CudaSlice<half::f16>,
+    /// Embedding dimension per layer
+    pub epl: u32,
+    /// Row width (n_layers * epl)
+    pub row_width: u32,
+    /// Number of tokens
+    pub seq_len: u32,
+}
+
+impl PerLayerEmbeddings {
+    /// Get a view for a specific layer's embeddings: [seq_len, epl] starting at offset.
+    /// Returns (offset_in_elements, epl) for manual slicing since views need contiguous data.
+    /// NOTE: The data is NOT contiguous per-layer (it's interleaved across layers in each row).
+    /// We need to either:
+    /// a) Restructure the data to be per-layer contiguous, or
+    /// b) Use a strided copy/gather kernel
+    ///
+    /// Since each token's data is [l0_epl, l1_epl, ..., lN_epl], to get layer l's data
+    /// we need elements at positions [tok_i * row_width + l * epl .. + (l+1)*epl] for each token.
+    pub fn layer_offset(&self, layer_idx: usize) -> usize {
+        layer_idx * self.epl as usize
+    }
+}
+
 pub fn forward_gemma4(
     hidden: &mut CudaSlice<f32>,
     weights: &ModelWeights,
@@ -338,6 +412,7 @@ pub fn forward_gemma4(
     kv_cache: &mut KvCache,
     scratch: &mut ScratchBuffers,
     seq_len: u32,
+    pe: Option<&PerLayerEmbeddings>,
 ) -> Result<(), KernelError> {
     let pos = kv_cache.pos();
     let total_kv_len = pos + seq_len;
@@ -354,7 +429,6 @@ pub fn forward_gemma4(
     for layer_idx in 0..n_layers {
         let layer = &weights.layers[layer_idx];
         let hd = config.layer_head_dim(layer_idx);
-        let _is_swa = config.is_swa(layer_idx);
         let has_kv = config.has_kv(layer_idx);
         let rope_theta = config.layer_rope_theta(layer_idx);
 
@@ -381,6 +455,16 @@ pub fn forward_gemma4(
         )?;
         check_nan!(scratch.norm_out, seq_len * config.dim, "after_attn_norm");
 
+        // DEEP DEBUG: dump values at key points in layer 0 for last position
+        let deep_dbg = (layer_idx == 0 || layer_idx == 5) && seq_len > 1;
+        if deep_dbg {
+            let last_off = ((seq_len - 1) * config.dim) as usize;
+            let mut d = vec![half::f16::ZERO; 8];
+            let _ = stream_ref.memcpy_dtoh(&scratch.norm_out.slice(last_off..last_off+8), &mut d);
+            let vals: Vec<f32> = d.iter().map(|x| x.to_f32()).collect();
+            tracing::info!(?vals, "L0_NORM_OUT last pos [0:8]");
+        }
+
         // 2. QKV projections
         let q_dim = config.n_heads * hd;
         let kv_dim = config.n_kv_heads * hd;
@@ -393,6 +477,13 @@ pub fn forward_gemma4(
         gemm_q(kernels, &scratch.norm_out, &layer.attn_q, &mut scratch.q,
             seq_len, q_dim, config.dim)?;
         check_nan!(scratch.q, seq_len * q_dim, "after_Q_proj");
+        if deep_dbg {
+            let last_off = ((seq_len - 1) * q_dim) as usize;
+            let mut d = vec![half::f16::ZERO; 8];
+            let _ = stream_ref.memcpy_dtoh(&scratch.q.slice(last_off..last_off+8), &mut d);
+            let vals: Vec<f32> = d.iter().map(|x| x.to_f32()).collect();
+            tracing::info!(?vals, "L0_Q_PROJ last pos [0:8]");
+        }
         gemm_q(kernels, &scratch.norm_out, &layer.attn_k, &mut scratch.k,
             seq_len, kv_dim, config.dim)?;
         check_nan!(scratch.k, seq_len * kv_dim, "after_K_proj");
@@ -443,14 +534,46 @@ pub fn forward_gemma4(
         check_nan!(scratch.k, seq_len * kv_dim, "after_K_norm");
         check_nan!(scratch.v, seq_len * kv_dim, "after_V_norm");
 
-        // 4. RoPE NeoX on Q (and K if this layer owns KV)
-        kernels.ops.rope_neox(&mut scratch.q, seq_len, config.n_heads, hd, pos, rope_theta)?;
-        kernels.ops.rope_neox(&mut scratch.k, seq_len, config.n_kv_heads, hd, pos, rope_theta)?;
+        if deep_dbg {
+            let last_off = ((seq_len - 1) * q_dim) as usize;
+            let mut d = vec![half::f16::ZERO; 8];
+            let _ = stream_ref.memcpy_dtoh(&scratch.q.slice(last_off..last_off+8), &mut d);
+            let vals: Vec<f32> = d.iter().map(|x| x.to_f32()).collect();
+            tracing::info!(?vals, "L0_Q_NORM last pos [0:8]");
+        }
+
+        // 4. RoPE NeoX on Q and K
+        // Full attention layers use frequency factors (only rotate 128/512 dims).
+        // SWA layers use standard RoPE (all 256 dims rotated).
+        let is_swa = config.is_swa(layer_idx);
+        if !is_swa {
+            if let Some(ref ff) = weights.rope_freq_factors {
+                kernels.ops.rope_neox_freqs(&mut scratch.q, ff, seq_len, config.n_heads, hd, pos, rope_theta)?;
+                kernels.ops.rope_neox_freqs(&mut scratch.k, ff, seq_len, config.n_kv_heads, hd, pos, rope_theta)?;
+            } else {
+                kernels.ops.rope_neox(&mut scratch.q, seq_len, config.n_heads, hd, pos, rope_theta)?;
+                kernels.ops.rope_neox(&mut scratch.k, seq_len, config.n_kv_heads, hd, pos, rope_theta)?;
+            }
+        } else {
+            kernels.ops.rope_neox(&mut scratch.q, seq_len, config.n_heads, hd, pos, rope_theta)?;
+            kernels.ops.rope_neox(&mut scratch.k, seq_len, config.n_kv_heads, hd, pos, rope_theta)?;
+        }
         check_nan!(scratch.q, seq_len * q_dim, "after_RoPE_Q");
         check_nan!(scratch.k, seq_len * kv_dim, "after_RoPE_K");
 
-        // 5. Write K, V into KV cache (every layer gets its own cache)
-        {
+        if deep_dbg {
+            let last_off = ((seq_len - 1) * q_dim) as usize;
+            let mut d = vec![half::f16::ZERO; 8];
+            let _ = stream_ref.memcpy_dtoh(&scratch.q.slice(last_off..last_off+8), &mut d);
+            let vals: Vec<f32> = d.iter().map(|x| x.to_f32()).collect();
+            tracing::info!(?vals, "L0_Q_ROPE last pos [0:8]");
+        }
+
+        // 5. Write K, V into KV cache
+        // For KV-owning layers: write to own cache slot.
+        // For shared layers: skip K/V write — reuse earlier layer's cache.
+        let kv_source = config.kv_source_layer(layer_idx);
+        if has_kv {
             let kv_elems = seq_len * kv_dim;
             {
                 let mut k_cache = kv_cache.k_mut(layer_idx, seq_len);
@@ -462,18 +585,18 @@ pub fn forward_gemma4(
             }
         }
 
-        // 6. Multi-Head Attention (use this layer's own KV cache)
+        // 6. Multi-Head Attention
+        // Shared layers reuse KV from kv_source_layer.
         {
-            let k_full = kv_cache.k_full(layer_idx, total_kv_len);
-            let v_full = kv_cache.v_full(layer_idx, total_kv_len);
+            let k_full = kv_cache.k_full(kv_source, total_kv_len);
+            let v_full = kv_cache.v_full(kv_source, total_kv_len);
 
-            // Scale = 1/sqrt(head_dim) per layer (head_dim varies in Gemma 4)
-            let attn_scale = 1.0f32 / (hd as f32).sqrt();
+            // Gemma 4: attention_scale = 1.0 (Q and K are already RMS-normed)
             kernels.ops.mha_fused_scaled(
                 &scratch.q, &k_full, &v_full, &mut scratch.attn_mha_out,
                 hd, config.n_heads, config.n_kv_heads,
                 seq_len, total_kv_len, pos,
-                attn_scale,
+                config.attention_scale,
             )?;
         }
         check_nan!(scratch.attn_mha_out, seq_len * q_dim, "after_MHA");
@@ -557,14 +680,96 @@ pub fn forward_gemma4(
             tracing::info!(layer = layer_idx, has_nan, maxv, first4 = ?&dbg[..4], "layer check");
         }
 
-        // 14. Layer output scale
+        // 14. Per-layer embedding (Gemma 4)
+        // Steps: hidden @ inp_gate → GELU → mul(layer_embd) → proj → rmsnorm → residual add
+        if let (Some(inp_gate), Some(proj), Some(post_norm), Some(pe_data), Some(epl)) = (
+            &layer.inp_gate, &layer.proj, &layer.post_norm, pe, config.embd_per_layer,
+        ) {
+            let pe_gate = scratch.pe_gate_out.as_mut().expect("pe_gate_out not allocated");
+            let pe_proj = scratch.pe_proj_out.as_mut().expect("pe_proj_out not allocated");
+
+            // 14a. Convert hidden (f32) → f16 norm_out for matmul input
+            let n_elems_pe = (seq_len * config.dim) as usize;
+            {
+                let mut norm_view = scratch.norm_out.slice_mut(0..n_elems_pe);
+                kernels.ops.copy_f32_to_f16(hidden, &mut norm_view, seq_len * config.dim)?;
+            }
+
+            // 14b. hidden_f16 @ inp_gate^T → pe_gate [seq_len, epl]
+            if seq_len == 1 {
+                kernels.gemv.quantize_input(&scratch.norm_out, config.dim)?;
+            }
+            gemm_q(kernels, &scratch.norm_out, inp_gate, pe_gate,
+                seq_len, epl, config.dim)?;
+
+            // 14c. GELU(pe_gate) in-place
+            {
+                let src_ptr = pe_gate as *const CudaSlice<half::f16>;
+                let dst_ptr = pe_gate as *mut CudaSlice<half::f16>;
+                unsafe {
+                    kernels.ops.gelu_act(&*src_ptr, &mut *dst_ptr, seq_len * epl)?;
+                }
+            }
+
+            // 14d. Strided multiply with per-layer token embedding
+            // pe_data.data: [seq_len, row_width] where row_width = n_layers * epl
+            // For layer l, we need columns [l*epl : (l+1)*epl] for each token.
+            // pe_strided_mul handles the strided access in one kernel launch.
+            {
+                let src_ptr = pe_gate as *const CudaSlice<half::f16>;
+                let dst_ptr = pe_gate as *mut CudaSlice<half::f16>;
+                let layer_off = (layer_idx as u32) * epl;
+                unsafe {
+                    kernels.ops.pe_strided_mul(
+                        &*src_ptr, &pe_data.data, &mut *dst_ptr,
+                        epl, pe_data.row_width, layer_off, seq_len,
+                    )?;
+                }
+            }
+
+            // DEBUG: dump pe_gate after strided multiply for layer 0
+            if layer_idx == 0 && seq_len > 1 {
+                let last_off = ((seq_len - 1) * epl) as usize;
+                let mut d = vec![half::f16::ZERO; 8];
+                let _ = stream_ref.memcpy_dtoh(&pe_gate.slice(last_off..last_off+8), &mut d);
+                let vals: Vec<f32> = d.iter().map(|x| x.to_f32()).collect();
+                tracing::info!(?vals, "PE_GATE_MUL L0 last pos [0:8]");
+                // Also dump pe_data values at layer 0 for last token
+                let pe_off = (9 * pe_data.row_width) as usize; // last token, start of row
+                let mut pd = vec![half::f16::ZERO; 8];
+                let _ = stream_ref.memcpy_dtoh(&pe_data.data.slice(pe_off..pe_off+8), &mut pd);
+                let pvals: Vec<f32> = pd.iter().map(|x| x.to_f32()).collect();
+                tracing::info!(?pvals, "PE_DATA L0 last token [0:8]");
+            }
+
+            // 14e. pe_gate @ proj^T → pe_proj [seq_len, dim]
+            if seq_len == 1 {
+                kernels.gemv.quantize_input(pe_gate, epl)?;
+            }
+            gemm_q(kernels, pe_gate, proj, pe_proj,
+                seq_len, config.dim, epl)?;
+
+            // 14f. RMSNorm + residual add: hidden += rmsnorm(pe_proj) * post_norm
+            kernels.ops.post_norm_add(
+                hidden, pe_proj, post_norm, &mut scratch.norm_out,
+                seq_len, config.dim, config.rms_norm_eps,
+            )?;
+        }
+
+        // 15. Layer output scale
         if let Some(scale) = layer.layer_output_scale {
             if (scale - 1.0).abs() > 1e-6 {
                 kernels.ops.scale_f32_inplace(hidden, seq_len * config.dim, scale)?;
             }
         }
 
-        // Per-layer embedding (skipped for initial implementation — complex and can be added later)
+        // Debug: dump last position hidden state after specific layers
+        if (layer_idx == 0 || layer_idx == 5 || layer_idx == 23 || layer_idx == 41) && seq_len > 1 {
+            let last_off = ((seq_len - 1) * config.dim) as usize;
+            let mut dbg = vec![0.0f32; 8];
+            let _ = stream_ref.memcpy_dtoh(&hidden.slice(last_off..last_off+8), &mut dbg);
+            tracing::info!(?dbg, layer = layer_idx, "LAYER_DONE last pos hidden[0:8]");
+        }
     }
 
     // === Final norm + logits ===

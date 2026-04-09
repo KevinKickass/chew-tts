@@ -53,9 +53,10 @@ impl ModelConfig {
         let is_gemma4 = arch == "gemma4";
         let sliding_window = header.get_u32(&format!("{arch}.attention.sliding_window")).ok();
         let n_kv_shared_layers = header.get_u32(&format!("{arch}.attention.shared_kv_layers")).unwrap_or(0);
-        // Gemma 4 still uses 1/sqrt(head_dim) scaling (HF: self.scaling = head_dim**-0.5)
-        // The llama.cpp "f_attention_scale = 1.0" refers to a different scaling factor
-        let attention_scale = 1.0 / (head_dim as f32).sqrt();
+        // Gemma 4 uses attention_scale=1.0 because Q and K are already
+        // RMS-normalized per-head before attention. llama.cpp: f_attention_scale = 1.0
+        // For non-Gemma4 models, standard 1/sqrt(head_dim).
+        let attention_scale = if is_gemma4 { 1.0 } else { 1.0 / (head_dim as f32).sqrt() };
         let logit_softcap = header.get_f32(&format!("{arch}.final_logit_softcapping")).ok();
         let rope_theta_swa = header.get_f32(&format!("{arch}.rope.freq_base_swa")).ok();
         let embd_per_layer = header.get_u32(&format!("{arch}.embedding_length_per_layer_input")).ok();
@@ -156,13 +157,22 @@ impl ModelConfig {
 
     /// Get the KV cache source layer for a given layer.
     /// For layers that own their KV, returns the layer itself.
-    /// For shared layers, returns the last KV-owning layer.
+    /// For shared layers, returns the matching (SWA/FULL) KV-owning layer.
+    /// SWA shared layers use last SWA owning layer, FULL shared use last FULL owning.
     pub fn kv_source_layer(&self, layer: usize) -> usize {
         if self.has_kv(layer) {
             layer
         } else {
-            // Last layer that owns KV
-            (self.n_kv_layers - 1) as usize
+            // Find last KV-owning layer with same SWA/FULL type
+            let want_swa = self.is_swa(layer);
+            let kv_end = self.n_kv_layers as usize;
+            for i in (0..kv_end).rev() {
+                if self.is_swa(i) == want_swa {
+                    return i;
+                }
+            }
+            // Fallback: last KV-owning layer
+            kv_end - 1
         }
     }
 

@@ -115,6 +115,12 @@ impl VramPlan {
         let hd = config.max_head_dim as u64;
         let v = config.vocab_size as u64;
 
+        let pe_elements = if let Some(epl) = config.embd_per_layer {
+            let epl = epl as u64;
+            s * epl + s * d  // pe_gate_out + pe_proj_out
+        } else {
+            0
+        };
         let scratch_f16_elements = s * d       // norm_out
             + s * nh * hd                     // q
             + s * nkv * hd                    // k
@@ -125,7 +131,8 @@ impl VramPlan {
             + s * ff                          // ffn_up_out
             + s * ff                          // ffn_silu_out
             + s * d                           // ffn_out
-            + s * v;                          // logits
+            + s * v                           // logits
+            + pe_elements;                    // per-layer embedding (Gemma 4)
         let scratch_f32_elements = s * d;     // residual (f32)
         let scratch_bytes = scratch_f16_elements * 2 + scratch_f32_elements * 4;
 

@@ -472,10 +472,12 @@ __global__ void copy_f16(const __half* __restrict__ src,
 // Grid: (n_heads, seq_len, 1)
 // Block: (threads, 1, 1)
 //
-__global__ void mha_fused(const __half* __restrict__ q,       // f16
-                           const __half* __restrict__ k,      // f16 KV cache
-                           const __half* __restrict__ v,      // f16 KV cache
-                           __half* __restrict__ out,           // f16
+// --- Fused MHA with parallel softmax ---
+// Score materialization in shared memory, parallel softmax, weighted V sum.
+__global__ void mha_fused(const __half* __restrict__ q,
+                           const __half* __restrict__ k,
+                           const __half* __restrict__ v,
+                           __half* __restrict__ out,
                            int head_dim,
                            int n_heads,
                            int n_kv_heads,
@@ -487,12 +489,11 @@ __global__ void mha_fused(const __half* __restrict__ q,       // f16
     int q_pos_local = blockIdx.y;
     int q_pos_global = pos_offset + q_pos_local;
 
-    int kv_head = head / (n_heads / n_kv_heads);  // GQA mapping
+    int kv_head = head / (n_heads / n_kv_heads);
 
-    // Q pointer for this (query_pos, head) — f16
     const __half* q_vec = q + q_pos_local * n_heads * head_dim + head * head_dim;
 
-    // Shared memory: first kv_len floats for scores, then blockDim.x for reduction
+    // Shared memory: kv_len floats for scores + blockDim.x for scratch
     extern __shared__ float smem[];
     float* scores = smem;
     float* scratch = smem + kv_len;
@@ -500,15 +501,12 @@ __global__ void mha_fused(const __half* __restrict__ q,       // f16
     // --- Step 1: Compute attention scores ---
     for (int kp = 0; kp < kv_len; kp++) {
         if (kp > q_pos_global) {
-            // Causal mask
             if (threadIdx.x == 0) scores[kp] = -1e30f;
             continue;
         }
 
-        // K pointer for this (kv_pos, kv_head) — f16 from KV cache
         const __half* k_vec = k + kp * n_kv_heads * head_dim + kv_head * head_dim;
 
-        // Dot product with reduction: f16 Q dot f16 K (accumulate in f32)
         float dot = 0.0f;
         for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
             dot += __half2float(q_vec[d]) * __half2float(k_vec[d]);
@@ -517,45 +515,54 @@ __global__ void mha_fused(const __half* __restrict__ q,       // f16
         __syncthreads();
 
         for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-            if (threadIdx.x < s) {
-                scratch[threadIdx.x] += scratch[threadIdx.x + s];
-            }
+            if (threadIdx.x < s) scratch[threadIdx.x] += scratch[threadIdx.x + s];
             __syncthreads();
         }
 
-        if (threadIdx.x == 0) {
-            scores[kp] = scratch[0] * scale;
-        }
+        if (threadIdx.x == 0) scores[kp] = scratch[0] * scale;
         __syncthreads();
     }
 
-    // --- Step 2: Softmax over scores (serial — avoids parallel reduction bugs with small kv_len) ---
-    if (threadIdx.x == 0) {
-        float max_val = -1e30f;
-        for (int kp = 0; kp < kv_len; kp++) {
-            if (scores[kp] > max_val) max_val = scores[kp];
+    // --- Step 2: Parallel softmax ---
+    // Find max (parallel)
+    {
+        float local_max = -1e30f;
+        for (int kp = threadIdx.x; kp < kv_len; kp += blockDim.x) {
+            if (scores[kp] > local_max) local_max = scores[kp];
         }
-        scratch[0] = max_val;
+        scratch[threadIdx.x] = local_max;
+        __syncthreads();
+        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+            if (threadIdx.x < s) scratch[threadIdx.x] = fmaxf(scratch[threadIdx.x], scratch[threadIdx.x + s]);
+            __syncthreads();
+        }
     }
-    __syncthreads();
     float max_val = scratch[0];
 
-    // Exp + sum + normalize (serial)
-    if (threadIdx.x == 0) {
-        float sum = 0.0f;
-        for (int kp = 0; kp < kv_len; kp++) {
+    // Exp + parallel sum
+    {
+        float local_sum = 0.0f;
+        for (int kp = threadIdx.x; kp < kv_len; kp += blockDim.x) {
             float e = expf(scores[kp] - max_val);
             scores[kp] = e;
-            sum += e;
+            local_sum += e;
         }
-        float inv = 1.0f / sum;
-        for (int kp = 0; kp < kv_len; kp++) {
-            scores[kp] *= inv;
+        scratch[threadIdx.x] = local_sum;
+        __syncthreads();
+        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+            if (threadIdx.x < s) scratch[threadIdx.x] += scratch[threadIdx.x + s];
+            __syncthreads();
         }
+    }
+    float inv_sum = 1.0f / scratch[0];
+
+    // Normalize
+    for (int kp = threadIdx.x; kp < kv_len; kp += blockDim.x) {
+        scores[kp] *= inv_sum;
     }
     __syncthreads();
 
-    // --- Step 3: Weighted sum of V (f16 from KV cache) → f16 output ---
+    // --- Step 3: Weighted sum of V ---
     __half* out_vec = out + q_pos_local * n_heads * head_dim + head * head_dim;
 
     for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
@@ -938,6 +945,41 @@ __global__ void rope_neox(__half* __restrict__ x,
     x[idx1] = __float2half(x0 * sin_a + x1 * cos_a);
 }
 
+// --- RoPE NeoX with proportional frequency factors --- f16 in-place
+// For Gemma 4 full-attention layers: freq_factors[pair_idx] divides the frequency.
+// When freq_factor = 1e30, angle ≈ 0, so cos=1, sin=0 → no rotation (identity).
+// n_rope_dims: number of dimensions to actually rotate (rest are identity).
+// freq_factors has shape [head_dim/2].
+__global__ void rope_neox_freqs(__half* __restrict__ x,
+                                const float* __restrict__ freq_factors,
+                                int head_dim,
+                                int n_heads,
+                                int pos,
+                                float theta_base) {
+    int seq_idx  = blockIdx.x;
+    int head_idx = blockIdx.y;
+    int pair_idx = threadIdx.x;
+
+    int half_dim = head_dim / 2;
+    if (pair_idx >= half_dim) return;
+
+    int base = seq_idx * n_heads * head_dim + head_idx * head_dim;
+    int idx0 = base + pair_idx;
+    int idx1 = base + pair_idx + half_dim;
+
+    float ff = freq_factors[pair_idx];
+    float freq = 1.0f / (powf(theta_base, (float)(2 * pair_idx) / (float)head_dim) * ff);
+    float angle = (float)(pos + seq_idx) * freq;
+    float cos_a = cosf(angle);
+    float sin_a = sinf(angle);
+
+    float x0 = __half2float(x[idx0]);
+    float x1 = __half2float(x[idx1]);
+
+    x[idx0] = __float2half(x0 * cos_a - x1 * sin_a);
+    x[idx1] = __float2half(x0 * sin_a + x1 * cos_a);
+}
+
 // --- RoPE NeoX graph-compatible (reads pos from device memory) ---
 __global__ void rope_neox_graph(__half* __restrict__ x,
                                 const int* __restrict__ decode_params,
@@ -1019,6 +1061,75 @@ __global__ void logit_softcap_inplace(__half* __restrict__ x, int n, float cap) 
     if (idx >= n) return;
     float v = __half2float(x[idx]);
     x[idx] = __float2half(tanhf(v / cap) * cap);
+}
+
+// --- Element-wise multiply: out = a * b (f16) ---
+__global__ void mul_f16(const __half* __restrict__ a,
+                        const __half* __restrict__ b,
+                        __half* __restrict__ out,
+                        int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    out[idx] = __float2half(__half2float(a[idx]) * __half2float(b[idx]));
+}
+
+// --- Standalone GELU activation: out = GELU(x) (f16) ---
+// Does NOT multiply by up — just applies GELU to x.
+__global__ void gelu_act(const __half* __restrict__ x,
+                         __half* __restrict__ out,
+                         int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    float g = __half2float(x[idx]);
+    float gelu_g = 0.5f * g * (1.0f + tanhf(0.7978845608f * (g + 0.044715f * g * g * g)));
+    out[idx] = __float2half(gelu_g);
+}
+
+// --- Gather quantized rows by token ID ---
+// Copies rows from a quantized tensor into a contiguous output buffer.
+// src: quantized tensor data (all rows contiguous)
+// token_ids: [n_tokens] int32 token indices
+// dst: output buffer [n_tokens * row_bytes] bytes
+// row_bytes: bytes per row in the quantized format
+// n_tokens: number of tokens to gather
+__global__ void gather_rows_quant(const unsigned char* __restrict__ src,
+                                  const int* __restrict__ token_ids,
+                                  unsigned char* __restrict__ dst,
+                                  int row_bytes,
+                                  int n_tokens) {
+    // Grid: (n_tokens, ceil(row_bytes/blockDim.x), 1)
+    int tok_idx = blockIdx.x;
+    int byte_idx = blockIdx.y * blockDim.x + threadIdx.x;
+    if (tok_idx >= n_tokens || byte_idx >= row_bytes) return;
+
+    int token_id = token_ids[tok_idx];
+    long long src_off = (long long)token_id * (long long)row_bytes + byte_idx;
+    long long dst_off = (long long)tok_idx * (long long)row_bytes + byte_idx;
+    dst[dst_off] = src[src_off];
+}
+
+// --- Per-layer embedding strided multiply ---
+// For each token t and embedding dim j:
+//   out[t * epl + j] = a[t * epl + j] * embd[t * row_width + layer_off + j]
+// a, out: [n_tokens, epl] contiguous f16
+// embd: [n_tokens, row_width] contiguous f16 (full per-layer embeddings for all layers)
+// layer_off: column offset for the current layer
+__global__ void pe_strided_mul(const __half* __restrict__ a,
+                               const __half* __restrict__ embd,
+                               __half* __restrict__ out,
+                               int epl,
+                               int row_width,
+                               int layer_off,
+                               int n_tokens) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = n_tokens * epl;
+    if (idx >= total) return;
+
+    int t = idx / epl;
+    int j = idx % epl;
+    float av = __half2float(a[idx]);
+    float ev = __half2float(embd[t * row_width + layer_off + j]);
+    out[idx] = __float2half(av * ev);
 }
 
 } // extern "C"

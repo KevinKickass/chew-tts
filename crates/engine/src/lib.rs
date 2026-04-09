@@ -212,6 +212,22 @@ impl ChewEngine {
             self.kernels.ops.scale_f32_inplace(&mut hidden, prefill_len * self.config.dim, scale)?;
         }
 
+        // Debug: dump hidden state for last position after embedding+scale
+        if self.config.is_gemma4() {
+            let last_off = ((prefill_len - 1) * self.config.dim) as usize;
+            let mut dbg = vec![0.0f32; 8];
+            self.stream.memcpy_dtoh(&hidden.slice(last_off..last_off+8), &mut dbg)
+                .map_err(EngineError::Driver)?;
+            info!(?dbg, pos = prefill_len - 1, "EMBED last pos first 8 values");
+        }
+
+        // Compute per-layer token embeddings (Gemma 4 only)
+        let pe = if self.config.is_gemma4() {
+            self.compute_per_layer_embeddings(&token_ids_gpu, &hidden, prefill_len)?
+        } else {
+            None
+        };
+
         // Forward pass on prefill
         if self.config.is_gemma4() {
             forward::forward_gemma4(
@@ -222,6 +238,7 @@ impl ChewEngine {
                 &mut self.kv_cache,
                 &mut self.scratch,
                 prefill_len,
+                pe.as_ref(),
             )?;
         } else {
             forward::forward(
@@ -318,6 +335,10 @@ impl ChewEngine {
                 .map_err(EngineError::Driver)?;
             let mut n_generated = 0u32;
 
+            // GPU timing: sync before loop, measure total
+            self.stream.synchronize().map_err(EngineError::Driver)?;
+            let decode_t0 = std::time::Instant::now();
+
             for _step in 1..max_new_tokens {
                 if _step == 1 {
                     // First decode: upload token from host
@@ -352,9 +373,11 @@ impl ChewEngine {
                         )?);
                     }
                 } else if self.config.is_gemma4() {
+                    let decode_pe = self.compute_per_layer_embeddings(&tok_gpu, &decode_hidden, 1)?;
                     forward::forward_gemma4(
                         &mut decode_hidden, &self.weights, &self.config,
                         &mut self.kernels, &mut self.kv_cache, &mut self.scratch, 1,
+                        decode_pe.as_ref(),
                     )?;
                 } else {
                     forward::forward(
@@ -378,6 +401,15 @@ impl ChewEngine {
                 n_generated += 1;
 
                 // NO HOST SYNC — entire loop runs without host-GPU synchronization
+            }
+
+            // Sync and measure decode time
+            self.stream.synchronize().map_err(EngineError::Driver)?;
+            let decode_elapsed = decode_t0.elapsed();
+            if n_generated > 0 {
+                let ms_per_tok = decode_elapsed.as_secs_f64() * 1000.0 / n_generated as f64;
+                let tps = n_generated as f64 / decode_elapsed.as_secs_f64();
+                info!(n_generated, ms_per_tok = format!("{:.2}", ms_per_tok), decode_tps = format!("{:.1}", tps), graph = use_graph, "decode timing");
             }
 
             // Batch download ALL tokens at end (one sync for all)
@@ -411,9 +443,11 @@ impl ChewEngine {
                 }
 
                 if self.config.is_gemma4() {
+                    let decode_pe = self.compute_per_layer_embeddings(&tok_gpu, &decode_hidden, 1)?;
                     forward::forward_gemma4(
                         &mut decode_hidden, &self.weights, &self.config,
                         &mut self.kernels, &mut self.kv_cache, &mut self.scratch, 1,
+                        decode_pe.as_ref(),
                     )?;
                 } else {
                     forward::forward(
@@ -436,6 +470,209 @@ impl ChewEngine {
         }
 
         Ok(generated)
+    }
+
+    /// Compute per-layer token embeddings for a set of token IDs.
+    ///
+    /// Full llama.cpp flow:
+    /// 1. Gather + dequant per_layer_token_embd → tok_embd [n_tokens, n_layers*epl]
+    /// 2. Scale tok_embd by sqrt(epl)
+    /// 3. Convert hidden_f32 to f16, project through per_layer_model_proj^T → proj [n_tokens, n_layers*epl]
+    /// 4. Scale proj by 1/sqrt(dim)
+    /// 5. RMS-norm proj rows (reshaped as [n_tokens*n_layers, epl]) with per_layer_proj_norm
+    /// 6. result = (tok_embd_scaled + proj_normed) / sqrt(2)
+    fn compute_per_layer_embeddings(
+        &mut self,
+        token_ids_gpu: &cudarc::driver::CudaSlice<i32>,
+        hidden_f32: &cudarc::driver::CudaSlice<f32>,
+        n_tokens: u32,
+    ) -> Result<Option<forward::PerLayerEmbeddings>, EngineError> {
+        let epl = match self.config.embd_per_layer {
+            Some(e) => e,
+            None => return Ok(None),
+        };
+        let pe_weight = match &self.weights.per_layer_token_embd {
+            Some(w) => w,
+            None => return Ok(None),
+        };
+
+        let n_layers = self.config.n_layers;
+        let dim = self.config.dim;
+        let row_width = epl * n_layers;  // total elements per token across all layers
+
+        // Compute bytes per row in the quantized format
+        let block_size = pe_weight.quant_type.block_size() as u32;
+        let block_bytes = pe_weight.quant_type.block_bytes() as u32;
+        let blocks_per_row = row_width / block_size;
+        let row_bytes = blocks_per_row * block_bytes;
+
+        // Only log at info level for prefill (many tokens), trace for decode (1 token)
+        if n_tokens > 1 {
+            info!(
+                epl, n_layers, row_width, row_bytes,
+                quant = ?pe_weight.quant_type,
+                n_tokens,
+                "computing per-layer embeddings"
+            );
+        }
+
+        // Step 1: Gather rows — copy the quantized rows for our token IDs into a contiguous buffer
+        let gathered_bytes = n_tokens * row_bytes;
+        let mut gathered_quant = self.stream
+            .alloc_zeros::<u8>(gathered_bytes as usize)
+            .map_err(EngineError::Driver)?;
+
+        self.kernels.ops.gather_rows_quant(
+            &pe_weight.data,
+            token_ids_gpu,
+            &mut gathered_quant,
+            row_bytes,
+            n_tokens,
+        )?;
+
+        // Step 1b: Dequantize all gathered rows to f16: [n_tokens, row_width]
+        let total_elements = n_tokens * row_width;
+        let mut tok_embd = self.stream
+            .alloc_zeros::<half::f16>(total_elements as usize)
+            .map_err(EngineError::Driver)?;
+
+        self.kernels.dequant.dequant(
+            &gathered_quant,
+            &mut tok_embd,
+            total_elements,
+            pe_weight.quant_type,
+        )?;
+
+        // Free gathered quant immediately
+        drop(gathered_quant);
+
+        // Step 2: Scale tok_embd by sqrt(epl)
+        let tok_scale = (epl as f32).sqrt();
+        {
+            let src_ptr = &tok_embd as *const cudarc::driver::CudaSlice<half::f16>;
+            let dst_ptr = &mut tok_embd as *mut cudarc::driver::CudaSlice<half::f16>;
+            unsafe {
+                self.kernels.ops.scale_f16(&*src_ptr, &mut *dst_ptr, total_elements, tok_scale)?;
+            }
+        }
+
+        // Step 3: Project hidden state through per_layer_model_proj
+        // per_layer_model_proj is [row_width, dim] quantized (BF16)
+        // proj = hidden_f16 @ per_layer_model_proj^T → [n_tokens, row_width]
+        let has_proj = self.weights.per_layer_model_proj.is_some()
+            && self.weights.per_layer_proj_norm.is_some();
+
+        if has_proj {
+            // 3a: Convert hidden f32 → f16 for matmul
+            let hidden_elems = n_tokens * dim;
+            let mut hidden_f16 = self.stream
+                .alloc_zeros::<half::f16>(hidden_elems as usize)
+                .map_err(EngineError::Driver)?;
+            {
+                let mut dst_view = hidden_f16.slice_mut(..);
+                self.kernels.ops.copy_f32_to_f16(hidden_f32, &mut dst_view, hidden_elems)?;
+            }
+
+            // 3b: Matmul — proj = hidden_f16 @ per_layer_model_proj^T
+            //   A = hidden_f16 [n_tokens, dim]  (M=n_tokens, K=dim)
+            //   B = per_layer_model_proj [row_width, dim]  (N=row_width, K=dim)
+            //   C = proj [n_tokens, row_width]
+            let mut proj = self.stream
+                .alloc_zeros::<half::f16>(total_elements as usize)
+                .map_err(EngineError::Driver)?;
+
+            let proj_w = self.weights.per_layer_model_proj.as_ref().unwrap();
+            self.kernels.gemm.matmul_dequant(
+                &hidden_f16,
+                &proj_w.data,
+                proj_w.quant_type,
+                proj_w.n_elements,
+                &mut proj,
+                n_tokens,    // M
+                row_width,   // N
+                dim,         // K
+                &self.kernels.dequant,
+            )?;
+
+            // Free hidden_f16 — no longer needed
+            drop(hidden_f16);
+
+            // Step 4: Scale proj by 1/sqrt(dim)
+            let proj_scale = 1.0 / (dim as f32).sqrt();
+            {
+                let src_ptr = &proj as *const cudarc::driver::CudaSlice<half::f16>;
+                let dst_ptr = &mut proj as *mut cudarc::driver::CudaSlice<half::f16>;
+                unsafe {
+                    self.kernels.ops.scale_f16(&*src_ptr, &mut *dst_ptr, total_elements, proj_scale)?;
+                }
+            }
+
+            // Step 5: RMS-norm proj with per_layer_proj_norm [epl]
+            // Conceptually reshape proj as [n_tokens * n_layers, epl] and norm each row
+            let norm_rows = n_tokens * n_layers;
+            let mut proj_normed = self.stream
+                .alloc_zeros::<half::f16>(total_elements as usize)
+                .map_err(EngineError::Driver)?;
+
+            let norm_weight = self.weights.per_layer_proj_norm.as_ref().unwrap();
+            self.kernels.ops.rms_norm(
+                &proj,
+                norm_weight,
+                &mut proj_normed,
+                norm_rows,
+                epl,
+                self.config.rms_norm_eps,
+            )?;
+
+            // Free un-normed proj
+            drop(proj);
+
+            // Step 6: result = (tok_embd_scaled + proj_normed) / sqrt(2)
+            // First add: tok_embd + proj_normed → tok_embd (reuse buffer)
+            let mut result = self.stream
+                .alloc_zeros::<half::f16>(total_elements as usize)
+                .map_err(EngineError::Driver)?;
+            self.kernels.ops.add_f16(&tok_embd, &proj_normed, &mut result, total_elements)?;
+
+            // Free intermediates
+            drop(tok_embd);
+            drop(proj_normed);
+
+            // Scale by 1/sqrt(2)
+            let inv_sqrt2 = 1.0 / 2.0_f32.sqrt();
+            {
+                let src_ptr = &result as *const cudarc::driver::CudaSlice<half::f16>;
+                let dst_ptr = &mut result as *mut cudarc::driver::CudaSlice<half::f16>;
+                unsafe {
+                    self.kernels.ops.scale_f16(&*src_ptr, &mut *dst_ptr, total_elements, inv_sqrt2)?;
+                }
+            }
+
+            Ok(Some(forward::PerLayerEmbeddings {
+                data: result,
+                epl,
+                row_width,
+                seq_len: n_tokens,
+            }))
+        } else {
+            // No projection weights available — fall back to token embeddings only
+            // Scale by 1/sqrt(2) since we already scaled by sqrt(epl)
+            let inv_sqrt2 = 1.0 / 2.0_f32.sqrt();
+            {
+                let src_ptr = &tok_embd as *const cudarc::driver::CudaSlice<half::f16>;
+                let dst_ptr = &mut tok_embd as *mut cudarc::driver::CudaSlice<half::f16>;
+                unsafe {
+                    self.kernels.ops.scale_f16(&*src_ptr, &mut *dst_ptr, total_elements, inv_sqrt2)?;
+                }
+            }
+
+            Ok(Some(forward::PerLayerEmbeddings {
+                data: tok_embd,
+                epl,
+                row_width,
+                seq_len: n_tokens,
+            }))
+        }
     }
 
     /// Reset the KV cache (start a new conversation).

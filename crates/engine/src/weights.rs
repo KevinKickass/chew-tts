@@ -35,6 +35,9 @@ pub struct ModelWeights {
     pub per_layer_model_proj: Option<QuantWeight>,
     /// per_layer_proj_norm: [n_embd_per_layer] — f16
     pub per_layer_proj_norm: Option<CudaSlice<half::f16>>,
+    /// RoPE proportional frequency factors: [max_head_dim/2] — f32
+    /// For Gemma 4: 1.0 for rotated dims, 1e30 for identity dims
+    pub rope_freq_factors: Option<CudaSlice<f32>>,
 }
 
 /// Weights for one transformer layer.
@@ -140,6 +143,27 @@ impl ModelWeights {
             None
         };
 
+        // RoPE proportional frequency factors (Gemma 4 full-attention layers)
+        let rope_freq_factors = if gguf.find_tensor("rope_freqs.weight").is_some() {
+            let (ti, host_data) = gguf.tensor_data_by_name("rope_freqs.weight")
+                .map_err(|_| LoadError::MissingTensor("rope_freqs.weight".into()))?;
+            let n = ti.n_elements() as usize;
+            let stream = alloc.stream(gpu_idx);
+            // This is F32 data — upload directly
+            assert!(host_data.len() == n * 4, "rope_freqs.weight expected F32");
+            let f32_data: Vec<f32> = host_data.chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            let mut gpu_buf = stream.alloc_zeros::<f32>(n)
+                .map_err(|e| LoadError::Vram(chew_vram::VramError::Alloc(e.to_string())))?;
+            stream.memcpy_htod(&f32_data, &mut gpu_buf)
+                .map_err(|e| LoadError::Vram(chew_vram::VramError::Alloc(e.to_string())))?;
+            info!(n_factors = n, "loaded rope_freqs.weight");
+            Some(gpu_buf)
+        } else {
+            None
+        };
+
         let mut layers = Vec::with_capacity(config.n_layers as usize);
         for i in 0..config.n_layers {
             let pfx = format!("blk.{i}");
@@ -205,6 +229,7 @@ impl ModelWeights {
             per_layer_token_embd,
             per_layer_model_proj,
             per_layer_proj_norm,
+            rope_freq_factors,
         })
     }
 }

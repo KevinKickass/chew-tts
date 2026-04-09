@@ -101,6 +101,61 @@ __global__ void dequant_q4_k(const void* __restrict__ src,
     dst[idx] = __float2half(val);
 }
 
+// --- Q5_K: 256 weights per super-block ---
+// Layout: d(f16) | dmin(f16) | scales[12] | qh[32] | qs[128] = 176 bytes
+// Same scale/min encoding as Q4_K, but 5 bits per weight:
+// Low 4 bits from qs (same nibble layout as Q4_K), high bit from qh.
+__global__ void dequant_q5_k(const void* __restrict__ src,
+                              __half* __restrict__ dst,
+                              int n_elements) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_elements) return;
+
+    int block_idx = idx / 256;
+    int in_block  = idx % 256;
+    int sub       = in_block / 32;
+
+    const uint8_t* block = (const uint8_t*)src + block_idx * 176;
+
+    float d    = __half2float(*(const __half*)block);
+    float dmin = __half2float(*(const __half*)(block + 2));
+    const uint8_t* scales = block + 4;    // 12 bytes
+    const uint8_t* qh     = block + 16;   // 32 bytes (high bits)
+    const uint8_t* qs     = block + 48;   // 128 bytes (low nibbles)
+
+    // Scale/min decoding: same as Q4_K
+    uint8_t sc, m;
+    if (sub < 4) {
+        sc = scales[sub] & 0x3F;
+        m  = scales[sub + 4] & 0x3F;
+    } else {
+        int off = sub - 4;
+        sc = (scales[off + 8] & 0x0F) | ((scales[off] >> 6) << 4);
+        m  = (scales[off + 8] >> 4)    | ((scales[off + 4] >> 6) << 4);
+    }
+
+    // Low 4 bits: same nibble layout as Q4_K
+    int in_sub = in_block % 32;
+    int pair = sub / 2;
+    int byte_idx = pair * 32 + in_sub;
+    uint8_t q_lo;
+    if (sub % 2 == 0) {
+        q_lo = qs[byte_idx] & 0x0F;
+    } else {
+        q_lo = (qs[byte_idx] >> 4) & 0x0F;
+    }
+
+    // High bit: qh[in_sub] bit (sub)
+    // GGML layout: for 64*j+offset+l, high bit = qh[l] >> (2*j + offset/32)
+    // Simplified: qh[in_sub] >> sub
+    uint8_t q_hi = (qh[in_sub] >> sub) & 1;
+
+    int q = q_lo | (q_hi << 4);  // 5-bit quantized value
+
+    float val = d * (float)sc * (float)q - dmin * (float)m;
+    dst[idx] = __float2half(val);
+}
+
 // --- Q6_K: 256 weights per super-block ---
 // Layout: ql[128] | qh[64] | scales[16] | d[2] = 210 bytes
 __global__ void dequant_q6_k(const void* __restrict__ src,
@@ -437,6 +492,40 @@ __global__ void dequant_iq4_xs(const void* __restrict__ src,
 }
 
 // --- F16 passthrough ---
+// --- TQ2_0: 256 weights per block, ternary quantization ---
+// Layout: d(f16) + qs[64] = 66 bytes per 256 elements
+// Each byte holds 4 x 2-bit values. Value = (q - 1) * d → {-d, 0, d, 2d}
+// Element ordering: 2 groups of 128, each group has 4 passes of 32 bytes
+__global__ void dequant_tq2_0(const void* __restrict__ src,
+                               __half* __restrict__ dst,
+                               int n_elements) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_elements) return;
+
+    int block_idx = idx / 256;
+    int in_block  = idx % 256;
+
+    const uint8_t* block = (const uint8_t*)src + block_idx * 66;
+    float d = __half2float(*(const __half*)block);
+    const uint8_t* qs = block + 2;
+
+    // Element mapping within the block:
+    // The dequant iterates: j in [0, 32, 64...] stepping by 32, l in [0..3], m in [0..31]
+    // Output index = (j/32) * 128 + l * 32 + m
+    // So for in_block: group = in_block / 128, subgroup = (in_block % 128) / 32, m = in_block % 32
+    // byte index = group * 32 + m, shift = subgroup * 2
+    int group = in_block / 128;      // 0 or 1
+    int subgroup = (in_block % 128) / 32;  // 0..3
+    int m = in_block % 32;
+
+    int byte_idx = group * 32 + m;
+    int shift = subgroup * 2;
+    int q = (qs[byte_idx] >> shift) & 3;
+
+    float val = (float)(q - 1) * d;
+    dst[idx] = __float2half(val);
+}
+
 __global__ void dequant_f16(const __half* __restrict__ src,
                              __half* __restrict__ dst,
                              int n_elements) {

@@ -41,8 +41,13 @@ pub struct OpsKernels {
     logit_softcap: CudaFunction,
     logit_softcap_inplace: CudaFunction,
     rope_neox: CudaFunction,
+    rope_neox_freqs: CudaFunction,
     rope_neox_graph: CudaFunction,
     post_norm_add: CudaFunction,
+    mul_f16: CudaFunction,
+    gelu_act: CudaFunction,
+    gather_rows_quant: CudaFunction,
+    pe_strided_mul: CudaFunction,
 }
 
 impl OpsKernels {
@@ -81,8 +86,13 @@ impl OpsKernels {
             logit_softcap: loader::get_fn(&module, "logit_softcap")?,
             logit_softcap_inplace: loader::get_fn(&module, "logit_softcap_inplace")?,
             rope_neox: loader::get_fn(&module, "rope_neox")?,
+            rope_neox_freqs: loader::get_fn(&module, "rope_neox_freqs")?,
             rope_neox_graph: loader::get_fn(&module, "rope_neox_graph")?,
             post_norm_add: loader::get_fn(&module, "post_norm_add")?,
+            mul_f16: loader::get_fn(&module, "mul_f16")?,
+            gelu_act: loader::get_fn(&module, "gelu_act")?,
+            gather_rows_quant: loader::get_fn(&module, "gather_rows_quant")?,
+            pe_strided_mul: loader::get_fn(&module, "pe_strided_mul")?,
             _module: module,
         })
     }
@@ -864,6 +874,35 @@ impl OpsKernels {
         Ok(())
     }
 
+    /// RoPE NeoX with proportional frequency factors (for Gemma 4 full-attention layers).
+    /// freq_factors shape: [head_dim/2], values 1.0 (rotate) or 1e30 (identity).
+    pub fn rope_neox_freqs(
+        &self,
+        x: &mut CudaSlice<half::f16>,
+        freq_factors: &CudaSlice<f32>,
+        seq_len: u32,
+        n_heads: u32,
+        head_dim: u32,
+        pos: u32,
+        theta_base: f32,
+    ) -> Result<(), KernelError> {
+        let cfg = LaunchConfig {
+            grid_dim: (seq_len, n_heads, 1),
+            block_dim: (head_dim / 2, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let hd = head_dim as i32;
+        let nh = n_heads as i32;
+        let p = pos as i32;
+        let mut args: [*mut c_void; 6] = [
+            slice_ptr_mut(x), slice_ptr(freq_factors),
+            scalar_ptr(&hd), scalar_ptr(&nh),
+            scalar_ptr(&p), scalar_ptr(&theta_base),
+        ];
+        unsafe { self.fast.launch(&self.rope_neox_freqs, cfg, &mut args)? }
+        Ok(())
+    }
+
     /// RoPE NeoX graph-compatible (reads pos from device memory).
     pub fn rope_neox_graph(
         &self,
@@ -916,6 +955,124 @@ impl OpsKernels {
         Ok(())
     }
 
+    /// Element-wise multiply: out = a * b, all f16.
+    pub fn mul_f16(
+        &self,
+        a: &CudaSlice<half::f16>,
+        b: &CudaSlice<half::f16>,
+        out: &mut CudaSlice<half::f16>,
+        n: u32,
+    ) -> Result<(), KernelError> {
+        let threads = 256u32;
+        let blocks = (n + threads - 1) / threads;
+        let cfg = LaunchConfig {
+            grid_dim: (blocks, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let n_i = n as i32;
+        let mut args: [*mut c_void; 4] = [
+            slice_ptr(a), slice_ptr(b), slice_ptr_mut(out),
+            scalar_ptr(&n_i),
+        ];
+        unsafe { self.fast.launch(&self.mul_f16, cfg, &mut args)? }
+        Ok(())
+    }
+
+    /// Standalone GELU activation: out = GELU(x), all f16.
+    /// Unlike `gelu()` which computes GELU(gate)*up, this just applies GELU.
+    pub fn gelu_act(
+        &self,
+        x: &CudaSlice<half::f16>,
+        out: &mut CudaSlice<half::f16>,
+        n: u32,
+    ) -> Result<(), KernelError> {
+        let threads = 256u32;
+        let blocks = (n + threads - 1) / threads;
+        let cfg = LaunchConfig {
+            grid_dim: (blocks, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let n_i = n as i32;
+        let mut args: [*mut c_void; 3] = [
+            slice_ptr(x), slice_ptr_mut(out),
+            scalar_ptr(&n_i),
+        ];
+        unsafe { self.fast.launch(&self.gelu_act, cfg, &mut args)? }
+        Ok(())
+    }
+
+    /// Gather rows from a quantized tensor by token ID.
+    /// Copies selected rows into a contiguous output buffer for subsequent dequantization.
+    ///
+    /// src: quantized tensor data on GPU
+    /// token_ids: [n_tokens] i32 on GPU
+    /// dst: output buffer, must be at least n_tokens * row_bytes
+    /// row_bytes: bytes per row in the quantized format
+    /// n_tokens: number of tokens to gather
+    pub fn gather_rows_quant(
+        &self,
+        src: &CudaSlice<u8>,
+        token_ids: &CudaSlice<i32>,
+        dst: &mut CudaSlice<u8>,
+        row_bytes: u32,
+        n_tokens: u32,
+    ) -> Result<(), KernelError> {
+        let threads = 256u32;
+        let y_blocks = (row_bytes + threads - 1) / threads;
+        let cfg = LaunchConfig {
+            grid_dim: (n_tokens, y_blocks, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let rb = row_bytes as i32;
+        let nt = n_tokens as i32;
+        let mut args: [*mut c_void; 5] = [
+            slice_ptr(src), slice_ptr(token_ids), slice_ptr_mut(dst),
+            scalar_ptr(&rb), scalar_ptr(&nt),
+        ];
+        unsafe { self.fast.launch(&self.gather_rows_quant, cfg, &mut args)? }
+        Ok(())
+    }
+
+    /// Per-layer embedding strided multiply.
+    /// For each token t and dim j:
+    ///   out[t*epl + j] = a[t*epl + j] * embd[t*row_width + layer_off + j]
+    ///
+    /// a, out: [n_tokens, epl] contiguous f16
+    /// embd: [n_tokens, row_width] contiguous f16
+    pub fn pe_strided_mul(
+        &self,
+        a: &CudaSlice<half::f16>,
+        embd: &CudaSlice<half::f16>,
+        out: &mut CudaSlice<half::f16>,
+        epl: u32,
+        row_width: u32,
+        layer_off: u32,
+        n_tokens: u32,
+    ) -> Result<(), KernelError> {
+        let total = n_tokens * epl;
+        let threads = 256u32;
+        let blocks = (total + threads - 1) / threads;
+        let cfg = LaunchConfig {
+            grid_dim: (blocks, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let epl_i = epl as i32;
+        let rw_i = row_width as i32;
+        let lo_i = layer_off as i32;
+        let nt_i = n_tokens as i32;
+        let mut args: [*mut c_void; 7] = [
+            slice_ptr(a), slice_ptr(embd), slice_ptr_mut(out),
+            scalar_ptr(&epl_i), scalar_ptr(&rw_i),
+            scalar_ptr(&lo_i), scalar_ptr(&nt_i),
+        ];
+        unsafe { self.fast.launch(&self.pe_strided_mul, cfg, &mut args)? }
+        Ok(())
+    }
+
     /// Computes Q@K^T/sqrt(head_dim), causal mask, softmax, @V — all fused.
     pub fn mha_fused(
         &self,
@@ -950,6 +1107,7 @@ impl OpsKernels {
         scale: f32,
     ) -> Result<(), KernelError> {
         let threads = 128u32.min(head_dim);
+        // Parallel softmax: kv_len floats for scores + threads floats for reduction scratch
         let smem = (kv_len + threads) * 4;
         let cfg = LaunchConfig {
             grid_dim: (n_heads, seq_len, 1),

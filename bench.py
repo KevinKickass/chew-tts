@@ -6,8 +6,22 @@ Measures prefill tok/s, decode tok/s, TTFT, total throughput.
 import time, json, subprocess, signal, os, sys
 import numpy as np
 
-MODEL = "/run/media/kevin/KioxiaNVMe/NVMeR0/AI/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
-TOKENIZER = "/run/media/kevin/KioxiaNVMe/KI-kram/models/llama3.1-8b-exl2-4bpw/tokenizer.json"
+MODELS = {
+    "llama-8b": {
+        "gguf": "/run/media/kevin/KioxiaNVMe/NVMeR0/AI/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+        "tokenizer": "/run/media/kevin/KioxiaNVMe/KI-kram/models/llama3.1-8b-exl2-4bpw/tokenizer.json",
+        "port": 8080,
+    },
+    "gemma4-e4b": {
+        "gguf": "/run/media/kevin/KioxiaNVMe/NVMeR0/AI/gemma4/gemma-4-E4B-it-Q4_K_M.gguf",
+        "tokenizer": "/run/media/kevin/KioxiaNVMe/NVMeR0/AI/gemma4/tokenizer.json",
+        "port": 8082,
+    },
+}
+CHEW_BIN = "/run/media/kevin/KioxiaNVMe/KI-kram/chew/target/release/chew"
+# Default model for backward compat
+MODEL = MODELS["llama-8b"]["gguf"]
+TOKENIZER = MODELS["llama-8b"]["tokenizer"]
 
 # Test cases: (name, prompt_text, max_tokens)
 TESTS = [

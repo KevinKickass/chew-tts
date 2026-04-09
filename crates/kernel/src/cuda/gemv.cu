@@ -81,24 +81,12 @@ __global__ void quantize_x_q8_1(const __half* __restrict__ x,
 }
 
 // ============================================================================
-// Q4_K × Q8_1 GEMV using dp4a
+// Q4_K × Q8_1 GEMV using dp4a — 4 warps (128 threads), 1 row per block
 // ============================================================================
-// Q4_K super-block: 256 elements, 144 bytes
-//   [0..1]   half d
-//   [2..3]   half dmin
-//   [4..15]  uint8_t scales[12] (packed 6-bit scales and mins)
-//   [16..143] uint8_t qs[128]   (4-bit quants, 2 nibbles per byte)
-//
-// Each Q4_K super-block maps to 8 Q8_1 blocks (256/32 = 8).
-// We process in groups of 32 elements (sub-blocks). Each sub-block has its
-// own 6-bit scale and min.
-//
-// Thread mapping: 256 threads, 8 warps.
-// Each thread processes VDR=2 sub-block pairs per super-block iteration.
-// The llama.cpp approach: each thread loads 2 int32 from qs (= 8 bytes = 16 nibbles),
-// masks nibbles, and uses dp4a against Q8_1 values.
-//
-// Grid: (N,), Block: (256,)
+// Reduced from 8 warps to 4: lower register pressure → better occupancy.
+// Grid: (N,), Block: (128,)
+#define NWARPS_Q4K 4
+__launch_bounds__(NWARPS_Q4K * 32, 1)
 __global__ void gemv_q4_k(const void* __restrict__ W,
                            const __half* __restrict__ x_unused,
                            __half* __restrict__ out,
@@ -106,46 +94,31 @@ __global__ void gemv_q4_k(const void* __restrict__ W,
                            const void* __restrict__ x_q8) {
     const int row = blockIdx.x;
     if (row >= N) return;
-    const int tid = threadIdx.x;  // [0, 255]
+    const int tid = threadIdx.x;  // [0, 127]
 
     const int blocks_per_row = K / 256;
     const uint8_t* row_data = (const uint8_t*)W + (long long)row * blocks_per_row * 144;
 
-    // Each thread handles a slice of the super-block.
-    // Following llama.cpp: qi = 32 (ints per Q4_K block when cast to int*), vdr = 2
-    // iqs = vdr * (tid % (qi/vdr)) = 2 * (tid % 16) -> 0,2,4,...,30
-    // bq8_offset = QR4_K * ((iqs/2) / (QI8_1/2)) = 2 * ((iqs/2) / 4) = 2 * (tid%16 / 4)
-    // Each thread iterates: kbx = tid/(qi/vdr) = tid/16, kbx += blocks_per_iter
-    // blocks_per_iter = vdr * nwarps * 32 / qi = 2 * 8 * 32 / 32 = 16
-    // But we only have blocks_per_row super-blocks, so we iterate in steps of 16.
+    const int iqs = 2 * (tid % 16);
+    const int bq8_offset = 2 * (iqs / 8);
 
-    // Simplified: each of the 256 threads picks a position within each super-block.
-    // With qi=32, vdr=2: thread tid processes iqs = 2*(tid%16), starting at super-block tid/16.
-    // That gives 16 starting super-blocks, stepping by 16.
-
-    const int iqs = 2 * (tid % 16);     // position within super-block (0,2,4,...,30)
-    const int bq8_offset = 2 * (iqs / 8);  // which pair of Q8_1 blocks (0,2,4,6)
-
+    // 4 warps, 128 threads: blocks_per_iter = 2 * 4 * 32 / 32 = 8
     float sumf = 0.0f;
 
-    for (int sb = tid / 16; sb < blocks_per_row; sb += 16) {
+    for (int sb = tid / 16; sb < blocks_per_row; sb += 8) {
         const uint8_t* block = row_data + sb * 144;
 
-        // Load d, dmin as half2
         const half2 dm = *(const half2*)block;
-        const float dm_x = __half2float(__low2half(dm));   // d
-        const float dm_y = __half2float(__high2half(dm));  // dmin
+        const float dm_x = __half2float(__low2half(dm));
+        const float dm_y = __half2float(__high2half(dm));
 
         const uint8_t* scales = block + 4;
         const uint8_t* qs = block + 16;
 
-        // Load Q4_K quant data: 2 int32 values from qs
-        // q4 pointer: qs + 16*bq8_offset + 4*((iqs/2)%4)
         const int* q4 = (const int*)(qs + 16 * bq8_offset + 4 * ((iqs / 2) % 4));
-        int v0 = q4[0];   // 4 bytes = 8 nibbles (low half)
-        int v1 = q4[4];   // next 4 bytes (high half, 16 bytes apart)
+        int v0 = q4[0];
+        int v1 = q4[4];
 
-        // Decode scales and mins (6-bit packed)
         const uint16_t* sc16 = (const uint16_t*)scales;
         uint16_t aux[2];
         const int j = bq8_offset / 2;
@@ -159,33 +132,25 @@ __global__ void gemv_q4_k(const void* __restrict__ W,
         const uint8_t* sc = (const uint8_t*)aux;
         const uint8_t* m  = sc + 2;
 
-        // Load Q8_1 data for the two iterations (QR4_K = 2)
-        int u[4];     // Q8_1 quant values as int32 (4 int8 per int32)
-        float d8[2];  // Q8_1 scales
-
+        int u[4];
+        float d8[2];
         #pragma unroll
         for (int i = 0; i < 2; ++i) {
             const uint8_t* bq8 = (const uint8_t*)x_q8 + (sb * 8 + bq8_offset + i) * Q8_1_BYTES;
             d8[i] = __half2float(__low2half(*(const half2*)bq8));
-
             const int* q8 = (const int*)(bq8 + 4) + ((iqs / 2) % 4);
             u[2 * i + 0] = q8[0];
             u[2 * i + 1] = q8[4];
         }
 
-        // vec_dot_q4_K_q8_1_impl_vmmq
         float sumf_d = 0.0f;
         float sumf_m = 0.0f;
-
         #pragma unroll
-        for (int i = 0; i < 2; ++i) {  // QR4_K = 2
+        for (int i = 0; i < 2; ++i) {
             const int v0i = (v0 >> (4 * i)) & 0x0F0F0F0F;
             const int v1i = (v1 >> (4 * i)) & 0x0F0F0F0F;
-
-            // dp4a: 4 int8 multiplies + accumulate
             const int dot1 = __dp4a(v1i, u[2 * i + 1], __dp4a(v0i, u[2 * i + 0], 0));
             const int dot2 = __dp4a(0x01010101, u[2 * i + 1], __dp4a(0x01010101, u[2 * i + 0], 0));
-
             sumf_d += d8[i] * (dot1 * sc[i]);
             sumf_m += d8[i] * (dot2 * m[i]);
         }
@@ -199,34 +164,23 @@ __global__ void gemv_q4_k(const void* __restrict__ W,
         sumf += __shfl_down_sync(0xFFFFFFFF, sumf, offset);
     }
 
-    // Cross-warp reduction via shared memory
-    __shared__ float warp_sums[8];
+    // Cross-warp reduction (only 4 warps)
+    __shared__ float warp_sums[NWARPS_Q4K];
     if (tid % 32 == 0) warp_sums[tid / 32] = sumf;
     __syncthreads();
 
     if (tid == 0) {
-        float total = 0.0f;
-        #pragma unroll
-        for (int i = 0; i < 8; i++) total += warp_sums[i];
+        float total = warp_sums[0] + warp_sums[1] + warp_sums[2] + warp_sums[3];
         out[row] = __float2half(total);
     }
 }
 
 // ============================================================================
-// Q6_K × Q8_1 GEMV using dp4a
+// Q6_K × Q8_1 GEMV using dp4a — 4 warps (128 threads), 1 row per block
 // ============================================================================
-// Q6_K super-block: 256 elements, 210 bytes
-//   [0..127]   uint8_t ql[128]   (low 4 bits)
-//   [128..191] uint8_t qh[64]    (high 2 bits)
-//   [192..207] int8_t scales[16]
-//   [208..209] half d
-//
-// IMPORTANT: Q6_K blocks are 210 bytes = NOT 4-byte aligned!
-// Must use get_int_b2 (2-byte loads) for weight data, not int* casts.
-//
-// Following llama.cpp's vec_dot_q6_K_q8_1 + vec_dot_q6_K_q8_1_impl_mmvq:
-// qi = 32, vdr = 1, QR6_K = 2
-// Grid: (N,), Block: (256,)
+// Grid: (N,), Block: (128,)
+#define NWARPS_Q6K 4
+__launch_bounds__(NWARPS_Q6K * 32, 2)
 __global__ void gemv_q6_k(const void* __restrict__ W,
                            const __half* __restrict__ x_unused,
                            __half* __restrict__ out,
@@ -238,99 +192,67 @@ __global__ void gemv_q6_k(const void* __restrict__ W,
 
     const int blocks_per_row = K / 256;
     const uint8_t* row_data = (const uint8_t*)W + (long long)row * blocks_per_row * 210;
-
-    // qi = 32, vdr = 1
-    // blocks_per_iter = 1 * 8 * 32 / 32 = 8
     const int iqs = tid % 32;
 
     float sumf = 0.0f;
 
-    for (int sb = tid / 32; sb < blocks_per_row; sb += 8) {
+    for (int sb = tid / 32; sb < blocks_per_row; sb += NWARPS_Q6K) {
         const uint8_t* block = row_data + sb * 210;
-        const uint8_t* ql = block;         // 128 bytes
-        const uint8_t* qh = block + 128;   // 64 bytes
-        const int8_t*  scales = (const int8_t*)(block + 192);  // 16 bytes
-        // d is at block + 208, 2-byte aligned (half)
+        const uint8_t* ql = block;
+        const uint8_t* qh = block + 128;
+        const int8_t*  scales = (const int8_t*)(block + 192);
         const float d = __half2float(*(const __half*)(block + 208));
 
-        // Compute offsets matching llama.cpp
-        // QI6_K = 32 (256 / (4*2))
-        // bq8_offset = 2 * QR6_K * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/4)
-        //            = 2 * 2 * (iqs / 16) + (iqs % 16) / 8
         const int bq8_offset = 4 * (iqs / 16) + (iqs % 16) / 8;
-        // scale_offset = (QI6_K/4) * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/8)
-        //              = 8 * (iqs / 16) + (iqs % 16) / 4
         const int scale_offset = 8 * (iqs / 16) + (iqs % 16) / 4;
-        // vh_shift = 2 * ((iqs % (QI6_K/2)) / (QI6_K/4))
-        //          = 2 * ((iqs % 16) / 8)
         const int vh_shift = 2 * ((iqs % 16) / 8);
 
-        // Use get_int_b2 for 2-byte-aligned weight loads (Q6_K blocks are 210 bytes!)
         const int vl = get_int_b2(ql, iqs);
-        // QI6_K/4 = 8
         const int vh = get_int_b2(qh, 8 * (iqs / 16) + iqs % 8) >> vh_shift;
-
         const int8_t* sc = scales + scale_offset;
 
-        // Load Q8_1 data for QR6_K=2 iterations
         int u[2];
         float d8[2];
-
         #pragma unroll
-        for (int i = 0; i < 2; ++i) {  // QR6_K = 2
+        for (int i = 0; i < 2; ++i) {
             const uint8_t* bq8 = (const uint8_t*)x_q8 + (sb * 8 + bq8_offset + 2 * i) * Q8_1_BYTES;
             d8[i] = __half2float(__low2half(*(const half2*)bq8));
-            // Q8_1 blocks are 36 bytes (4-byte aligned), safe to use get_int_b4
             u[i] = get_int_b4(bq8 + 4, iqs % 8);
         }
 
-        // vec_dot_q6_K_q8_1_impl_mmvq
         float local_sum = 0.0f;
-
         #pragma unroll
-        for (int i = 0; i < 2; ++i) {  // QR6_K = 2
+        for (int i = 0; i < 2; ++i) {
             const int sc_val = sc[4 * i];
             const int vil = (vl >> (4 * i)) & 0x0F0F0F0F;
             const int vih = ((vh >> (4 * i)) << 4) & 0x30303030;
-
-            // Combine low 4 bits and high 2 bits, subtract 32
             const int vi = __vsubss4((vil | vih), 0x20202020);
-
             local_sum += d8[i] * (__dp4a(vi, u[i], 0) * sc_val);
         }
-
         sumf += d * local_sum;
     }
 
-    // Warp reduction
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
         sumf += __shfl_down_sync(0xFFFFFFFF, sumf, offset);
     }
 
-    __shared__ float warp_sums[8];
+    __shared__ float warp_sums[NWARPS_Q6K];
     if (tid % 32 == 0) warp_sums[tid / 32] = sumf;
     __syncthreads();
 
     if (tid == 0) {
-        float total = 0.0f;
-        #pragma unroll
-        for (int i = 0; i < 8; i++) total += warp_sums[i];
+        float total = warp_sums[0] + warp_sums[1] + warp_sums[2] + warp_sums[3];
         out[row] = __float2half(total);
     }
 }
 
 // ============================================================================
-// Q8_0 × Q8_1 GEMV using dp4a
+// Q8_0 × Q8_1 GEMV using dp4a — 4 warps (128 threads), 1 row per block
 // ============================================================================
-// Q8_0 block: 34 bytes per 32 elements
-//   half d (2 bytes) + int8_t qs[32]
-//
-// Both sides are int8, so dp4a is perfect: process 4 elements per dp4a call.
-// Each thread loads 1 int32 from Q8_0 qs (= 4 int8 values) and 1 int32 from Q8_1 qs.
-// VDR_Q8_0 = 2: each thread processes 2 int32 pairs per Q8_0 block.
-//
-// Grid: (N,), Block: (256,)
+// Grid: (N,), Block: (128,)
+#define NWARPS_Q80 4
+__launch_bounds__(NWARPS_Q80 * 32, 2)
 __global__ void gemv_q8_0(const void* __restrict__ W,
                            const __half* __restrict__ x_unused,
                            __half* __restrict__ out,
@@ -343,24 +265,16 @@ __global__ void gemv_q8_0(const void* __restrict__ W,
     const int blocks_per_row = K / 32;
     const uint8_t* row_data = (const uint8_t*)W + (long long)row * blocks_per_row * 34;
 
-    // qi = QI8_0 = 8, vdr = 2
-    // iqs = 2 * (tid % 4) -> 0, 2, 4, 6
-    // blocks_per_iter = 2 * 8 * 32 / 8 = 64
-    // Each thread starts at block tid/4, steps by 64.
     const int iqs = 2 * (tid % 4);
-
     float sumf = 0.0f;
 
-    for (int blk = tid / 4; blk < blocks_per_row; blk += 64) {
+    for (int blk = tid / 4; blk < blocks_per_row; blk += 32) {
         const uint8_t* w_block = row_data + blk * 34;
         const __half w_d = *(const __half*)w_block;
-
-        // Load 2 int32 from Q8_0 qs
         const int* w_qs = (const int*)(w_block + 2);
         int v0 = w_qs[iqs + 0];
         int v1 = w_qs[iqs + 1];
 
-        // Load corresponding Q8_1 data
         const uint8_t* bq8 = (const uint8_t*)x_q8 + blk * Q8_1_BYTES;
         const __half x_d = __low2half(*(const half2*)bq8);
         const int* x_qs = (const int*)(bq8 + 4);
@@ -369,25 +283,234 @@ __global__ void gemv_q8_0(const void* __restrict__ W,
 
         int sumi = __dp4a(v0, u0, 0);
         sumi = __dp4a(v1, u1, sumi);
-
         sumf += __half2float(w_d) * __half2float(x_d) * (float)sumi;
     }
 
-    // Warp reduction
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
         sumf += __shfl_down_sync(0xFFFFFFFF, sumf, offset);
     }
 
-    __shared__ float warp_sums[8];
+    __shared__ float warp_sums[NWARPS_Q80];
     if (tid % 32 == 0) warp_sums[tid / 32] = sumf;
     __syncthreads();
 
     if (tid == 0) {
-        float total = 0.0f;
-        #pragma unroll
-        for (int i = 0; i < 8; i++) total += warp_sums[i];
+        float total = warp_sums[0] + warp_sums[1] + warp_sums[2] + warp_sums[3];
         out[row] = __float2half(total);
+    }
+}
+
+// ============================================================================
+// Fused Gate+Up GEMV: computes BOTH gate[N,K] and up[N,K] in one kernel
+// ============================================================================
+// Saves 1 kernel launch and reads Q8_1 input only once for both matrices.
+// Grid: (N,), Block: (128,)
+// Writes: gate_out[N] and up_out[N]
+#define NWARPS_DUAL 4
+__launch_bounds__(NWARPS_DUAL * 32, 1)
+__global__ void gemv_dual_q4_k(const void* __restrict__ W_gate,
+                                const void* __restrict__ W_up,
+                                __half* __restrict__ out_gate,
+                                __half* __restrict__ out_up,
+                                int N, int K,
+                                const void* __restrict__ x_q8) {
+    const int row = blockIdx.x;
+    if (row >= N) return;
+    const int tid = threadIdx.x;
+
+    const int blocks_per_row = K / 256;
+    const uint8_t* gate_data = (const uint8_t*)W_gate + (long long)row * blocks_per_row * 144;
+    const uint8_t* up_data   = (const uint8_t*)W_up   + (long long)row * blocks_per_row * 144;
+
+    const int iqs = 2 * (tid % 16);
+    const int bq8_offset = 2 * (iqs / 8);
+
+    float sumf_gate = 0.0f;
+    float sumf_up   = 0.0f;
+
+    for (int sb = tid / 16; sb < blocks_per_row; sb += 8) {
+        // Load Q8_1 data ONCE (shared between gate and up)
+        int u[4];
+        float d8[2];
+        #pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const uint8_t* bq8 = (const uint8_t*)x_q8 + (sb * 8 + bq8_offset + i) * Q8_1_BYTES;
+            d8[i] = __half2float(__low2half(*(const half2*)bq8));
+            const int* q8 = (const int*)(bq8 + 4) + ((iqs / 2) % 4);
+            u[2 * i + 0] = q8[0];
+            u[2 * i + 1] = q8[4];
+        }
+
+        // Process GATE weight
+        {
+            const uint8_t* block = gate_data + sb * 144;
+            const half2 dm = *(const half2*)block;
+            const float dm_x = __half2float(__low2half(dm));
+            const float dm_y = __half2float(__high2half(dm));
+            const uint8_t* scales = block + 4;
+            const uint8_t* qs = block + 16;
+            const int* q4 = (const int*)(qs + 16 * bq8_offset + 4 * ((iqs / 2) % 4));
+            int v0 = q4[0]; int v1 = q4[4];
+            const uint16_t* sc16 = (const uint16_t*)scales;
+            uint16_t aux[2]; const int j = bq8_offset / 2;
+            if (j < 2) { aux[0] = sc16[j+0]&0x3f3f; aux[1] = sc16[j+2]&0x3f3f; }
+            else { aux[0]=((sc16[j+2]>>0)&0x0f0f)|((sc16[j-2]&0xc0c0)>>2); aux[1]=((sc16[j+2]>>4)&0x0f0f)|((sc16[j-0]&0xc0c0)>>2); }
+            const uint8_t* sc = (const uint8_t*)aux; const uint8_t* m = sc + 2;
+            float sd=0,sm=0;
+            #pragma unroll
+            for (int i=0;i<2;++i) {
+                const int v0i=(v0>>(4*i))&0x0F0F0F0F; const int v1i=(v1>>(4*i))&0x0F0F0F0F;
+                sd += d8[i]*(__dp4a(v1i,u[2*i+1],__dp4a(v0i,u[2*i+0],0))*sc[i]);
+                sm += d8[i]*(__dp4a(0x01010101,u[2*i+1],__dp4a(0x01010101,u[2*i+0],0))*m[i]);
+            }
+            sumf_gate += dm_x*sd - dm_y*sm;
+        }
+
+        // Process UP weight (same Q8_1 data reused)
+        {
+            const uint8_t* block = up_data + sb * 144;
+            const half2 dm = *(const half2*)block;
+            const float dm_x = __half2float(__low2half(dm));
+            const float dm_y = __half2float(__high2half(dm));
+            const uint8_t* scales = block + 4;
+            const uint8_t* qs = block + 16;
+            const int* q4 = (const int*)(qs + 16 * bq8_offset + 4 * ((iqs / 2) % 4));
+            int v0 = q4[0]; int v1 = q4[4];
+            const uint16_t* sc16 = (const uint16_t*)scales;
+            uint16_t aux[2]; const int j = bq8_offset / 2;
+            if (j < 2) { aux[0] = sc16[j+0]&0x3f3f; aux[1] = sc16[j+2]&0x3f3f; }
+            else { aux[0]=((sc16[j+2]>>0)&0x0f0f)|((sc16[j-2]&0xc0c0)>>2); aux[1]=((sc16[j+2]>>4)&0x0f0f)|((sc16[j-0]&0xc0c0)>>2); }
+            const uint8_t* sc = (const uint8_t*)aux; const uint8_t* m = sc + 2;
+            float sd=0,sm=0;
+            #pragma unroll
+            for (int i=0;i<2;++i) {
+                const int v0i=(v0>>(4*i))&0x0F0F0F0F; const int v1i=(v1>>(4*i))&0x0F0F0F0F;
+                sd += d8[i]*(__dp4a(v1i,u[2*i+1],__dp4a(v0i,u[2*i+0],0))*sc[i]);
+                sm += d8[i]*(__dp4a(0x01010101,u[2*i+1],__dp4a(0x01010101,u[2*i+0],0))*m[i]);
+            }
+            sumf_up += dm_x*sd - dm_y*sm;
+        }
+    }
+
+    // Warp reduction for both
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        sumf_gate += __shfl_down_sync(0xFFFFFFFF, sumf_gate, off);
+        sumf_up   += __shfl_down_sync(0xFFFFFFFF, sumf_up, off);
+    }
+
+    __shared__ float ws_gate[NWARPS_DUAL];
+    __shared__ float ws_up[NWARPS_DUAL];
+    if (tid % 32 == 0) { ws_gate[tid/32] = sumf_gate; ws_up[tid/32] = sumf_up; }
+    __syncthreads();
+
+    if (tid == 0) {
+        float g = ws_gate[0]+ws_gate[1]+ws_gate[2]+ws_gate[3];
+        float u = ws_up[0]+ws_up[1]+ws_up[2]+ws_up[3];
+        out_gate[row] = __float2half(g);
+        out_up[row]   = __float2half(u);
+    }
+}
+
+// ============================================================================
+// Fused Q+K+V GEMV: computes Q[Nq,K], K[Nk,K], V[Nk,K] in one kernel
+// ============================================================================
+// For GQA: Nq = n_heads * head_dim, Nk = n_kv_heads * head_dim (Nk <= Nq)
+// We launch with N = max(Nq, Nk). Rows >= Nk skip K and V.
+// Grid: (Nq,), Block: (128,)
+#define NWARPS_QKV 4
+__launch_bounds__(NWARPS_QKV * 32, 1)
+__global__ void gemv_qkv_q4_k(const void* __restrict__ W_q,
+                                const void* __restrict__ W_k,
+                                const void* __restrict__ W_v,
+                                __half* __restrict__ out_q,
+                                __half* __restrict__ out_k,
+                                __half* __restrict__ out_v,
+                                int Nq, int Nk, int K,
+                                const void* __restrict__ x_q8) {
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int blocks_per_row = K / 256;
+    const int iqs = 2 * (tid % 16);
+    const int bq8_offset = 2 * (iqs / 8);
+
+    // Always compute Q
+    float sumf_q = 0.0f;
+    const uint8_t* q_data = (const uint8_t*)W_q + (long long)row * blocks_per_row * 144;
+
+    // Conditionally compute K and V (only for rows < Nk)
+    float sumf_k = 0.0f;
+    float sumf_v = 0.0f;
+    const bool do_kv = (row < Nk);
+    const uint8_t* k_data = do_kv ? (const uint8_t*)W_k + (long long)row * blocks_per_row * 144 : nullptr;
+    const uint8_t* v_data = do_kv ? (const uint8_t*)W_v + (long long)row * blocks_per_row * 144 : nullptr;
+
+    for (int sb = tid / 16; sb < blocks_per_row; sb += 8) {
+        // Load Q8_1 ONCE
+        int u[4]; float d8[2];
+        #pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const uint8_t* bq8 = (const uint8_t*)x_q8 + (sb*8+bq8_offset+i)*Q8_1_BYTES;
+            d8[i] = __half2float(__low2half(*(const half2*)bq8));
+            const int* q8 = (const int*)(bq8+4)+((iqs/2)%4);
+            u[2*i+0]=q8[0]; u[2*i+1]=q8[4];
+        }
+
+        // Macro for Q4_K dot product on one weight matrix
+        #define DO_Q4K_DOT(w_ptr, result) { \
+            const uint8_t* blk = (w_ptr) + sb * 144; \
+            const half2 dm = *(const half2*)blk; \
+            const float dx = __half2float(__low2half(dm)); \
+            const float dy = __half2float(__high2half(dm)); \
+            const uint8_t* sc_raw = blk+4; const uint8_t* qs_ = blk+16; \
+            const int* q4_ = (const int*)(qs_+16*bq8_offset+4*((iqs/2)%4)); \
+            int v0_=q4_[0]; int v1_=q4_[4]; \
+            const uint16_t* s16=(const uint16_t*)sc_raw; \
+            uint16_t ax[2]; const int jj=bq8_offset/2; \
+            if(jj<2){ax[0]=s16[jj]&0x3f3f;ax[1]=s16[jj+2]&0x3f3f;} \
+            else{ax[0]=((s16[jj+2])&0x0f0f)|((s16[jj-2]&0xc0c0)>>2);ax[1]=((s16[jj+2]>>4)&0x0f0f)|((s16[jj]&0xc0c0)>>2);} \
+            const uint8_t*sc_=(const uint8_t*)ax; const uint8_t*mm_=sc_+2; \
+            float sd_=0,sm_=0; \
+            for(int ii=0;ii<2;++ii){ \
+                const int v0i_=(v0_>>(4*ii))&0x0F0F0F0F; const int v1i_=(v1_>>(4*ii))&0x0F0F0F0F; \
+                sd_+=d8[ii]*(__dp4a(v1i_,u[2*ii+1],__dp4a(v0i_,u[2*ii],0))*sc_[ii]); \
+                sm_+=d8[ii]*(__dp4a(0x01010101,u[2*ii+1],__dp4a(0x01010101,u[2*ii],0))*mm_[ii]); \
+            } \
+            (result) += dx*sd_ - dy*sm_; \
+        }
+
+        DO_Q4K_DOT(q_data, sumf_q);
+        if (do_kv) {
+            DO_Q4K_DOT(k_data, sumf_k);
+            DO_Q4K_DOT(v_data, sumf_v);
+        }
+        #undef DO_Q4K_DOT
+    }
+
+    // Warp reduction
+    #pragma unroll
+    for (int off=16;off>0;off>>=1) {
+        sumf_q += __shfl_down_sync(0xFFFFFFFF,sumf_q,off);
+        if (do_kv) {
+            sumf_k += __shfl_down_sync(0xFFFFFFFF,sumf_k,off);
+            sumf_v += __shfl_down_sync(0xFFFFFFFF,sumf_v,off);
+        }
+    }
+
+    __shared__ float ws[3][NWARPS_QKV];
+    if (tid%32==0) {
+        ws[0][tid/32]=sumf_q;
+        if (do_kv) { ws[1][tid/32]=sumf_k; ws[2][tid/32]=sumf_v; }
+    }
+    __syncthreads();
+
+    if (tid==0) {
+        out_q[row] = __float2half(ws[0][0]+ws[0][1]+ws[0][2]+ws[0][3]);
+        if (do_kv) {
+            out_k[row] = __float2half(ws[1][0]+ws[1][1]+ws[1][2]+ws[1][3]);
+            out_v[row] = __float2half(ws[2][0]+ws[2][1]+ws[2][2]+ws[2][3]);
+        }
     }
 }
 

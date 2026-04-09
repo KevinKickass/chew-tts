@@ -72,7 +72,8 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("failed to load tokenizer from {}: {e}", tokenizer_path.display()))?;
 
     let eos_token_id = tokenizer
-        .token_to_id("<end_of_turn>")  // Gemma 4
+        .token_to_id("<turn|>")  // Gemma 4 (end of turn = ID 106)
+        .or_else(|| tokenizer.token_to_id("<end_of_turn>"))  // Gemma 2/3
         .or_else(|| tokenizer.token_to_id("<|eot_id|>"))  // Llama
         .or_else(|| tokenizer.token_to_id("</s>"))
         .or_else(|| tokenizer.token_to_id("<|endoftext|>"))
@@ -168,17 +169,33 @@ struct Usage {
 /// Build a chat prompt based on model architecture.
 fn build_prompt(messages: &[ChatMessage], arch: &str) -> String {
     match arch {
-        "gemma4" | "gemma3" | "gemma2" => build_prompt_gemma(messages),
+        "gemma4" => build_prompt_gemma4(messages),
+        "gemma3" | "gemma2" => build_prompt_gemma_legacy(messages),
         _ => build_prompt_llama(messages),
     }
 }
 
-/// Build a Gemma-style chat prompt.
-fn build_prompt_gemma(messages: &[ChatMessage]) -> String {
+/// Build a Gemma 4 chat prompt.
+/// Uses <|turn> (ID 105) and <turn|> (ID 106) as special tokens.
+fn build_prompt_gemma4(messages: &[ChatMessage]) -> String {
     let mut prompt = String::new();
     for msg in messages {
         let role = match msg.role.as_str() {
-            "system" => "user", // Gemma doesn't have system role, treat as user
+            "system" => "user",
+            r => r,
+        };
+        prompt.push_str(&format!("<|turn>{}\n{}<turn|>\n", role, msg.content));
+    }
+    prompt.push_str("<|turn>model\n");
+    prompt
+}
+
+/// Build a Gemma 2/3 chat prompt (legacy <start_of_turn> format).
+fn build_prompt_gemma_legacy(messages: &[ChatMessage]) -> String {
+    let mut prompt = String::new();
+    for msg in messages {
+        let role = match msg.role.as_str() {
+            "system" => "user",
             r => r,
         };
         prompt.push_str(&format!("<start_of_turn>{}\n{}<end_of_turn>\n", role, msg.content));
