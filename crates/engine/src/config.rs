@@ -53,7 +53,9 @@ impl ModelConfig {
         let is_gemma4 = arch == "gemma4";
         let sliding_window = header.get_u32(&format!("{arch}.attention.sliding_window")).ok();
         let n_kv_shared_layers = header.get_u32(&format!("{arch}.attention.shared_kv_layers")).unwrap_or(0);
-        let attention_scale = if is_gemma4 { 1.0 } else { 1.0 / (head_dim as f32).sqrt() };
+        // Gemma 4 still uses 1/sqrt(head_dim) scaling (HF: self.scaling = head_dim**-0.5)
+        // The llama.cpp "f_attention_scale = 1.0" refers to a different scaling factor
+        let attention_scale = 1.0 / (head_dim as f32).sqrt();
         let logit_softcap = header.get_f32(&format!("{arch}.final_logit_softcapping")).ok();
         let rope_theta_swa = header.get_f32(&format!("{arch}.rope.freq_base_swa")).ok();
         let embd_per_layer = header.get_u32(&format!("{arch}.embedding_length_per_layer_input")).ok();

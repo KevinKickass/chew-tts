@@ -358,11 +358,28 @@ pub fn forward_gemma4(
         let has_kv = config.has_kv(layer_idx);
         let rope_theta = config.layer_rope_theta(layer_idx);
 
+        // Debug helper: check f16 buffer for NaN
+        let dbg_layer = layer_idx <= 1 && seq_len > 1;
+        macro_rules! check_nan {
+            ($buf:expr, $n:expr, $label:expr) => {
+                if dbg_layer {
+                    let cnt = ($n as usize).min($buf.len()).min(256);
+                    let mut d = vec![half::f16::ZERO; cnt];
+                    let _ = stream_ref.memcpy_dtoh(&$buf.slice(0..cnt), &mut d);
+                    let nan = d.iter().any(|x| x.to_f32().is_nan());
+                    let mx = d.iter().map(|x| x.to_f32().abs()).filter(|x| x.is_finite()).fold(0f32, f32::max);
+                    if nan { tracing::error!(layer=layer_idx, mx, "NaN in {}", $label); }
+                    else { tracing::info!(layer=layer_idx, mx, "OK {}", $label); }
+                }
+            };
+        }
+
         // 1. Attention norm: f32 hidden → f16 norm_out
         kernels.ops.rms_norm_f32in(
             hidden, &layer.attn_norm, &mut scratch.norm_out,
             seq_len, config.dim, config.rms_norm_eps,
         )?;
+        check_nan!(scratch.norm_out, seq_len * config.dim, "after_attn_norm");
 
         // 2. QKV projections
         let q_dim = config.n_heads * hd;
@@ -375,10 +392,13 @@ pub fn forward_gemma4(
 
         gemm_q(kernels, &scratch.norm_out, &layer.attn_q, &mut scratch.q,
             seq_len, q_dim, config.dim)?;
+        check_nan!(scratch.q, seq_len * q_dim, "after_Q_proj");
         gemm_q(kernels, &scratch.norm_out, &layer.attn_k, &mut scratch.k,
             seq_len, kv_dim, config.dim)?;
+        check_nan!(scratch.k, seq_len * kv_dim, "after_K_proj");
         gemm_q(kernels, &scratch.norm_out, &layer.attn_v, &mut scratch.v,
             seq_len, kv_dim, config.dim)?;
+        check_nan!(scratch.v, seq_len * kv_dim, "after_V_proj");
 
         // 3. QK norms (RMSNorm with learned weights)
         // The rms_norm kernel requires different src and dst pointers.
@@ -419,9 +439,15 @@ pub fn forward_gemma4(
             }
         }
 
+        check_nan!(scratch.q, seq_len * q_dim, "after_QK_norm");
+        check_nan!(scratch.k, seq_len * kv_dim, "after_K_norm");
+        check_nan!(scratch.v, seq_len * kv_dim, "after_V_norm");
+
         // 4. RoPE NeoX on Q (and K if this layer owns KV)
         kernels.ops.rope_neox(&mut scratch.q, seq_len, config.n_heads, hd, pos, rope_theta)?;
         kernels.ops.rope_neox(&mut scratch.k, seq_len, config.n_kv_heads, hd, pos, rope_theta)?;
+        check_nan!(scratch.q, seq_len * q_dim, "after_RoPE_Q");
+        check_nan!(scratch.k, seq_len * kv_dim, "after_RoPE_K");
 
         // 5. Write K, V into KV cache (every layer gets its own cache)
         {
@@ -441,14 +467,16 @@ pub fn forward_gemma4(
             let k_full = kv_cache.k_full(layer_idx, total_kv_len);
             let v_full = kv_cache.v_full(layer_idx, total_kv_len);
 
-            // Gemma 4 uses attention_scale=1.0 (QK norms handle scaling)
+            // Scale = 1/sqrt(head_dim) per layer (head_dim varies in Gemma 4)
+            let attn_scale = 1.0f32 / (hd as f32).sqrt();
             kernels.ops.mha_fused_scaled(
                 &scratch.q, &k_full, &v_full, &mut scratch.attn_mha_out,
                 hd, config.n_heads, config.n_kv_heads,
                 seq_len, total_kv_len, pos,
-                config.attention_scale,
+                attn_scale,
             )?;
         }
+        check_nan!(scratch.attn_mha_out, seq_len * q_dim, "after_MHA");
 
         // 7. Output projection
         if seq_len == 1 {
@@ -456,6 +484,8 @@ pub fn forward_gemma4(
         }
         gemm_q(kernels, &scratch.attn_mha_out, &layer.attn_output, &mut scratch.attn_out,
             seq_len, config.dim, q_dim)?;
+
+        check_nan!(scratch.attn_out, seq_len * config.dim, "after_output_proj");
 
         // 8. Post-attention norm: attn_out = rmsnorm(attn_out) * weight
         if let Some(ref pan) = layer.post_attention_norm {
@@ -496,6 +526,8 @@ pub fn forward_gemma4(
         gemm_q(kernels, &scratch.ffn_silu_out, &layer.ffn_down, &mut scratch.ffn_out,
             seq_len, config.dim, config.ff_dim)?;
 
+        check_nan!(scratch.ffn_out, seq_len * config.dim, "after_ffn_down");
+
         // 13. Post-FFN norm
         if let Some(ref pfn) = layer.post_ffw_norm {
             kernels.ops.post_norm_add(
@@ -504,6 +536,15 @@ pub fn forward_gemma4(
             )?;
         } else {
             kernels.ops.add_inplace_f32_f16(hidden, &scratch.ffn_out, seq_len * config.dim)?;
+        }
+
+        // Check hidden state after post-FFN norm
+        if dbg_layer {
+            let mut d = vec![0.0f32; 8];
+            let _ = stream_ref.memcpy_dtoh(&hidden.slice(0..8), &mut d);
+            let nan = d.iter().any(|x| x.is_nan());
+            let mx = d.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+            tracing::info!(layer=layer_idx, nan, mx, "hidden after post-ffn-norm+scale");
         }
 
         // DEBUG: check for NaN after each layer
