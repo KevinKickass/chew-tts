@@ -202,24 +202,12 @@ pub fn forward(
         } else if seq_len > 1 {
             // Prefill path: no GEMV quantization needed
         }
-        // Fused QKV GEMV for decode (M=1, Q4_K only)
-        if seq_len == 1 && layer.attn_q.quant_type == chew_gguf::GgmlType::Q4_K
-            && layer.attn_k.quant_type == chew_gguf::GgmlType::Q4_K {
-            let nq = config.n_heads * config.head_dim;
-            let nk = config.n_kv_heads * config.head_dim;
-            timed!(t_gemm, kernels.gemv.gemv_qkv(
-                &layer.attn_q.data, &layer.attn_k.data, &layer.attn_v.data,
-                &mut scratch.q, &mut scratch.k, &mut scratch.v,
-                nq, nk, config.dim, layer.attn_q.quant_type,
-            ))?;
-        } else {
-            timed!(t_gemm, gemm_q(kernels, &scratch.norm_out, &layer.attn_q, &mut scratch.q,
-                seq_len, config.n_heads * config.head_dim, config.dim))?;
-            timed!(t_gemm, gemm_q(kernels, &scratch.norm_out, &layer.attn_k, &mut scratch.k,
-                seq_len, config.n_kv_heads * config.head_dim, config.dim))?;
-            timed!(t_gemm, gemm_q(kernels, &scratch.norm_out, &layer.attn_v, &mut scratch.v,
-                seq_len, config.n_kv_heads * config.head_dim, config.dim))?;
-        }
+        timed!(t_gemm, gemm_q(kernels, &scratch.norm_out, &layer.attn_q, &mut scratch.q,
+            seq_len, config.n_heads * config.head_dim, config.dim))?;
+        timed!(t_gemm, gemm_q(kernels, &scratch.norm_out, &layer.attn_k, &mut scratch.k,
+            seq_len, config.n_kv_heads * config.head_dim, config.dim))?;
+        timed!(t_gemm, gemm_q(kernels, &scratch.norm_out, &layer.attn_v, &mut scratch.v,
+            seq_len, config.n_kv_heads * config.head_dim, config.dim))?;
 
         // 3. RoPE on Q and K
         timed!(t_rope, {
