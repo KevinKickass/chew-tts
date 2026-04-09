@@ -958,6 +958,12 @@ pub fn forward_moe_streaming(
             }
             // attn_mha_out now holds cur_moe (weighted expert sum)
 
+            // Sync to catch any pending CUDA errors from expert loop
+            stream.synchronize().map_err(|e| {
+                tracing::error!(%e, "CUDA error after expert loop");
+                KernelError::Launch(e.to_string())
+            })?;
+
             // RMSNorm cur_moe (post_ffw_norm_2)
             {
                 let src_ptr = &scratch.attn_mha_out as *const CudaSlice<half::f16>;
