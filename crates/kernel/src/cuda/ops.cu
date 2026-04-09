@@ -1370,6 +1370,17 @@ __global__ void mul_f16(const __half* __restrict__ a,
     out[idx] = __float2half(__half2float(a[idx]) * __half2float(b[idx]));
 }
 
+// --- Broadcast multiply: out[i] = a[i] * b[i % stride] (f16) ---
+// Used for row-wise multiply with a vector: a is [rows, stride], b is [stride]
+__global__ void mul_f16_broadcast(const __half* __restrict__ a,
+                                   const __half* __restrict__ b,
+                                   __half* __restrict__ out,
+                                   int n, int stride) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    out[idx] = __float2half(__half2float(a[idx]) * __half2float(b[idx % stride]));
+}
+
 // --- Standalone GELU activation: out = GELU(x) (f16) ---
 // Does NOT multiply by up — just applies GELU to x.
 __global__ void gelu_act(const __half* __restrict__ x,

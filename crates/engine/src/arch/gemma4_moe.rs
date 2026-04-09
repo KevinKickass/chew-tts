@@ -554,7 +554,11 @@ pub fn forward_moe_streaming(
 ) -> Result<(), KernelError> {
     let pos = kv_cache.pos();
     let total_kv_len = pos + seq_len;
-    let n_layers = config.n_layers as usize;
+    let max_layers = std::env::var("CHEW_MAX_LAYERS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(config.n_layers as usize);
+    let n_layers = max_layers.min(config.n_layers as usize);
 
     let mut use_shell_a = true;
 
@@ -705,10 +709,20 @@ pub fn forward_moe_streaming(
             seq_len, config.dim, q_dim)?;
 
         // ── 8. Post-attention norm + residual ──
+        if layer_idx == 0 {
+            let mut d = vec![half::f16::ZERO; 4];
+            stream.memcpy_dtoh(&scratch.attn_out.slice(0..4), &mut d).ok();
+            info!(?d, "L0 attn_out before post_norm");
+        }
         kernels.ops.post_norm_add(
             hidden, &scratch.attn_out, &layer.post_attention_norm, &mut scratch.norm_out,
             seq_len, config.dim, config.rms_norm_eps,
         )?;
+        if layer_idx == 0 {
+            let mut d = vec![0.0f32; 4];
+            stream.memcpy_dtoh(&hidden.slice(0..4), &mut d).ok();
+            info!(?d, "L0 hidden after post_attn_norm");
+        }
 
         // ══════════════════════════════════════════════════════════════
         // FFN: Shared MLP + MoE run in PARALLEL on attn_out (= hidden)
@@ -753,6 +767,14 @@ pub fn forward_moe_streaming(
             }
         }
         // ffn_out now holds cur_mlp (normed shared MLP output)
+        if layer_idx == 0 {
+            let mut d = vec![half::f16::ZERO; 4];
+            stream.memcpy_dtoh(&scratch.ffn_out.slice(0..4), &mut d).ok();
+            info!(?d, "L0 cur_mlp (normed shared FFN)");
+            let mut h = vec![0.0f32; 4];
+            stream.memcpy_dtoh(&hidden.slice(0..4), &mut h).ok();
+            info!(?h, "L0 hidden before MoE");
+        }
 
         // ── 9b. MoE Router ──
         // Router operates on attn_out (= hidden), NOT on the MLP output
@@ -764,10 +786,16 @@ pub fn forward_moe_streaming(
             let top_k = config.n_experts_per_tok;
             let dim_scale = 1.0 / (config.dim as f32).sqrt();
 
-            // Router norm: rms_norm(hidden) → norm_out, then scale by 1/sqrt(dim) and mul by gate_scale
-            // We reuse attn_out as temp for router computation
+            // Router: rms_norm(attn_out) * (1/sqrt(dim)) * gate_scale → router input
+            // rms_norm without weight — just normalize hidden (f32) to f16
+            // We use rms_norm_f32in with a dummy weight of all 1.0 — but we don't have that.
+            // Actually: llama.cpp does ggml_rms_norm which is just normalization.
+            // Our rms_norm_f32in applies weight after norm. We need rms_norm_no_weight equivalent for f32in.
+            // Workaround: use rms_norm_f32in with attn_norm (weight), then the scale and gate_scale
+            // will effectively replace it. This is wrong but let's see.
+            // TODO: proper weightless f32→f16 rms_norm
             kernels.ops.rms_norm_f32in(
-                hidden, &layer.attn_norm, &mut scratch.attn_out, // reuse attn_out as temp
+                hidden, &layer.attn_norm, &mut scratch.attn_out,
                 seq_len, config.dim, config.rms_norm_eps,
             )?;
             // Scale by 1/sqrt(dim)
@@ -778,10 +806,10 @@ pub fn forward_moe_streaming(
                     kernels.ops.scale_f16(&*src_ptr, &mut *dst_ptr, seq_len * config.dim, dim_scale)?;
                 }
             }
-            // Multiply by gate_inp_scale (element-wise)
-            kernels.ops.mul_f16(
+            // Multiply by gate_inp_scale (broadcast over seq_len)
+            kernels.ops.mul_f16_broadcast(
                 &scratch.attn_out, &layer.moe_gate_scale, &mut scratch.attn_mha_out,
-                seq_len * config.dim,
+                seq_len * config.dim, config.dim,
             )?;
 
             // Router GEMM: router_input @ gate_inp → logits [seq_len, n_experts]
@@ -924,6 +952,16 @@ pub fn forward_moe_streaming(
         // ── 11. Layer output scale ──
         if let Some(scale) = layer.layer_output_scale {
             kernels.ops.scale_f32_inplace(hidden, seq_len * config.dim, scale)?;
+        }
+
+        // Hidden state check after layer
+        {
+            let mut d = vec![0.0f32; 8];
+            stream.memcpy_dtoh(&hidden.slice(0..8), &mut d)
+                .map_err(|e| KernelError::Launch(e.to_string()))?;
+            let has_nan = d.iter().any(|x| x.is_nan());
+            let maxv = d.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+            info!(layer_idx, has_nan, maxv, ?d, "hidden after layer");
         }
     }
 

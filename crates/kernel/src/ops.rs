@@ -46,6 +46,7 @@ pub struct OpsKernels {
     rope_neox_graph: CudaFunction,
     post_norm_add: CudaFunction,
     mul_f16: CudaFunction,
+    mul_f16_broadcast: CudaFunction,
     gelu_act: CudaFunction,
     gather_rows_quant: CudaFunction,
     pe_strided_mul: CudaFunction,
@@ -94,6 +95,7 @@ impl OpsKernels {
             rope_neox_graph: loader::get_fn(&module, "rope_neox_graph")?,
             post_norm_add: loader::get_fn(&module, "post_norm_add")?,
             mul_f16: loader::get_fn(&module, "mul_f16")?,
+            mul_f16_broadcast: loader::get_fn(&module, "mul_f16_broadcast")?,
             gelu_act: loader::get_fn(&module, "gelu_act")?,
             gather_rows_quant: loader::get_fn(&module, "gather_rows_quant")?,
             pe_strided_mul: loader::get_fn(&module, "pe_strided_mul")?,
@@ -1003,6 +1005,33 @@ impl OpsKernels {
             scalar_ptr(&n_i),
         ];
         unsafe { self.fast.fire(&self.mul_f16, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
+        Ok(())
+    }
+
+    /// Broadcast multiply: out[i] = a[i] * b[i % stride], all f16.
+    /// a is [rows, stride], b is [stride]. n = rows * stride.
+    pub fn mul_f16_broadcast(
+        &self,
+        a: &CudaSlice<half::f16>,
+        b: &CudaSlice<half::f16>,
+        out: &mut CudaSlice<half::f16>,
+        n: u32,
+        stride: u32,
+    ) -> Result<(), KernelError> {
+        let threads = 256u32;
+        let blocks = (n + threads - 1) / threads;
+        let cfg = LaunchConfig {
+            grid_dim: (blocks, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let n_i = n as i32;
+        let stride_i = stride as i32;
+        let mut args: [*mut c_void; 5] = [
+            slice_ptr(a), slice_ptr(b), slice_ptr_mut(out),
+            scalar_ptr(&n_i), scalar_ptr(&stride_i),
+        ];
+        unsafe { self.fast.fire(&self.mul_f16_broadcast, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
         Ok(())
     }
 

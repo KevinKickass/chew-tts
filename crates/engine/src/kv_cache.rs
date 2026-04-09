@@ -42,7 +42,7 @@ impl KvCache {
 
         for i in 0..n_kv_layers {
             let hd = config.layer_head_dim(i as usize);
-            let stride = config.n_kv_heads * hd;
+            let stride = config.layer_kv_heads(i as usize) * hd;
             let kv_size = (max_seq as usize) * (stride as usize);
 
             let k = stream.alloc_zeros::<half::f16>(kv_size)?;
