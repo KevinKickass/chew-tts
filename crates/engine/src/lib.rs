@@ -475,6 +475,15 @@ impl ChewEngine {
                     self.kernels.ops.scale_f32_inplace(&mut decode_hidden, self.config.dim, scale)?;
                 }
 
+                // Debug: check decode embedding
+                if _step == 1 {
+                    let mut tok_host = [0i32];
+                    self.stream.memcpy_dtoh(&tok_gpu, &mut tok_host).ok();
+                    let mut emb = vec![0.0f32; 4];
+                    self.stream.memcpy_dtoh(&decode_hidden.slice(0..4), &mut emb).ok();
+                    info!(?tok_host, ?emb, "decode embed check");
+                }
+
                 if use_graph {
                     if let Some(ref mut dg) = decode_graph {
                         let pos = self.kv_cache.pos();
@@ -558,6 +567,15 @@ impl ChewEngine {
                 if self.config.is_gemma4() {
                     let scale = (self.config.dim as f32).sqrt();
                     self.kernels.ops.scale_f32_inplace(&mut decode_hidden, self.config.dim, scale)?;
+                }
+
+                // Debug: check decode embedding (sampling path)
+                {
+                    let mut tok_host = [0i32];
+                    self.stream.memcpy_dtoh(&tok_gpu, &mut tok_host).ok();
+                    let mut emb = vec![0.0f32; 4];
+                    self.stream.memcpy_dtoh(&decode_hidden.slice(0..4), &mut emb).ok();
+                    info!(?tok_host, ?emb, "decode embed check (sampling)");
                 }
 
                 {

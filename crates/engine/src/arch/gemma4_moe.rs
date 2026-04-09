@@ -628,6 +628,23 @@ pub fn forward_moe_streaming(
                 .map_err(|e| KernelError::Launch(e.to_string()))?;
         }
 
+        // Debug: check inputs/outputs for decode
+        if layer_idx == 0 && seq_len == 1 {
+            let mut h = vec![0.0f32; 4];
+            stream.memcpy_dtoh(&hidden.slice(0..4), &mut h).ok();
+            info!(?h, "L0 decode hidden input");
+            let mut n = vec![half::f16::ZERO; 4];
+            stream.memcpy_dtoh(&scratch.norm_out.slice(0..4), &mut n).ok();
+            info!(?n, "L0 decode norm_out (after attn_norm)");
+        }
+        if layer_idx == 0 && seq_len == 1 {
+            let mut d = vec![half::f16::ZERO; 4];
+            stream.memcpy_dtoh(&scratch.v.slice(0..4), &mut d).ok();
+            info!(?d, "L0 decode V first 4");
+            stream.memcpy_dtoh(&scratch.q.slice(0..4), &mut d).ok();
+            info!(?d, "L0 decode Q first 4");
+        }
+
         // ── 3. QK norms ──
         {
             let src_ptr = &scratch.q as *const CudaSlice<half::f16>;
@@ -699,6 +716,12 @@ pub fn forward_moe_streaming(
                 seq_len, total_kv_len, pos,
                 config.attention_scale,
             )?;
+        }
+
+        if layer_idx == 0 && seq_len == 1 {
+            let mut d = vec![half::f16::ZERO; 4];
+            stream.memcpy_dtoh(&scratch.attn_mha_out.slice(0..4), &mut d).ok();
+            info!(?d, "L0 decode MHA out first 4");
         }
 
         // ── 7. Output projection ──
