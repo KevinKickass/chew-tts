@@ -531,9 +531,21 @@ impl MoeModelWeights {
 
 // ─── Forward pass ───────────────────────────────────────────────────────────
 
-use crate::forward::{ScratchBuffers, gemm_q};
+use crate::forward::ScratchBuffers;
 use crate::kv_cache::KvCache;
 use chew_kernel::{GpuKernels, KernelError};
+
+/// GEMM without GEMV path — always uses dequant+cuBLAS.
+/// Avoids CUDA_ERROR_MISALIGNED_ADDRESS that GEMV has with MoE weights.
+fn gemm_no_gemv(
+    kernels: &mut GpuKernels,
+    a: &CudaSlice<half::f16>,
+    w: &QuantWeight,
+    c: &mut CudaSlice<half::f16>,
+    m: u32, n: u32, k: u32,
+) -> Result<(), KernelError> {
+    kernels.gemm.matmul_dequant(a, &w.data, w.quant_type, w.n_elements, c, m, n, k, &kernels.dequant)
+}
 
 /// Run the MoE forward pass for all layers (streaming mode).
 ///
@@ -624,20 +636,18 @@ pub fn forward_moe_streaming(
         let q_dim = config.n_heads * hd;
         let kv_dim = kv_heads * hd;
 
-        if seq_len == 1 {
-            kernels.gemv.quantize_input(&scratch.norm_out, config.dim)?;
-        }
-
-        gemm_q(kernels, &scratch.norm_out, &layer.attn_q, &mut scratch.q,
+        // NOTE: skip quantize_input for MoE — GEMV has alignment issues with MoE weights
+        // All projections use dequant+cuBLAS fallback path instead of GEMV
+        gemm_no_gemv(kernels, &scratch.norm_out, &layer.attn_q, &mut scratch.q,
             seq_len, q_dim, config.dim)?;
         sync_check!("Q_proj");
-        gemm_q(kernels, &scratch.norm_out, &layer.attn_k, &mut scratch.k,
+        gemm_no_gemv(kernels, &scratch.norm_out, &layer.attn_k, &mut scratch.k,
             seq_len, kv_dim, config.dim)?;
         sync_check!("K_proj");
 
         // V = K for shared-KV layers (full attention), or separate V
         if let Some(ref attn_v) = layer.attn_v {
-            gemm_q(kernels, &scratch.norm_out, attn_v, &mut scratch.v,
+            gemm_no_gemv(kernels, &scratch.norm_out, attn_v, &mut scratch.v,
                 seq_len, kv_dim, config.dim)?;
         } else {
             // Shared KV: V = K — copy only kv_dim * seq_len elements
@@ -752,7 +762,7 @@ pub fn forward_moe_streaming(
         if seq_len == 1 {
             kernels.gemv.quantize_input(&scratch.attn_mha_out, q_dim)?;
         }
-        gemm_q(kernels, &scratch.attn_mha_out, &layer.attn_output, &mut scratch.attn_out,
+        gemm_no_gemv(kernels, &scratch.attn_mha_out, &layer.attn_output, &mut scratch.attn_out,
             seq_len, config.dim, q_dim)?;
 
         // ── 8. Post-attention norm + residual ──
@@ -785,9 +795,9 @@ pub fn forward_moe_streaming(
         if seq_len == 1 {
             kernels.gemv.quantize_input(&scratch.norm_out, config.dim)?;
         }
-        gemm_q(kernels, &scratch.norm_out, &layer.ffn_gate, &mut scratch.ffn_gate_out,
+        gemm_no_gemv(kernels, &scratch.norm_out, &layer.ffn_gate, &mut scratch.ffn_gate_out,
             seq_len, config.ff_dim, config.dim)?;
-        gemm_q(kernels, &scratch.norm_out, &layer.ffn_up, &mut scratch.ffn_up_out,
+        gemm_no_gemv(kernels, &scratch.norm_out, &layer.ffn_up, &mut scratch.ffn_up_out,
             seq_len, config.ff_dim, config.dim)?;
 
         kernels.ops.gelu(
@@ -799,7 +809,7 @@ pub fn forward_moe_streaming(
             kernels.gemv.quantize_input(&scratch.ffn_silu_out, config.ff_dim)?;
         }
         // cur_mlp → ffn_out
-        gemm_q(kernels, &scratch.ffn_silu_out, &layer.ffn_down, &mut scratch.ffn_out,
+        gemm_no_gemv(kernels, &scratch.ffn_silu_out, &layer.ffn_down, &mut scratch.ffn_out,
             seq_len, config.dim, config.ff_dim)?;
 
         // RMSNorm the shared MLP output (post_ffw_norm_1)
@@ -862,7 +872,7 @@ pub fn forward_moe_streaming(
                 kernels.gemv.quantize_input(&scratch.norm_out, config.dim)?;
             }
             // Reuse attn_out for logits (n_experts=128 < dim=2816, fits)
-            gemm_q(kernels, &scratch.norm_out, &layer.moe_gate, &mut scratch.attn_out,
+            gemm_no_gemv(kernels, &scratch.norm_out, &layer.moe_gate, &mut scratch.attn_out,
                 seq_len, n_experts, config.dim)?;
 
             // ── 9c. MoE FFN input (separate norm on attn_out) ──
@@ -1030,7 +1040,7 @@ pub fn forward_moe_streaming(
     if seq_len == 1 {
         kernels.gemv.quantize_input(&scratch.norm_out, config.dim)?;
     }
-    gemm_q(kernels, &scratch.norm_out, &moe_weights.output, &mut scratch.logits,
+    gemm_no_gemv(kernels, &scratch.norm_out, &moe_weights.output, &mut scratch.logits,
         seq_len, config.vocab_size, config.dim)?;
 
     // Sync after logit GEMM to catch errors
