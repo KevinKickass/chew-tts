@@ -91,9 +91,34 @@ impl ChewEngine {
         };
 
         let desired_ctx = max_context.unwrap_or(config.context_length.min(32768));
+
+        // Try normal loading first, then streaming fallback
+        let streaming_plan = if VramPlan::fit(&config, &gguf, desired_ctx, free_bytes).is_none() {
+            // Normal doesn't fit — try streaming
+            let sp = VramPlan::fit_streaming(&config, &gguf, desired_ctx, free_bytes);
+            if let Some(ref plan) = sp {
+                plan.print_report(free_bytes / (1024 * 1024));
+                info!(
+                    resident = plan.n_resident, streamed = plan.n_streamed,
+                    layer_mb = plan.per_layer_bytes / (1024*1024),
+                    "streaming mode: {} of {} layers in VRAM",
+                    plan.n_resident, plan.total_layers,
+                );
+            }
+            sp
+        } else {
+            None
+        };
+
         let plan = VramPlan::fit(&config, &gguf, desired_ctx, free_bytes)
+            .or_else(|| {
+                // In streaming mode, create a minimal plan for just the resident parts
+                streaming_plan.as_ref().map(|sp| {
+                    VramPlan::compute(&config, &gguf, sp.context_length, sp.context_length.min(512))
+                })
+            })
             .ok_or_else(|| EngineError::Load(LoadError::MissingTensor(
-                format!("not enough VRAM: need model + 256 ctx, have {} MB free",
+                format!("not enough VRAM even for streaming: need fixed overhead, have {} MB free",
                     free_bytes / (1024 * 1024))
             )))?;
 

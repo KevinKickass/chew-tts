@@ -1,6 +1,60 @@
 use crate::config::ModelConfig;
 use chew_gguf::GgufFile;
 
+/// Plan for streaming weights that don't fit in VRAM.
+#[derive(Debug, Clone)]
+pub struct StreamingPlan {
+    /// Layers permanently in VRAM
+    pub n_resident: u32,
+    /// Layers that must be streamed from RAM
+    pub n_streamed: u32,
+    /// Average bytes per layer (quantized weights only, no norms)
+    pub per_layer_bytes: u64,
+    /// Max bytes for any single layer (for DMA slot sizing)
+    pub max_layer_bytes: u64,
+    /// Fixed VRAM usage (embeddings, norms, KV, scratch, etc.)
+    pub fixed_bytes: u64,
+    /// DMA double-buffer size (2 × max_layer_bytes)
+    pub dma_slot_bytes: u64,
+    /// KV cache bytes
+    pub kv_cache_bytes: u64,
+    /// Context length for streaming mode
+    pub context_length: u32,
+    /// Total layers in model
+    pub total_layers: u32,
+}
+
+impl StreamingPlan {
+    pub fn print_report(&self, available_mb: u64) {
+        let res_mb = self.n_resident as u64 * self.per_layer_bytes / (1024*1024);
+        let stream_mb = self.n_streamed as u64 * self.per_layer_bytes / (1024*1024);
+        println!("╔══════════════════════════════════════════╗");
+        println!("║       STREAMING VRAM BUDGET               ║");
+        println!("╠══════════════════════════════════════════╣");
+        println!("║  Resident layers: {:>3}/{:>3} ({:>5} MB)      ║",
+            self.n_resident, self.total_layers, res_mb);
+        println!("║  Streamed layers: {:>3}     ({:>5} MB host)  ║",
+            self.n_streamed, stream_mb);
+        println!("║  DMA slots (2×):        {:>5} MB          ║",
+            self.dma_slot_bytes / (1024*1024));
+        println!("║  Fixed (KV+scratch+emb): {:>5} MB          ║",
+            self.fixed_bytes / (1024*1024));
+        println!("║  KV cache ({}k ctx):    {:>5} MB          ║",
+            self.context_length / 1024, self.kv_cache_bytes / (1024*1024));
+        println!("╠══════════════════════════════════════════╣");
+        println!("║  GPU free:              {:>5} MB          ║", available_mb);
+        if self.n_streamed == 0 {
+            println!("║  >>> ALL LAYERS FIT — FULL SPEED <<<     ║");
+        } else {
+            let est_tps = if self.n_streamed <= 4 { "~40-50" }
+                else if self.n_streamed <= 16 { "~15-25" }
+                else { "~5-10" };
+            println!("║  >>> STREAMING MODE — est. {} tok/s <<<  ║", est_tps);
+        }
+        println!("╚══════════════════════════════════════════╝");
+    }
+}
+
 /// Exact VRAM budget — computed from model config before any allocation.
 ///
 /// Mirrors the allocation logic in `weights.rs` exactly:
@@ -168,7 +222,7 @@ impl VramPlan {
     ///
     /// Uses **peak_bytes** (not total_bytes) because loading temporarily needs more.
     /// Tries the requested context_length first, then halves it until it fits.
-    /// Returns None if even context_length=256 doesn't fit.
+    /// Returns None if even context_length=256 doesn't fit (caller should try streaming).
     pub fn fit(
         config: &ModelConfig,
         gguf: &GgufFile,
@@ -176,7 +230,6 @@ impl VramPlan {
         available_bytes: u64,
     ) -> Option<Self> {
         let mut ctx = desired_context;
-        // 256 MB headroom for CUDA driver, display, misc
         let headroom = 256 * 1024 * 1024;
 
         while ctx >= 256 {
@@ -190,6 +243,121 @@ impl VramPlan {
         }
 
         None
+    }
+
+    /// Try streaming mode when normal loading doesn't fit.
+    pub fn fit_streaming(
+        config: &ModelConfig,
+        gguf: &GgufFile,
+        desired_context: u32,
+        available_bytes: u64,
+    ) -> Option<StreamingPlan> {
+        // Try with desired context, then halve
+        let mut ctx = desired_context.min(8192); // cap streaming context
+        while ctx >= 256 {
+            if let Some(plan) = Self::compute_streaming(config, gguf, ctx, available_bytes) {
+                return Some(plan);
+            }
+            ctx /= 2;
+        }
+        None
+    }
+
+    /// Compute a streaming plan: how many layers fit in VRAM permanently?
+    /// Returns (n_resident_layers, per_layer_bytes, streaming_plan) or None if even
+    /// the fixed overhead doesn't fit.
+    pub fn compute_streaming(
+        config: &ModelConfig,
+        gguf: &GgufFile,
+        desired_context: u32,
+        available_bytes: u64,
+    ) -> Option<StreamingPlan> {
+        let headroom: u64 = 256 * 1024 * 1024;
+
+        // Calculate per-layer weight size from GGUF
+        let mut per_layer_bytes: u64 = 0;
+        let mut max_layer_bytes: u64 = 0;
+        for layer in 0..config.n_layers {
+            let pfx = format!("blk.{layer}");
+            let mut layer_total: u64 = 0;
+            for t in &gguf.tensors {
+                if t.name.starts_with(&pfx) && !t.name.contains("norm") {
+                    layer_total += t.data_size();
+                }
+            }
+            if layer_total > max_layer_bytes {
+                max_layer_bytes = layer_total;
+            }
+            per_layer_bytes += layer_total;
+        }
+        let avg_layer_bytes = per_layer_bytes / config.n_layers as u64;
+
+        // Fixed VRAM: embeddings + output + norms + KV cache + scratch
+        let mut fixed_bytes: u64 = 0;
+
+        // Token embeddings (f16 for embed_tokens)
+        if let Some(t) = gguf.find_tensor("token_embd.weight") {
+            fixed_bytes += t.n_elements() * 2; // f16
+        }
+        // Output projection (quantized)
+        if let Some(t) = gguf.find_tensor("output.weight") {
+            fixed_bytes += t.data_size();
+        } else if let Some(t) = gguf.find_tensor("token_embd.weight") {
+            fixed_bytes += t.data_size(); // tied embeddings
+        }
+        // All norms (tiny, f16)
+        for t in &gguf.tensors {
+            if t.name.contains("norm") {
+                fixed_bytes += t.n_elements() * 2;
+            }
+        }
+
+        // KV cache
+        let ctx = desired_context.min(4096); // streaming mode: cap context
+        let kv_bytes: u64 = (0..config.n_layers as usize).map(|i| {
+            let hd = config.layer_head_dim(i) as u64;
+            2 * ctx as u64 * config.n_kv_heads as u64 * hd * 2
+        }).sum();
+        fixed_bytes += kv_bytes;
+
+        // Scratch + cuBLAS + dequant
+        let scratch_bytes = {
+            let s = 512u64; // max batch
+            let d = config.dim as u64;
+            let ff = config.ff_dim as u64;
+            let nh = config.n_heads as u64;
+            let nkv = config.n_kv_heads as u64;
+            let hd = config.max_head_dim as u64;
+            let v = config.vocab_size as u64;
+            (s*d + s*nh*hd + 2*s*nkv*hd + s*d + s*d + 3*s*ff + s*d + s*v) * 2 + s*d*4
+        };
+        fixed_bytes += scratch_bytes;
+        fixed_bytes += 32 * 1024 * 1024; // cuBLAS
+        fixed_bytes += 128 * 1024 * 1024; // dequant scratch
+
+        // 2 DMA slots
+        let dma_slot_bytes = 2 * max_layer_bytes;
+
+        let total_fixed = fixed_bytes + dma_slot_bytes + headroom;
+        if total_fixed >= available_bytes {
+            return None; // doesn't even fit the fixed parts
+        }
+
+        let available_for_layers = available_bytes - total_fixed;
+        let n_resident = (available_for_layers / avg_layer_bytes).min(config.n_layers as u64) as u32;
+        let n_streamed = config.n_layers - n_resident;
+
+        Some(StreamingPlan {
+            n_resident,
+            n_streamed,
+            per_layer_bytes: avg_layer_bytes,
+            max_layer_bytes,
+            fixed_bytes,
+            dma_slot_bytes,
+            kv_cache_bytes: kv_bytes,
+            context_length: ctx,
+            total_layers: config.n_layers,
+        })
     }
 
     pub fn weights_mb(&self) -> u64 { self.weights_bytes / (1024 * 1024) }
