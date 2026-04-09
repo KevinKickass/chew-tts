@@ -871,11 +871,12 @@ pub fn forward_moe_streaming(
 
                     // norm_out @ expert_gate_up → [1, expert_ff*2]
                     let fused_dim = expert_ff * 2;
-                    if seq_len == 1 {
-                        kernels.gemv.quantize_input(&scratch.norm_out, config.dim)?;
-                    }
-                    gemm_q(kernels, &scratch.norm_out, &moe_weights.expert_scratch, &mut scratch.ffn_gate_out,
-                        1, fused_dim, config.dim)?;
+                    // Force dequant+cuBLAS path for expert GEMMs (GEMV can misalign on scratch)
+                    kernels.gemm.matmul_dequant(
+                        &scratch.norm_out, &moe_weights.expert_scratch.data,
+                        moe_weights.expert_scratch.quant_type, moe_weights.expert_scratch.n_elements,
+                        &mut scratch.ffn_gate_out, 1, fused_dim, config.dim, &kernels.dequant,
+                    )?;
 
                     // Split gate/up and GELU
                     let n = expert_ff as usize;
@@ -902,11 +903,11 @@ pub fn forward_moe_streaming(
                     moe_weights.expert_scratch.n_elements = dn_info.n_elements;
 
                     // expert_result @ down → [1, dim]
-                    if seq_len == 1 {
-                        kernels.gemv.quantize_input(&scratch.ffn_gate_out, expert_ff)?;
-                    }
-                    gemm_q(kernels, &scratch.ffn_gate_out, &moe_weights.expert_scratch, &mut scratch.attn_out,
-                        1, config.dim, expert_ff)?;
+                    kernels.gemm.matmul_dequant(
+                        &scratch.ffn_gate_out, &moe_weights.expert_scratch.data,
+                        moe_weights.expert_scratch.quant_type, moe_weights.expert_scratch.n_elements,
+                        &mut scratch.attn_out, 1, config.dim, expert_ff, &kernels.dequant,
+                    )?;
 
                     // Weighted accumulate into attn_mha_out (reuse as moe accumulator)
                     if first_expert {
