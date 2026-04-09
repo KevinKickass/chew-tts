@@ -177,8 +177,11 @@ dependencies = [
  "byteorder",
  "half",
  "memmap2",
+ "serde_json",
  "thiserror",
+ "tokenizers",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

@@ -6,9 +6,9 @@ use axum::{
     routing::{get, post},
 };
 use chew_engine::{ChewEngine, sample::SampleParams};
+use chew_gguf::GgufFile;
 use chew_vram::VramAllocator;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 use std::sync::Arc;
 use tokenizers::Tokenizer;
 use tokio::sync::Mutex;
@@ -36,7 +36,7 @@ async fn main() -> anyhow::Result<()> {
 
     let model_path = std::env::args()
         .nth(1)
-        .expect("usage: chew <model.gguf> [--tokenizer path/to/tokenizer.json] [--port 8080]");
+        .expect("usage: chew <model.gguf> [--port 8080] [--context N]");
 
     let args: Vec<String> = std::env::args().collect();
 
@@ -53,23 +53,13 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|i| args.get(i + 1))
         .and_then(|s| s.parse().ok());
 
-    // Look for tokenizer: --tokenizer flag, or tokenizer.json next to model
-    let tokenizer_path = args
-        .iter()
-        .position(|a| a == "--tokenizer")
-        .and_then(|i| args.get(i + 1))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            let model = PathBuf::from(&model_path);
-            model.parent().unwrap_or(".".as_ref()).join("tokenizer.json")
-        });
-
     info!("chew v0.1 — GPU inference engine");
-    info!(model = %model_path, port, tokenizer = %tokenizer_path.display(), "starting");
+    info!(model = %model_path, port, "starting");
 
-    // Load tokenizer
-    let tokenizer = Tokenizer::from_file(&tokenizer_path)
-        .map_err(|e| anyhow::anyhow!("failed to load tokenizer from {}: {e}", tokenizer_path.display()))?;
+    // Extract tokenizer from GGUF metadata
+    let gguf = GgufFile::open(&model_path)?;
+    let tokenizer = chew_gguf::extract_tokenizer(&gguf.header)
+        .ok_or_else(|| anyhow::anyhow!("GGUF has no tokenizer metadata (tokenizer.ggml.tokens missing)"))?;
 
     let eos_token_id = tokenizer
         .token_to_id("<turn|>")  // Gemma 4 (end of turn = ID 106)
