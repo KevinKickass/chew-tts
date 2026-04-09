@@ -1,6 +1,8 @@
 use crate::config::ModelConfig;
 use crate::kv_cache::KvCache;
-use crate::weights::{ModelWeights, QuantWeight};
+use crate::weights::{ModelWeights, QuantWeight, StreamingWeights, LayerWeights,
+    HostLayerLayout, StreamingLayerNorms, TensorSlot};
+use crate::WeightStorage;
 use chew_kernel::{GpuKernels, KernelError};
 use cudarc::driver::{CudaSlice, CudaStream};
 use cudarc::driver::sys;
@@ -833,6 +835,580 @@ pub fn forward_gemma4(
     }
 
     kv_cache.advance(seq_len);
+
+    Ok(())
+}
+
+// =============================================================
+// Streaming forward pass — layers partially on host RAM
+// =============================================================
+
+/// Upload a streamed layer's weight data from host buffer into a GPU shell.
+fn upload_layer_to_shell_direct(
+    host_data: &[u8],
+    layout: &HostLayerLayout,
+    shell: &mut LayerWeights,
+    stream: &Arc<CudaStream>,
+) -> Result<(), String> {
+    let base = layout.offset;
+
+    fn upload_slot(host_data: &[u8], base: usize, slot: &TensorSlot, qw: &mut crate::weights::QuantWeight, stream: &Arc<CudaStream>) -> Result<(), String> {
+        let src = &host_data[base + slot.off..base + slot.off + slot.size];
+        stream.memcpy_htod(src, &mut qw.data)
+            .map_err(|e| e.to_string())?;
+        qw.quant_type = slot.quant_type;
+        qw.n_elements = slot.n_elements;
+        Ok(())
+    }
+
+    upload_slot(host_data, base, &layout.attn_q, &mut shell.attn_q, stream)?;
+    upload_slot(host_data, base, &layout.attn_k, &mut shell.attn_k, stream)?;
+    upload_slot(host_data, base, &layout.attn_v, &mut shell.attn_v, stream)?;
+    upload_slot(host_data, base, &layout.attn_output, &mut shell.attn_output, stream)?;
+    upload_slot(host_data, base, &layout.ffn_gate, &mut shell.ffn_gate, stream)?;
+    upload_slot(host_data, base, &layout.ffn_up, &mut shell.ffn_up, stream)?;
+    upload_slot(host_data, base, &layout.ffn_down, &mut shell.ffn_down, stream)?;
+
+    if let Some(ref slot) = layout.inp_gate {
+        if let Some(ref mut qw) = shell.inp_gate {
+            upload_slot(host_data, base, slot, qw, stream)?;
+        }
+    }
+    if let Some(ref slot) = layout.proj {
+        if let Some(ref mut qw) = shell.proj {
+            upload_slot(host_data, base, slot, qw, stream)?;
+        }
+    }
+    shell.layer_output_scale = layout.layer_output_scale;
+
+    Ok(())
+}
+
+/// Copy norm weights from always-resident norms into a shell.
+fn copy_norms_to_shell_direct(
+    norms: &StreamingLayerNorms,
+    shell: &mut LayerWeights,
+    stream: &Arc<CudaStream>,
+) -> Result<(), String> {
+    stream.memcpy_dtod(&norms.attn_norm, &mut shell.attn_norm).map_err(|e| e.to_string())?;
+    stream.memcpy_dtod(&norms.ffn_norm, &mut shell.ffn_norm).map_err(|e| e.to_string())?;
+
+    if let (Some(src), Some(dst)) = (&norms.attn_q_norm, &mut shell.attn_q_norm) {
+        stream.memcpy_dtod(src, dst).map_err(|e| e.to_string())?;
+    }
+    if let (Some(src), Some(dst)) = (&norms.attn_k_norm, &mut shell.attn_k_norm) {
+        stream.memcpy_dtod(src, dst).map_err(|e| e.to_string())?;
+    }
+    if let (Some(src), Some(dst)) = (&norms.post_attention_norm, &mut shell.post_attention_norm) {
+        stream.memcpy_dtod(src, dst).map_err(|e| e.to_string())?;
+    }
+    if let (Some(src), Some(dst)) = (&norms.post_ffw_norm, &mut shell.post_ffw_norm) {
+        stream.memcpy_dtod(src, dst).map_err(|e| e.to_string())?;
+    }
+    if let (Some(src), Some(dst)) = (&norms.post_norm, &mut shell.post_norm) {
+        stream.memcpy_dtod(src, dst).map_err(|e| e.to_string())?;
+    }
+
+    Ok(())
+}
+
+/// Streaming forward pass: resident layers from GPU, streamed layers DMA'd on demand.
+///
+/// This function handles both Llama-style and Gemma4-style models by checking
+/// config flags. It processes layers one at a time, uploading streamed layer
+/// weights from host RAM into a double-buffered GPU shell before execution.
+pub fn forward_streaming(
+    hidden: &mut CudaSlice<f32>,
+    weights: &mut WeightStorage,
+    config: &ModelConfig,
+    kernels: &mut GpuKernels,
+    kv_cache: &mut KvCache,
+    scratch: &mut ScratchBuffers,
+    seq_len: u32,
+    pe: Option<&PerLayerEmbeddings>,
+    stream: &Arc<CudaStream>,
+) -> Result<(), KernelError> {
+    let sw = match weights {
+        WeightStorage::Streaming(s) => s,
+        WeightStorage::Normal(_) => panic!("forward_streaming called with Normal weights"),
+    };
+
+    let is_gemma4 = config.is_gemma4();
+    let pos = kv_cache.pos();
+    let total_kv_len = pos + seq_len;
+    let n_elems = seq_len * config.dim;
+
+    let max_layers = std::env::var("CHEW_MAX_LAYERS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(config.n_layers as usize);
+    let n_layers = max_layers.min(config.n_layers as usize);
+    let n_resident = sw.n_resident;
+
+    // For Llama-style: layer 0 separate RMSNorm
+    if !is_gemma4 && n_layers > 0 {
+        let norm = &sw.layer_norms[0].attn_norm;
+        if seq_len == 1 {
+            let x_q8 = kernels.gemv.x_q8_mut();
+            kernels.ops.rms_norm_f32in_q8(
+                hidden, norm, &mut scratch.norm_out,
+                x_q8, seq_len, config.dim, config.rms_norm_eps,
+            )?;
+        } else {
+            kernels.ops.rms_norm_f32in(
+                hidden, norm, &mut scratch.norm_out,
+                seq_len, config.dim, config.rms_norm_eps,
+            )?;
+        }
+    }
+
+    // Track which shell is "active" for double buffering
+    let mut use_shell_a = true;
+
+    for layer_idx in 0..n_layers {
+        // Get layer weights: either resident or streamed via shell
+        let layer: &LayerWeights = if layer_idx < n_resident {
+            &sw.resident_layers[layer_idx]
+        } else {
+            // Upload streamed layer into the active shell
+            let streamed_idx = layer_idx - n_resident;
+            let layout = &sw.host_layer_offsets[streamed_idx];
+            let norms = &sw.layer_norms[layer_idx];
+
+            {
+                let shell = if use_shell_a { &mut sw.shell_a } else { &mut sw.shell_b };
+
+                // DMA: host → GPU (synchronous for now, async double-buffer later)
+                upload_layer_to_shell_direct(
+                    &sw.host_layer_data, layout, shell, stream,
+                ).map_err(|e| KernelError::Launch(format!("streaming upload: {e}")))?;
+                copy_norms_to_shell_direct(norms, shell, stream)
+                    .map_err(|e| KernelError::Launch(format!("norm copy: {e}")))?;
+            }
+
+            // Ensure DMA is complete before compute
+            stream.synchronize()
+                .map_err(|e| KernelError::Launch(format!("stream sync: {e}")))?;
+
+            use_shell_a = !use_shell_a;
+
+            if use_shell_a { &sw.shell_b } else { &sw.shell_a }
+        };
+
+        // Get next layer's norm for fused operations (Llama path)
+        let next_attn_norm: Option<&CudaSlice<half::f16>> = if layer_idx + 1 < n_layers {
+            Some(&sw.layer_norms[layer_idx + 1].attn_norm)
+        } else {
+            None
+        };
+
+        if is_gemma4 {
+            forward_streaming_layer_gemma4(
+                hidden, layer, config, kernels, kv_cache, scratch,
+                seq_len, layer_idx, pos, total_kv_len, pe, sw,
+            )?;
+        } else {
+            forward_streaming_layer_llama(
+                hidden, layer, config, kernels, kv_cache, scratch,
+                seq_len, layer_idx, n_layers, next_attn_norm, n_elems,
+            )?;
+        }
+    }
+
+    // === Final norm + logits ===
+    kernels.ops.rms_norm_f32in(
+        hidden, &sw.output_norm, &mut scratch.norm_out,
+        seq_len, config.dim, config.rms_norm_eps,
+    )?;
+
+    if seq_len == 1 {
+        kernels.gemv.quantize_input(&scratch.norm_out, config.dim)?;
+    }
+    gemm_q(kernels, &scratch.norm_out, &sw.output, &mut scratch.logits,
+        seq_len, config.vocab_size, config.dim)?;
+
+    // Logit softcapping (Gemma4)
+    if let Some(cap) = config.logit_softcap {
+        let n_logits = seq_len * config.vocab_size;
+        kernels.ops.logit_softcap_inplace(&mut scratch.logits, n_logits, cap)?;
+    }
+
+    kv_cache.advance(seq_len);
+    Ok(())
+}
+
+/// Process a single Llama-style layer in the streaming forward pass.
+fn forward_streaming_layer_llama(
+    hidden: &mut CudaSlice<f32>,
+    layer: &LayerWeights,
+    config: &ModelConfig,
+    kernels: &mut GpuKernels,
+    kv_cache: &mut KvCache,
+    scratch: &mut ScratchBuffers,
+    seq_len: u32,
+    layer_idx: usize,
+    _n_layers: usize,
+    next_attn_norm: Option<&CudaSlice<half::f16>>,
+    n_elems: u32,
+) -> Result<(), KernelError> {
+    let pos = kv_cache.pos();
+    let total_kv_len = pos + seq_len;
+
+    // QKV projections (norm_out already computed by previous layer's fused op)
+    if seq_len == 1 && layer_idx > 0 {
+        // x_q8 already set from previous fused op
+    }
+    gemm_q(kernels, &scratch.norm_out, &layer.attn_q, &mut scratch.q,
+        seq_len, config.n_heads * config.head_dim, config.dim)?;
+    if seq_len == 1 && layer.attn_k.quant_type == layer.attn_v.quant_type {
+        let nk = config.n_kv_heads * config.head_dim;
+        let used = kernels.gemv.gemv_dual(
+            &layer.attn_k.data, &layer.attn_v.data,
+            &mut scratch.k, &mut scratch.v,
+            nk, config.dim, layer.attn_k.quant_type,
+        )?;
+        if !used {
+            gemm_q(kernels, &scratch.norm_out, &layer.attn_k, &mut scratch.k,
+                seq_len, config.n_kv_heads * config.head_dim, config.dim)?;
+            gemm_q(kernels, &scratch.norm_out, &layer.attn_v, &mut scratch.v,
+                seq_len, config.n_kv_heads * config.head_dim, config.dim)?;
+        }
+    } else {
+        gemm_q(kernels, &scratch.norm_out, &layer.attn_k, &mut scratch.k,
+            seq_len, config.n_kv_heads * config.head_dim, config.dim)?;
+        gemm_q(kernels, &scratch.norm_out, &layer.attn_v, &mut scratch.v,
+            seq_len, config.n_kv_heads * config.head_dim, config.dim)?;
+    }
+
+    // RoPE
+    kernels.ops.rope(&mut scratch.q, seq_len, config.n_heads, config.head_dim, pos, config.rope_theta)?;
+    kernels.ops.rope(&mut scratch.k, seq_len, config.n_kv_heads, config.head_dim, pos, config.rope_theta)?;
+
+    // Write KV cache
+    let kv_elems = seq_len * config.n_kv_heads * config.head_dim;
+    {
+        let mut k_cache = kv_cache.k_mut(layer_idx, seq_len);
+        kernels.ops.copy_f16(&scratch.k, &mut k_cache, kv_elems)?;
+    }
+    {
+        let mut v_cache = kv_cache.v_mut(layer_idx, seq_len);
+        kernels.ops.copy_f16(&scratch.v, &mut v_cache, kv_elems)?;
+    }
+
+    // MHA
+    {
+        let k_full = kv_cache.k_full(layer_idx, total_kv_len);
+        let v_full = kv_cache.v_full(layer_idx, total_kv_len);
+        kernels.ops.mha_fused(
+            &scratch.q, &k_full, &v_full, &mut scratch.attn_mha_out,
+            config.head_dim, config.n_heads, config.n_kv_heads,
+            seq_len, total_kv_len, pos,
+        )?;
+    }
+
+    // Output projection
+    if seq_len == 1 {
+        kernels.gemv.quantize_input(&scratch.attn_mha_out, config.n_heads * config.head_dim)?;
+    }
+    gemm_q(kernels, &scratch.attn_mha_out, &layer.attn_output, &mut scratch.attn_out,
+        seq_len, config.dim, config.n_heads * config.head_dim)?;
+
+    // Fused add + RMSNorm for FFN
+    if seq_len == 1 {
+        let x_q8 = kernels.gemv.x_q8_mut();
+        kernels.ops.fused_add_rmsnorm_q8(
+            hidden, &scratch.attn_out, &layer.ffn_norm, &mut scratch.norm_out,
+            x_q8, seq_len, config.dim, config.rms_norm_eps,
+        )?;
+    } else {
+        kernels.ops.fused_add_rmsnorm(
+            hidden, &scratch.attn_out, &layer.ffn_norm, &mut scratch.norm_out,
+            seq_len, config.dim, config.rms_norm_eps,
+        )?;
+    }
+
+    // FFN: gate + up
+    if seq_len == 1 && layer.ffn_gate.quant_type == layer.ffn_up.quant_type {
+        let used = kernels.gemv.gemv_dual(
+            &layer.ffn_gate.data, &layer.ffn_up.data,
+            &mut scratch.ffn_gate_out, &mut scratch.ffn_up_out,
+            config.ff_dim, config.dim, layer.ffn_gate.quant_type,
+        )?;
+        if !used {
+            gemm_q(kernels, &scratch.norm_out, &layer.ffn_gate, &mut scratch.ffn_gate_out,
+                seq_len, config.ff_dim, config.dim)?;
+            gemm_q(kernels, &scratch.norm_out, &layer.ffn_up, &mut scratch.ffn_up_out,
+                seq_len, config.ff_dim, config.dim)?;
+        }
+    } else {
+        gemm_q(kernels, &scratch.norm_out, &layer.ffn_gate, &mut scratch.ffn_gate_out,
+            seq_len, config.ff_dim, config.dim)?;
+        gemm_q(kernels, &scratch.norm_out, &layer.ffn_up, &mut scratch.ffn_up_out,
+            seq_len, config.ff_dim, config.dim)?;
+    }
+
+    // SiLU(gate) * up
+    kernels.ops.silu(
+        &scratch.ffn_gate_out, &scratch.ffn_up_out, &mut scratch.ffn_silu_out,
+        seq_len * config.ff_dim,
+    )?;
+
+    // Down projection
+    if seq_len == 1 {
+        kernels.gemv.quantize_input(&scratch.ffn_silu_out, config.ff_dim)?;
+    }
+    gemm_q(kernels, &scratch.ffn_silu_out, &layer.ffn_down, &mut scratch.ffn_out,
+        seq_len, config.dim, config.ff_dim)?;
+
+    // Residual + next layer's attn_norm
+    if let Some(next_norm) = next_attn_norm {
+        if seq_len == 1 {
+            let x_q8 = kernels.gemv.x_q8_mut();
+            kernels.ops.fused_add_rmsnorm_q8(
+                hidden, &scratch.ffn_out, next_norm, &mut scratch.norm_out,
+                x_q8, seq_len, config.dim, config.rms_norm_eps,
+            )?;
+        } else {
+            kernels.ops.fused_add_rmsnorm(
+                hidden, &scratch.ffn_out, next_norm, &mut scratch.norm_out,
+                seq_len, config.dim, config.rms_norm_eps,
+            )?;
+        }
+    } else {
+        // Last layer
+        kernels.ops.add_inplace_f32_f16(hidden, &scratch.ffn_out, n_elems)?;
+    }
+
+    Ok(())
+}
+
+/// Process a single Gemma4-style layer in the streaming forward pass.
+fn forward_streaming_layer_gemma4(
+    hidden: &mut CudaSlice<f32>,
+    layer: &LayerWeights,
+    config: &ModelConfig,
+    kernels: &mut GpuKernels,
+    kv_cache: &mut KvCache,
+    scratch: &mut ScratchBuffers,
+    seq_len: u32,
+    layer_idx: usize,
+    pos: u32,
+    total_kv_len: u32,
+    pe: Option<&PerLayerEmbeddings>,
+    sw: &StreamingWeights,
+) -> Result<(), KernelError> {
+    let hd = config.layer_head_dim(layer_idx);
+    let has_kv = config.has_kv(layer_idx);
+    let rope_theta = config.layer_rope_theta(layer_idx);
+
+    // 1. Attention norm
+    kernels.ops.rms_norm_f32in(
+        hidden, &layer.attn_norm, &mut scratch.norm_out,
+        seq_len, config.dim, config.rms_norm_eps,
+    )?;
+
+    // 2. QKV projections
+    let q_dim = config.n_heads * hd;
+    let kv_dim = config.n_kv_heads * hd;
+
+    if seq_len == 1 {
+        kernels.gemv.quantize_input(&scratch.norm_out, config.dim)?;
+    }
+
+    gemm_q(kernels, &scratch.norm_out, &layer.attn_q, &mut scratch.q,
+        seq_len, q_dim, config.dim)?;
+    gemm_q(kernels, &scratch.norm_out, &layer.attn_k, &mut scratch.k,
+        seq_len, kv_dim, config.dim)?;
+    gemm_q(kernels, &scratch.norm_out, &layer.attn_v, &mut scratch.v,
+        seq_len, kv_dim, config.dim)?;
+
+    // 3. QK norms
+    if let Some(ref q_norm) = layer.attn_q_norm {
+        let src_ptr = &scratch.q as *const CudaSlice<half::f16>;
+        let dst_ptr = &mut scratch.q as *mut CudaSlice<half::f16>;
+        unsafe {
+            kernels.ops.rms_norm(
+                &*src_ptr, q_norm, &mut *dst_ptr,
+                seq_len * config.n_heads, hd, config.rms_norm_eps,
+            )?;
+        }
+    }
+    if let Some(ref k_norm) = layer.attn_k_norm {
+        let src_ptr = &scratch.k as *const CudaSlice<half::f16>;
+        let dst_ptr = &mut scratch.k as *mut CudaSlice<half::f16>;
+        unsafe {
+            kernels.ops.rms_norm(
+                &*src_ptr, k_norm, &mut *dst_ptr,
+                seq_len * config.n_kv_heads, hd, config.rms_norm_eps,
+            )?;
+        }
+    }
+
+    // V norm (no weight)
+    {
+        let src_ptr = &scratch.v as *const CudaSlice<half::f16>;
+        let dst_ptr = &mut scratch.v as *mut CudaSlice<half::f16>;
+        unsafe {
+            kernels.ops.rms_norm_no_weight(
+                &*src_ptr, &mut *dst_ptr,
+                seq_len * config.n_kv_heads, hd, config.rms_norm_eps,
+            )?;
+        }
+    }
+
+    // 4. RoPE NeoX
+    let is_swa = config.is_swa(layer_idx);
+    if !is_swa {
+        if let Some(ref ff) = sw.rope_freq_factors {
+            kernels.ops.rope_neox_freqs(&mut scratch.q, ff, seq_len, config.n_heads, hd, pos, rope_theta)?;
+            kernels.ops.rope_neox_freqs(&mut scratch.k, ff, seq_len, config.n_kv_heads, hd, pos, rope_theta)?;
+        } else {
+            kernels.ops.rope_neox(&mut scratch.q, seq_len, config.n_heads, hd, pos, rope_theta)?;
+            kernels.ops.rope_neox(&mut scratch.k, seq_len, config.n_kv_heads, hd, pos, rope_theta)?;
+        }
+    } else {
+        kernels.ops.rope_neox(&mut scratch.q, seq_len, config.n_heads, hd, pos, rope_theta)?;
+        kernels.ops.rope_neox(&mut scratch.k, seq_len, config.n_kv_heads, hd, pos, rope_theta)?;
+    }
+
+    // 5. Write KV cache
+    let kv_source = config.kv_source_layer(layer_idx);
+    if has_kv {
+        let kv_elems = seq_len * kv_dim;
+        {
+            let mut k_cache = kv_cache.k_mut(layer_idx, seq_len);
+            kernels.ops.copy_f16(&scratch.k, &mut k_cache, kv_elems)?;
+        }
+        {
+            let mut v_cache = kv_cache.v_mut(layer_idx, seq_len);
+            kernels.ops.copy_f16(&scratch.v, &mut v_cache, kv_elems)?;
+        }
+    }
+
+    // 6. MHA
+    {
+        let k_full = kv_cache.k_full(kv_source, total_kv_len);
+        let v_full = kv_cache.v_full(kv_source, total_kv_len);
+        kernels.ops.mha_fused_scaled(
+            &scratch.q, &k_full, &v_full, &mut scratch.attn_mha_out,
+            hd, config.n_heads, config.n_kv_heads,
+            seq_len, total_kv_len, pos,
+            config.attention_scale,
+        )?;
+    }
+
+    // 7. Output projection
+    if seq_len == 1 {
+        kernels.gemv.quantize_input(&scratch.attn_mha_out, q_dim)?;
+    }
+    gemm_q(kernels, &scratch.attn_mha_out, &layer.attn_output, &mut scratch.attn_out,
+        seq_len, config.dim, q_dim)?;
+
+    // 8. Post-attention norm + residual
+    if let Some(ref pan) = layer.post_attention_norm {
+        kernels.ops.post_norm_add(
+            hidden, &scratch.attn_out, pan, &mut scratch.norm_out,
+            seq_len, config.dim, config.rms_norm_eps,
+        )?;
+    } else {
+        kernels.ops.add_inplace_f32_f16(hidden, &scratch.attn_out, seq_len * config.dim)?;
+    }
+
+    // 9. FFN norm
+    kernels.ops.rms_norm_f32in(
+        hidden, &layer.ffn_norm, &mut scratch.norm_out,
+        seq_len, config.dim, config.rms_norm_eps,
+    )?;
+
+    // 10. Gate + Up
+    if seq_len == 1 {
+        kernels.gemv.quantize_input(&scratch.norm_out, config.dim)?;
+    }
+    gemm_q(kernels, &scratch.norm_out, &layer.ffn_gate, &mut scratch.ffn_gate_out,
+        seq_len, config.ff_dim, config.dim)?;
+    gemm_q(kernels, &scratch.norm_out, &layer.ffn_up, &mut scratch.ffn_up_out,
+        seq_len, config.ff_dim, config.dim)?;
+
+    // 11. GELU(gate) * up
+    kernels.ops.gelu(
+        &scratch.ffn_gate_out, &scratch.ffn_up_out, &mut scratch.ffn_silu_out,
+        seq_len * config.ff_dim,
+    )?;
+
+    // 12. Down projection
+    if seq_len == 1 {
+        kernels.gemv.quantize_input(&scratch.ffn_silu_out, config.ff_dim)?;
+    }
+    gemm_q(kernels, &scratch.ffn_silu_out, &layer.ffn_down, &mut scratch.ffn_out,
+        seq_len, config.dim, config.ff_dim)?;
+
+    // 13. Post-FFN norm + residual
+    if let Some(ref pfn) = layer.post_ffw_norm {
+        kernels.ops.post_norm_add(
+            hidden, &scratch.ffn_out, pfn, &mut scratch.norm_out,
+            seq_len, config.dim, config.rms_norm_eps,
+        )?;
+    } else {
+        kernels.ops.add_inplace_f32_f16(hidden, &scratch.ffn_out, seq_len * config.dim)?;
+    }
+
+    // 14. Per-layer embedding (Gemma 4)
+    if let (Some(inp_gate), Some(proj), Some(post_norm), Some(pe_data), Some(epl)) = (
+        &layer.inp_gate, &layer.proj, &layer.post_norm, pe, config.embd_per_layer,
+    ) {
+        let pe_gate = scratch.pe_gate_out.as_mut().expect("pe_gate_out not allocated");
+        let pe_proj = scratch.pe_proj_out.as_mut().expect("pe_proj_out not allocated");
+
+        let n_elems_pe = (seq_len * config.dim) as usize;
+        {
+            let mut norm_view = scratch.norm_out.slice_mut(0..n_elems_pe);
+            kernels.ops.copy_f32_to_f16(hidden, &mut norm_view, seq_len * config.dim)?;
+        }
+
+        if seq_len == 1 {
+            kernels.gemv.quantize_input(&scratch.norm_out, config.dim)?;
+        }
+        gemm_q(kernels, &scratch.norm_out, inp_gate, pe_gate,
+            seq_len, epl, config.dim)?;
+
+        {
+            let src_ptr = pe_gate as *const CudaSlice<half::f16>;
+            let dst_ptr = pe_gate as *mut CudaSlice<half::f16>;
+            unsafe {
+                kernels.ops.gelu_act(&*src_ptr, &mut *dst_ptr, seq_len * epl)?;
+            }
+        }
+
+        {
+            let src_ptr = pe_gate as *const CudaSlice<half::f16>;
+            let dst_ptr = pe_gate as *mut CudaSlice<half::f16>;
+            let layer_off = (layer_idx as u32) * epl;
+            unsafe {
+                kernels.ops.pe_strided_mul(
+                    &*src_ptr, &pe_data.data, &mut *dst_ptr,
+                    epl, pe_data.row_width, layer_off, seq_len,
+                )?;
+            }
+        }
+
+        if seq_len == 1 {
+            kernels.gemv.quantize_input(pe_gate, epl)?;
+        }
+        gemm_q(kernels, pe_gate, proj, pe_proj,
+            seq_len, config.dim, epl)?;
+
+        kernels.ops.post_norm_add(
+            hidden, pe_proj, post_norm, &mut scratch.norm_out,
+            seq_len, config.dim, config.rms_norm_eps,
+        )?;
+    }
+
+    // 15. Layer output scale
+    if let Some(scale) = layer.layer_output_scale {
+        if (scale - 1.0).abs() > 1e-6 {
+            kernels.ops.scale_f32_inplace(hidden, seq_len * config.dim, scale)?;
+        }
+    }
 
     Ok(())
 }

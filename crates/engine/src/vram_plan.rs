@@ -274,30 +274,29 @@ impl VramPlan {
     ) -> Option<StreamingPlan> {
         let headroom: u64 = 256 * 1024 * 1024;
 
-        // Calculate per-layer weight size from GGUF
-        let mut per_layer_bytes: u64 = 0;
-        let mut max_layer_bytes: u64 = 0;
-        for layer in 0..config.n_layers {
-            let pfx = format!("blk.{layer}");
-            let mut layer_total: u64 = 0;
-            for t in &gguf.tensors {
-                if t.name.starts_with(&pfx) && !t.name.contains("norm") {
-                    layer_total += t.data_size();
-                }
-            }
-            if layer_total > max_layer_bytes {
-                max_layer_bytes = layer_total;
-            }
-            per_layer_bytes += layer_total;
-        }
-        let avg_layer_bytes = per_layer_bytes / config.n_layers as u64;
+        // Calculate per-layer weight size: total model bytes minus global tensors, divided by layers.
+        // This is more reliable than summing individual tensor data_size() which can have
+        // rounding/padding issues.
+        let total_model_bytes: u64 = gguf.tensors.iter().map(|t| t.data_size()).sum();
+        let global_tensor_bytes: u64 = gguf.tensors.iter()
+            .filter(|t| !t.name.starts_with("blk."))
+            .map(|t| t.data_size())
+            .sum();
+        let all_norm_bytes: u64 = gguf.tensors.iter()
+            .filter(|t| t.name.starts_with("blk.") && t.name.contains("norm"))
+            .map(|t| t.data_size())
+            .sum();
+        let layer_weight_total = total_model_bytes - global_tensor_bytes - all_norm_bytes;
+        let avg_layer_bytes = layer_weight_total / config.n_layers as u64;
+        let max_layer_bytes = avg_layer_bytes + avg_layer_bytes / 10; // 10% margin
 
         // Fixed VRAM: embeddings + output + norms + KV cache + scratch
         let mut fixed_bytes: u64 = 0;
 
-        // Token embeddings (f16 for embed_tokens)
+        // Token embeddings — keep as f16 for embed_tokens kernel
+        // TODO: could keep as quantized + gather_dequant to save ~900MB
         if let Some(t) = gguf.find_tensor("token_embd.weight") {
-            fixed_bytes += t.n_elements() * 2; // f16
+            fixed_bytes += t.n_elements() * 2; // f16 for now
         }
         // Output projection (quantized)
         if let Some(t) = gguf.find_tensor("output.weight") {
@@ -339,12 +338,29 @@ impl VramPlan {
         let dma_slot_bytes = 2 * max_layer_bytes;
 
         let total_fixed = fixed_bytes + dma_slot_bytes + headroom;
+        tracing::info!(
+            fixed_mb = fixed_bytes / (1024*1024),
+            dma_mb = dma_slot_bytes / (1024*1024),
+            headroom_mb = headroom / (1024*1024),
+            total_fixed_mb = total_fixed / (1024*1024),
+            available_mb = available_bytes / (1024*1024),
+            avg_layer_mb = avg_layer_bytes / (1024*1024),
+            max_layer_mb = max_layer_bytes / (1024*1024),
+            "streaming budget check"
+        );
         if total_fixed >= available_bytes {
-            return None; // doesn't even fit the fixed parts
+            return None;
         }
 
         let available_for_layers = available_bytes - total_fixed;
-        let n_resident = (available_for_layers / avg_layer_bytes).min(config.n_layers as u64) as u32;
+        // Reserve extra for 2 shell LayerWeights (allocated as f16 upper bounds, ~2× layer size)
+        let shell_overhead = 2 * avg_layer_bytes * 2; // f16 shells are ~2× quantized size
+        let safe_available = if available_for_layers > shell_overhead {
+            available_for_layers - shell_overhead
+        } else {
+            0
+        };
+        let n_resident = (safe_available / avg_layer_bytes).min(config.n_layers as u64) as u32;
         let n_streamed = config.n_layers - n_resident;
 
         Some(StreamingPlan {

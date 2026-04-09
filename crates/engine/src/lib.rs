@@ -9,7 +9,7 @@ use config::ModelConfig;
 use forward::ScratchBuffers;
 use kv_cache::KvCache;
 use vram_plan::VramPlan;
-use weights::{LoadError, ModelWeights};
+use weights::{LoadError, ModelWeights, StreamingWeights};
 
 use chew_gguf::GgufFile;
 use chew_kernel::GpuKernels;
@@ -19,13 +19,76 @@ use std::path::Path;
 use std::sync::Arc;
 use tracing::info;
 
+/// Weight storage mode: all-GPU or streaming from host RAM.
+pub enum WeightStorage {
+    /// All layers fit in VRAM — fastest path.
+    Normal(ModelWeights),
+    /// Some layers streamed from host RAM — double-buffered DMA.
+    Streaming(StreamingWeights),
+}
+
+impl WeightStorage {
+    pub fn token_embd(&self) -> &cudarc::driver::CudaSlice<half::f16> {
+        match self {
+            WeightStorage::Normal(w) => &w.token_embd,
+            WeightStorage::Streaming(w) => &w.token_embd,
+        }
+    }
+
+    pub fn output_norm(&self) -> &cudarc::driver::CudaSlice<half::f16> {
+        match self {
+            WeightStorage::Normal(w) => &w.output_norm,
+            WeightStorage::Streaming(w) => &w.output_norm,
+        }
+    }
+
+    pub fn output(&self) -> &weights::QuantWeight {
+        match self {
+            WeightStorage::Normal(w) => &w.output,
+            WeightStorage::Streaming(w) => &w.output,
+        }
+    }
+
+    pub fn per_layer_token_embd(&self) -> Option<&weights::QuantWeight> {
+        match self {
+            WeightStorage::Normal(w) => w.per_layer_token_embd.as_ref(),
+            WeightStorage::Streaming(w) => w.per_layer_token_embd.as_ref(),
+        }
+    }
+
+    pub fn per_layer_model_proj(&self) -> Option<&weights::QuantWeight> {
+        match self {
+            WeightStorage::Normal(w) => w.per_layer_model_proj.as_ref(),
+            WeightStorage::Streaming(w) => w.per_layer_model_proj.as_ref(),
+        }
+    }
+
+    pub fn per_layer_proj_norm(&self) -> Option<&cudarc::driver::CudaSlice<half::f16>> {
+        match self {
+            WeightStorage::Normal(w) => w.per_layer_proj_norm.as_ref(),
+            WeightStorage::Streaming(w) => w.per_layer_proj_norm.as_ref(),
+        }
+    }
+
+    pub fn rope_freq_factors(&self) -> Option<&cudarc::driver::CudaSlice<f32>> {
+        match self {
+            WeightStorage::Normal(w) => w.rope_freq_factors.as_ref(),
+            WeightStorage::Streaming(w) => w.rope_freq_factors.as_ref(),
+        }
+    }
+
+    pub fn is_streaming(&self) -> bool {
+        matches!(self, WeightStorage::Streaming(_))
+    }
+}
+
 /// The Chew inference engine.
 ///
 /// Owns the model weights, KV cache, GPU kernels, and scratch memory.
 /// Call `generate()` to produce tokens.
 pub struct ChewEngine {
     pub config: ModelConfig,
-    weights: ModelWeights,
+    weights: WeightStorage,
     kernels: GpuKernels,
     kv_cache: KvCache,
     scratch: ScratchBuffers,
@@ -92,8 +155,11 @@ impl ChewEngine {
 
         let desired_ctx = max_context.unwrap_or(config.context_length.min(32768));
 
-        // Try normal loading first, then streaming fallback
-        let streaming_plan = if VramPlan::fit(&config, &gguf, desired_ctx, free_bytes).is_none() {
+        // Try normal loading first (min 2k context), then streaming fallback
+        let min_useful_ctx = 2048u32;
+        let streaming_plan = if VramPlan::fit(&config, &gguf, desired_ctx, free_bytes)
+            .filter(|p| p.context_length >= min_useful_ctx)
+            .is_none() {
             // Normal doesn't fit — try streaming
             let sp = VramPlan::fit_streaming(&config, &gguf, desired_ctx, free_bytes);
             if let Some(ref plan) = sp {
@@ -171,9 +237,18 @@ impl ChewEngine {
         let max_k = config.ff_dim.max(config.dim) as usize;
         let kernels = GpuKernels::load(&stream, max_weight_elems, max_k)?;
 
-        // 4. Load + dequantize weights
-        let weights =
-            ModelWeights::load(&gguf, &config, alloc, &kernels.dequant, gpu_idx)?;
+        // 4. Load + dequantize weights (normal or streaming)
+        let weights = if let Some(ref sp) = streaming_plan {
+            info!("loading in STREAMING mode: {} resident, {} streamed",
+                sp.n_resident, sp.n_streamed);
+            WeightStorage::Streaming(
+                StreamingWeights::load(&gguf, &config, sp, alloc, &kernels.dequant, gpu_idx)?
+            )
+        } else {
+            WeightStorage::Normal(
+                ModelWeights::load(&gguf, &config, alloc, &kernels.dequant, gpu_idx)?
+            )
+        };
 
         // 5. Allocate KV cache
         let kv_cache = KvCache::alloc(&config, max_seq, &stream)?;
@@ -224,7 +299,7 @@ impl ChewEngine {
             .alloc_zeros::<f32>((prefill_len * self.config.dim) as usize)
             .map_err(EngineError::Driver)?;
         self.kernels.ops.embed_tokens_f32(
-            &self.weights.token_embd,
+            self.weights.token_embd(),
             &token_ids_gpu,
             &mut hidden,
             prefill_len,
@@ -254,28 +329,7 @@ impl ChewEngine {
         };
 
         // Forward pass on prefill
-        if self.config.is_gemma4() {
-            forward::forward_gemma4(
-                &mut hidden,
-                &self.weights,
-                &self.config,
-                &mut self.kernels,
-                &mut self.kv_cache,
-                &mut self.scratch,
-                prefill_len,
-                pe.as_ref(),
-            )?;
-        } else {
-            forward::forward(
-                &mut hidden,
-                &self.weights,
-                &self.config,
-                &mut self.kernels,
-                &mut self.kv_cache,
-                &mut self.scratch,
-                prefill_len,
-            )?;
-        }
+        self.run_forward(&mut hidden, pe.as_ref(), prefill_len)?;
 
         // Sample first token from logits of last position
         // Logits are f16 — download and convert to f32 for sampling
@@ -346,7 +400,11 @@ impl ChewEngine {
         // Works for both greedy and non-greedy: graph captures forward pass only,
         // sampling (argmax or CPU top-k) happens outside the graph.
         // Disable CUDA graph for Gemma 4 (different forward pass, variable head_dim)
-        let use_graph = std::env::var("CHEW_NO_GRAPH").is_err() && max_new_tokens > 20 && !self.config.is_gemma4();
+        // Disable CUDA graph for streaming mode (weight data changes between layers)
+        let use_graph = std::env::var("CHEW_NO_GRAPH").is_err()
+            && max_new_tokens > 20
+            && !self.config.is_gemma4()
+            && !self.weights.is_streaming();
         let mut decode_graph: Option<forward::DecodeGraph> = None;
 
         let greedy = params.temperature == 0.0;
@@ -375,7 +433,7 @@ impl ChewEngine {
                 // else: tok_gpu already has argmax from previous step
 
                 self.kernels.ops.embed_tokens_f32(
-                    &self.weights.token_embd, &tok_gpu, &mut decode_hidden, 1, self.config.dim,
+                    self.weights.token_embd(), &tok_gpu, &mut decode_hidden, 1, self.config.dim,
                 )?;
 
                 // Scale embeddings by sqrt(dim) for Gemma 4
@@ -391,24 +449,26 @@ impl ChewEngine {
                         self.kv_cache.advance(1);
                     } else {
                         let pos = self.kv_cache.pos();
-                        decode_graph = Some(forward::DecodeGraph::capture(
-                            &mut decode_hidden, &self.weights, &self.config,
-                            &mut self.kernels, &mut self.kv_cache, &mut self.scratch,
-                            pos, &self.stream,
-                        )?);
+                        match &self.weights {
+                            WeightStorage::Normal(w) => {
+                                decode_graph = Some(forward::DecodeGraph::capture(
+                                    &mut decode_hidden, w, &self.config,
+                                    &mut self.kernels, &mut self.kv_cache, &mut self.scratch,
+                                    pos, &self.stream,
+                                )?);
+                            }
+                            WeightStorage::Streaming(_) => {
+                                unreachable!("CUDA graph disabled for streaming mode");
+                            }
+                        }
                     }
-                } else if self.config.is_gemma4() {
-                    let decode_pe = self.compute_per_layer_embeddings(&tok_gpu, &decode_hidden, 1)?;
-                    forward::forward_gemma4(
-                        &mut decode_hidden, &self.weights, &self.config,
-                        &mut self.kernels, &mut self.kv_cache, &mut self.scratch, 1,
-                        decode_pe.as_ref(),
-                    )?;
                 } else {
-                    forward::forward(
-                        &mut decode_hidden, &self.weights, &self.config,
-                        &mut self.kernels, &mut self.kv_cache, &mut self.scratch, 1,
-                    )?;
+                    let decode_pe = if self.config.is_gemma4() {
+                        self.compute_per_layer_embeddings(&tok_gpu, &decode_hidden, 1)?
+                    } else {
+                        None
+                    };
+                    self.run_forward(&mut decode_hidden, decode_pe.as_ref(), 1)?;
                 }
 
                 // GPU argmax → tok_gpu (stays on GPU)
@@ -458,7 +518,7 @@ impl ChewEngine {
                     .map_err(EngineError::Driver)?;
 
                 self.kernels.ops.embed_tokens_f32(
-                    &self.weights.token_embd, &tok_gpu, &mut decode_hidden, 1, self.config.dim,
+                    self.weights.token_embd(), &tok_gpu, &mut decode_hidden, 1, self.config.dim,
                 )?;
 
                 // Scale embeddings by sqrt(dim) for Gemma 4
@@ -467,18 +527,13 @@ impl ChewEngine {
                     self.kernels.ops.scale_f32_inplace(&mut decode_hidden, self.config.dim, scale)?;
                 }
 
-                if self.config.is_gemma4() {
-                    let decode_pe = self.compute_per_layer_embeddings(&tok_gpu, &decode_hidden, 1)?;
-                    forward::forward_gemma4(
-                        &mut decode_hidden, &self.weights, &self.config,
-                        &mut self.kernels, &mut self.kv_cache, &mut self.scratch, 1,
-                        decode_pe.as_ref(),
-                    )?;
-                } else {
-                    forward::forward(
-                        &mut decode_hidden, &self.weights, &self.config,
-                        &mut self.kernels, &mut self.kv_cache, &mut self.scratch, 1,
-                    )?;
+                {
+                    let decode_pe = if self.config.is_gemma4() {
+                        self.compute_per_layer_embeddings(&tok_gpu, &decode_hidden, 1)?
+                    } else {
+                        None
+                    };
+                    self.run_forward(&mut decode_hidden, decode_pe.as_ref(), 1)?;
                 }
 
                 self.stream.memcpy_dtoh(
@@ -495,6 +550,42 @@ impl ChewEngine {
         }
 
         Ok(generated)
+    }
+
+    /// Run the forward pass, dispatching based on weight storage type.
+    fn run_forward(
+        &mut self,
+        hidden: &mut cudarc::driver::CudaSlice<f32>,
+        pe: Option<&forward::PerLayerEmbeddings>,
+        seq_len: u32,
+    ) -> Result<(), EngineError> {
+        match &self.weights {
+            WeightStorage::Normal(w) => {
+                if self.config.is_gemma4() {
+                    forward::forward_gemma4(
+                        hidden, w, &self.config,
+                        &mut self.kernels, &mut self.kv_cache, &mut self.scratch,
+                        seq_len, pe,
+                    )?;
+                } else {
+                    forward::forward(
+                        hidden, w, &self.config,
+                        &mut self.kernels, &mut self.kv_cache, &mut self.scratch,
+                        seq_len,
+                    )?;
+                }
+            }
+            WeightStorage::Streaming(_) => {
+                // For streaming, we need mutable access to upload weights to shells.
+                // Use the streaming forward function.
+                forward::forward_streaming(
+                    hidden, &mut self.weights, &self.config,
+                    &mut self.kernels, &mut self.kv_cache, &mut self.scratch,
+                    seq_len, pe, &self.stream,
+                )?;
+            }
+        }
+        Ok(())
     }
 
     /// Compute per-layer token embeddings for a set of token IDs.
@@ -516,7 +607,7 @@ impl ChewEngine {
             Some(e) => e,
             None => return Ok(None),
         };
-        let pe_weight = match &self.weights.per_layer_token_embd {
+        let pe_weight = match self.weights.per_layer_token_embd() {
             Some(w) => w,
             None => return Ok(None),
         };
@@ -584,8 +675,8 @@ impl ChewEngine {
         // Step 3: Project hidden state through per_layer_model_proj
         // per_layer_model_proj is [row_width, dim] quantized (BF16)
         // proj = hidden_f16 @ per_layer_model_proj^T → [n_tokens, row_width]
-        let has_proj = self.weights.per_layer_model_proj.is_some()
-            && self.weights.per_layer_proj_norm.is_some();
+        let has_proj = self.weights.per_layer_model_proj().is_some()
+            && self.weights.per_layer_proj_norm().is_some();
 
         if has_proj {
             // 3a: Convert hidden f32 → f16 for matmul
@@ -606,7 +697,7 @@ impl ChewEngine {
                 .alloc_zeros::<half::f16>(total_elements as usize)
                 .map_err(EngineError::Driver)?;
 
-            let proj_w = self.weights.per_layer_model_proj.as_ref().unwrap();
+            let proj_w = self.weights.per_layer_model_proj().unwrap();
             self.kernels.gemm.matmul_dequant(
                 &hidden_f16,
                 &proj_w.data,
@@ -639,7 +730,7 @@ impl ChewEngine {
                 .alloc_zeros::<half::f16>(total_elements as usize)
                 .map_err(EngineError::Driver)?;
 
-            let norm_weight = self.weights.per_layer_proj_norm.as_ref().unwrap();
+            let norm_weight = self.weights.per_layer_proj_norm().unwrap();
             self.kernels.ops.rms_norm(
                 &proj,
                 norm_weight,
