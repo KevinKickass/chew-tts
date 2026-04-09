@@ -1205,4 +1205,16 @@ impl OpsKernels {
 
         Ok(())
     }
+
+    // --- C dispatch accessors: expose CudaFunction handles for the C layer ---
+
+    pub fn rms_norm_f32in_q8_fn(&self) -> &CudaFunction { &self.rms_norm_f32in_q8 }
+    pub fn fused_add_rmsnorm_q8_fn(&self) -> &CudaFunction { &self.fused_add_rmsnorm_q8 }
+    pub fn rope_fn(&self) -> &CudaFunction { &self.rope }
+    pub fn copy_f16_fn(&self) -> &CudaFunction { &self.copy_f16 }
+    pub fn mha_fused_fn(&self) -> &CudaFunction { &self.mha_fused }
+    pub fn silu_fn(&self) -> &CudaFunction { &self.silu }
+    pub fn add_inplace_f32_f16_fn(&self) -> &CudaFunction { &self.add_inplace_f32_f16 }
+    pub fn rms_norm_f32in_fn(&self) -> &CudaFunction { &self.rms_norm_f32in }
+    pub fn argmax_f16_fn(&self) -> &CudaFunction { &self.argmax_f16 }
 }

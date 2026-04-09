@@ -50,6 +50,27 @@ impl GemvKernels {
         &mut self.x_q8
     }
 
+    /// Immutable reference to the pre-allocated Q8_1 input buffer.
+    /// Used by C dispatch layer to get the device pointer.
+    pub fn x_q8(&self) -> &CudaSlice<u8> {
+        &self.x_q8
+    }
+
+    /// Get CUfunction handle for quantize_x kernel.
+    pub fn quantize_x_fn(&self) -> &CudaFunction {
+        &self.quantize_x
+    }
+
+    /// Get CUfunction handle for Q4_K GEMV kernel.
+    pub fn q4_k_fn(&self) -> &CudaFunction {
+        &self.q4_k
+    }
+
+    /// Get CUfunction handle for dual Q4_K GEMV kernel.
+    pub fn dual_q4_k_fn(&self) -> &CudaFunction {
+        &self.dual_q4_k
+    }
+
     /// Quantize input vector x (f16) to Q8_1 format.
     /// Must be called once before any gemv calls with the same x.
     pub fn quantize_input(&mut self, x: &CudaSlice<half::f16>, k: u32) -> Result<(), KernelError> {
