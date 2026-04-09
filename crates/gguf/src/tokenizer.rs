@@ -58,10 +58,16 @@ pub fn extract_tokenizer(header: &GgufHeader) -> Option<Tokenizer> {
     );
 
     let json_str = serde_json::to_string(&tokenizer_json).ok()?;
-    let tokenizer = Tokenizer::from_bytes(json_str.as_bytes()).ok()?;
-
-    info!("tokenizer extracted from GGUF metadata");
-    Some(tokenizer)
+    match Tokenizer::from_bytes(json_str.as_bytes()) {
+        Ok(tokenizer) => {
+            info!("tokenizer extracted from GGUF metadata");
+            Some(tokenizer)
+        }
+        Err(e) => {
+            tracing::error!(%e, model_type, "failed to build tokenizer from GGUF metadata");
+            None
+        }
+    }
 }
 
 fn build_tokenizer_json(
@@ -159,7 +165,12 @@ fn build_tokenizer_json(
                 "trim_offsets": true,
                 "use_regex": true
             });
-            result["decoder"] = json!({"type": "ByteLevel"});
+            result["decoder"] = json!({
+                "type": "ByteLevel",
+                "add_prefix_space": false,
+                "trim_offsets": true,
+                "use_regex": true
+            });
         }
         "llama" | "gemma" | "gemma2" | "gemma3" | "gemma4" => {
             // SentencePiece-style: ▁ = space marker in vocab
