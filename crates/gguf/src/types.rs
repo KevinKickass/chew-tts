@@ -239,6 +239,10 @@ pub struct GgufHeader {
 }
 
 impl GgufHeader {
+    pub fn model_arch(&self) -> Option<&str> {
+        self.architecture()
+    }
+
     pub fn architecture(&self) -> Option<&str> {
         self.metadata
             .get("general.architecture")
@@ -249,6 +253,29 @@ impl GgufHeader {
         self.metadata
             .get("general.name")
             .and_then(|v| v.as_str())
+    }
+
+    pub fn chat_template(&self) -> Option<&str> {
+        self.metadata
+            .get("tokenizer.chat_template")
+            .and_then(|v| v.as_str())
+    }
+
+    pub fn token_id(&self, key: &str) -> Option<u32> {
+        self.metadata.get(key).and_then(|v| v.as_u32())
+    }
+
+    pub fn bos_token_id(&self) -> Option<u32> {
+        self.token_id("tokenizer.ggml.bos_token_id")
+    }
+
+    pub fn eos_token_id(&self) -> Option<u32> {
+        self.token_id("tokenizer.ggml.eos_token_id")
+    }
+
+    pub fn preferred_eos_token_id(&self) -> Option<u32> {
+        self.token_id("tokenizer.ggml.eot_token_id")
+            .or_else(|| self.token_id("tokenizer.ggml.eos_token_id"))
     }
 
     pub fn context_length(&self) -> Option<u32> {

@@ -30,15 +30,18 @@ pub struct OpsKernels {
     argmax_f16: CudaFunction,
     sample_top_k: CudaFunction,
     mha_fused: CudaFunction,
+    mha_naive: CudaFunction,
     // CUDA Graph-compatible variants
     rope_graph: CudaFunction,
     copy_f16_with_offset: CudaFunction,
     mha_fused_graph: CudaFunction,
     // Gemma 4 kernels
     gelu: CudaFunction,
+    gelu_split_batch: CudaFunction,
     rms_norm_no_weight: CudaFunction,
     rms_norm_f32in_no_weight: CudaFunction,
     scale_f16: CudaFunction,
+    weighted_sum_rows_f16: CudaFunction,
     scale_f32_inplace: CudaFunction,
     logit_softcap: CudaFunction,
     logit_softcap_inplace: CudaFunction,
@@ -81,14 +84,17 @@ impl OpsKernels {
             argmax_f16: loader::get_fn(&module, "argmax_f16")?,
             sample_top_k: loader::get_fn(&module, "sample_top_k")?,
             mha_fused: loader::get_fn(&module, "mha_fused")?,
+            mha_naive: loader::get_fn(&module, "mha_naive")?,
             rope_graph: loader::get_fn(&module, "rope_graph")?,
             copy_f16_with_offset: loader::get_fn(&module, "copy_f16_with_offset")?,
             mha_fused_graph: loader::get_fn(&module, "mha_fused_graph")?,
             // Gemma 4 kernels
             gelu: loader::get_fn(&module, "gelu")?,
+            gelu_split_batch: loader::get_fn(&module, "gelu_split_batch")?,
             rms_norm_no_weight: loader::get_fn(&module, "rms_norm_no_weight")?,
             rms_norm_f32in_no_weight: loader::get_fn(&module, "rms_norm_f32in_no_weight")?,
             scale_f16: loader::get_fn(&module, "scale_f16")?,
+            weighted_sum_rows_f16: loader::get_fn(&module, "weighted_sum_rows_f16")?,
             scale_f32_inplace: loader::get_fn(&module, "scale_f32_inplace")?,
             logit_softcap: loader::get_fn(&module, "logit_softcap")?,
             logit_softcap_inplace: loader::get_fn(&module, "logit_softcap_inplace")?,
@@ -785,6 +791,32 @@ impl OpsKernels {
         Ok(())
     }
 
+    /// Batched GELU split for fused [gate|up] expert outputs.
+    pub fn gelu_split_batch(
+        &self,
+        fused: &CudaSlice<half::f16>,
+        out: &mut CudaSlice<half::f16>,
+        expert_ff: u32,
+        batch: u32,
+    ) -> Result<(), KernelError> {
+        let total = expert_ff * batch;
+        let threads = 256u32;
+        let blocks = (total + threads - 1) / threads;
+        let cfg = LaunchConfig {
+            grid_dim: (blocks, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let expert_ff_i = expert_ff as i32;
+        let batch_i = batch as i32;
+        let mut args: [*mut c_void; 4] = [
+            slice_ptr(fused), slice_ptr_mut(out),
+            scalar_ptr(&expert_ff_i), scalar_ptr(&batch_i),
+        ];
+        unsafe { self.fast.fire(&self.gelu_split_batch, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
+        Ok(())
+    }
+
     /// RMSNorm without weight: just normalize by RMS. f16 in/out.
     pub fn rms_norm_no_weight(
         &self,
@@ -830,6 +862,32 @@ impl OpsKernels {
             scalar_ptr(&n_i), scalar_ptr(&scale),
         ];
         unsafe { self.fast.fire(&self.scale_f16, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
+        Ok(())
+    }
+
+    /// out[col] = sum_row rows[row, col] * weights[row]
+    pub fn weighted_sum_rows_f16(
+        &self,
+        rows: &CudaSlice<half::f16>,
+        weights: &CudaSlice<f32>,
+        out: &mut CudaSlice<half::f16>,
+        dim: u32,
+        batch: u32,
+    ) -> Result<(), KernelError> {
+        let threads = 256u32;
+        let blocks = (dim + threads - 1) / threads;
+        let cfg = LaunchConfig {
+            grid_dim: (blocks, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let dim_i = dim as i32;
+        let batch_i = batch as i32;
+        let mut args: [*mut c_void; 5] = [
+            slice_ptr(rows), slice_ptr(weights), slice_ptr_mut(out),
+            scalar_ptr(&dim_i), scalar_ptr(&batch_i),
+        ];
+        unsafe { self.fast.fire(&self.weighted_sum_rows_f16, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
         Ok(())
     }
 
@@ -1211,7 +1269,7 @@ impl OpsKernels {
         pos_offset: u32,
     ) -> Result<(), KernelError> {
         self.mha_fused_scaled(q, k, v, out, head_dim, n_heads, n_kv_heads,
-            seq_len, kv_len, pos_offset, 1.0 / (head_dim as f32).sqrt())
+            seq_len, kv_len, pos_offset, 1.0 / (head_dim as f32).sqrt(), 0.0)
     }
 
     /// MHA with custom attention scale (Gemma 4 uses scale=1.0).
@@ -1228,6 +1286,7 @@ impl OpsKernels {
         kv_len: u32,
         pos_offset: u32,
         scale: f32,
+        softcap: f32,
     ) -> Result<(), KernelError> {
         // Flash Attention: 2D block (32 lanes, 4 warps)
         let smem = (8 + 4 * head_dim) * 4; // max/sum slots + VKQ combine buffer
@@ -1244,14 +1303,46 @@ impl OpsKernels {
         let kvl = kv_len as i32;
         let po = pos_offset as i32;
 
-        let mut args: [*mut c_void; 11] = [
+        let mut args: [*mut c_void; 12] = [
             slice_ptr(q), view_ptr(k), view_ptr(v), slice_ptr_mut(out),
             scalar_ptr(&hd), scalar_ptr(&nh), scalar_ptr(&nkv),
             scalar_ptr(&sl), scalar_ptr(&kvl), scalar_ptr(&po),
-            scalar_ptr(&scale),
+            scalar_ptr(&scale), scalar_ptr(&softcap),
         ];
         unsafe { self.fast.fire(&self.mha_fused, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
 
+        Ok(())
+    }
+
+    pub fn mha_naive(
+        &self,
+        q: &CudaSlice<half::f16>,
+        k: &CudaView<'_, half::f16>,
+        v: &CudaView<'_, half::f16>,
+        out: &mut CudaSlice<half::f16>,
+        head_dim: u32,
+        n_heads: u32,
+        n_kv_heads: u32,
+        seq_len: u32,
+        kv_len: u32,
+        pos_offset: u32,
+        scale: f32,
+        softcap: f32,
+    ) -> Result<(), KernelError> {
+        let smem = (2 * kv_len as usize * std::mem::size_of::<f32>()) as u32;
+        let hd = head_dim as i32;
+        let nh = n_heads as i32;
+        let nkv = n_kv_heads as i32;
+        let sl = seq_len as i32;
+        let kvl = kv_len as i32;
+        let po = pos_offset as i32;
+        let mut args: [*mut c_void; 12] = [
+            slice_ptr(q), view_ptr(k), view_ptr(v), slice_ptr_mut(out),
+            scalar_ptr(&hd), scalar_ptr(&nh), scalar_ptr(&nkv),
+            scalar_ptr(&sl), scalar_ptr(&kvl), scalar_ptr(&po),
+            scalar_ptr(&scale), scalar_ptr(&softcap),
+        ];
+        unsafe { self.fast.fire(&self.mha_naive, (n_heads, seq_len, 1), (1, 1, 1), smem, &mut args); }
         Ok(())
     }
 

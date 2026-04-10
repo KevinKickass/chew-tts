@@ -21,6 +21,8 @@ pub struct ModelConfig {
     pub swa_layers: Vec<bool>,       // per-layer: true = SWA, false = full attention
     pub n_kv_shared_layers: u32,     // layers from end that share KV cache
     pub attention_scale: f32,        // 1.0 for Gemma 4, 1/sqrt(d) for Llama
+    pub attn_logit_softcap: Option<f32>,
+    pub router_logit_softcap: Option<f32>,
     pub logit_softcap: Option<f32>,  // final logit softcapping
     pub rope_theta_swa: Option<f32>, // separate rope base for SWA layers
     /// Per-layer head_dim: full attn layers have 512, SWA layers have 256
@@ -79,6 +81,8 @@ impl ModelConfig {
         // RMS-normalized per-head before attention. llama.cpp: f_attention_scale = 1.0
         // For non-Gemma4 models, standard 1/sqrt(head_dim).
         let attention_scale = if is_gemma4 { 1.0 } else { 1.0 / (head_dim as f32).sqrt() };
+        let attn_logit_softcap = header.get_f32(&format!("{arch}.attn_logit_softcapping")).ok();
+        let router_logit_softcap = header.get_f32(&format!("{arch}.router_logit_softcapping")).ok();
         let logit_softcap = header.get_f32(&format!("{arch}.final_logit_softcapping")).ok();
         let rope_theta_swa = header.get_f32(&format!("{arch}.rope.freq_base_swa")).ok();
         let embd_per_layer = header.get_u32(&format!("{arch}.embedding_length_per_layer_input")).ok()
@@ -146,6 +150,8 @@ impl ModelConfig {
             swa_layers,
             n_kv_shared_layers,
             attention_scale,
+            attn_logit_softcap,
+            router_logit_softcap,
             logit_softcap,
             rope_theta_swa,
             head_dims,

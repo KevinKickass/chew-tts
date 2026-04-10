@@ -603,6 +603,7 @@ pub fn forward_gemma4(
                 hd, config.n_heads, config.n_kv_heads,
                 seq_len, total_kv_len, pos,
                 config.attention_scale,
+                config.attn_logit_softcap.unwrap_or(0.0),
             )?;
         }
         check_nan!(scratch.attn_mha_out, seq_len * q_dim, "after_MHA");
@@ -1294,6 +1295,7 @@ fn forward_streaming_layer_gemma4(
             hd, config.n_heads, config.n_kv_heads,
             seq_len, total_kv_len, pos,
             config.attention_scale,
+            config.attn_logit_softcap.unwrap_or(0.0),
         )?;
     }
 

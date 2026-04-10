@@ -650,7 +650,8 @@ __global__ void mha_fused(const __half* __restrict__ q,
                            int seq_len,
                            int kv_len,
                            int pos_offset,
-                           float scale) {
+                           float scale,
+                           float softcap) {
     const int head = blockIdx.x;
     const int q_pos = blockIdx.y;
     const int causal_limit = pos_offset + q_pos;
@@ -664,10 +665,10 @@ __global__ void mha_fused(const __half* __restrict__ q,
     const __half* Q_ptr = q + q_pos * n_heads * D + head * D;
 
     // Load Q into registers: each sub-group of FA_NTH_KQ=8 threads holds all of Q.
-    // Thread lane holds D/(2*8) = 8 float2 values (for D=128).
+    // Thread lane holds D/(2*8) float2 values: 8 for D=128, 16 for D=256, 32 for D=512.
     const int q_idx = lane % FA_NTH_KQ;
-    const int q_elems = D / (2 * FA_NTH_KQ);  // 8 for D=128
-    float2 Q_reg[8]; // max D/(2*8)=8
+    const int q_elems = D / (2 * FA_NTH_KQ);  // 8 for D=128, 32 for D=512
+    float2 Q_reg[32];
     #pragma unroll
     for (int i = 0; i < q_elems; i++) {
         int d = q_idx * q_elems + i;
@@ -727,6 +728,10 @@ __global__ void mha_fused(const __half* __restrict__ q,
             #pragma unroll
             for (int off = FA_NTH_KQ / 2; off > 0; off >>= 1)
                 dot += __shfl_xor_sync(0xFFFFFFFF, dot, off);
+
+            if (softcap > 0.0f && dot > -1e20f) {
+                dot = tanhf(dot / softcap) * softcap;
+            }
 
             KQ_max_new = fmaxf(KQ_max_new, dot);
 
@@ -830,6 +835,81 @@ __global__ void mha_fused(const __half* __restrict__ q,
             out_ptr[2*d]     = __float2half(sx * inv);
             out_ptr[2*d + 1] = __float2half(sy * inv);
         }
+    }
+}
+
+// Correctness-first MHA fallback for larger head sizes / special paths.
+// One block per (head, q_pos). Thread 0 computes the full attention.
+__global__ void mha_naive(const __half* __restrict__ q,
+                          const __half* __restrict__ k,
+                          const __half* __restrict__ v,
+                          __half* __restrict__ out,
+                          int head_dim,
+                          int n_heads,
+                          int n_kv_heads,
+                          int seq_len,
+                          int kv_len,
+                          int pos_offset,
+                          float scale,
+                          float softcap) {
+    if (threadIdx.x != 0 || threadIdx.y != 0) {
+        return;
+    }
+
+    const int head = blockIdx.x;
+    const int q_pos = blockIdx.y;
+    const int causal_limit = pos_offset + q_pos;
+    const int kv_head = head / (n_heads / n_kv_heads);
+    const int kv_stride = n_kv_heads * head_dim;
+    const int D = head_dim;
+
+    const __half * Q_ptr = q + q_pos * n_heads * D + head * D;
+    __half * out_ptr = out + q_pos * n_heads * D + head * D;
+
+    extern __shared__ float smem[];
+    float * scores = smem;      // kv_len
+    float * probs  = smem + kv_len;
+
+    float max_score = -1e30f;
+    for (int kp = 0; kp < kv_len; ++kp) {
+        float dot = -1e30f;
+        if (kp <= causal_limit) {
+            const __half * K_ptr = k + kp * kv_stride + kv_head * D;
+            dot = 0.0f;
+            for (int d = 0; d < D; ++d) {
+                dot += __half2float(Q_ptr[d]) * __half2float(K_ptr[d]);
+            }
+            dot *= scale;
+            if (softcap > 0.0f) {
+                dot = tanhf(dot / softcap) * softcap;
+            }
+            max_score = fmaxf(max_score, dot);
+        }
+        scores[kp] = dot;
+    }
+
+    float sum = 0.0f;
+    for (int kp = 0; kp < kv_len; ++kp) {
+        float p = 0.0f;
+        if (scores[kp] > -1e20f) {
+            p = expf(scores[kp] - max_score);
+            sum += p;
+        }
+        probs[kp] = p;
+    }
+
+    float inv_sum = sum > 0.0f ? 1.0f / sum : 0.0f;
+    for (int d = 0; d < D; ++d) {
+        float acc = 0.0f;
+        for (int kp = 0; kp < kv_len; ++kp) {
+            float p = probs[kp] * inv_sum;
+            if (p == 0.0f) {
+                continue;
+            }
+            const __half * V_ptr = v + kp * kv_stride + kv_head * D;
+            acc += p * __half2float(V_ptr[d]);
+        }
+        out_ptr[d] = __float2half(acc);
     }
 }
 
@@ -1038,7 +1118,7 @@ __global__ void mha_fused_graph(
 
     const int q_idx = lane % FA_NTH_KQ;
     const int q_elems = D / (2 * FA_NTH_KQ);
-    float2 Q_reg[8];
+    float2 Q_reg[32];
     #pragma unroll
     for (int i = 0; i < q_elems; i++) {
         int d = q_idx * q_elems + i;
@@ -1175,6 +1255,45 @@ __global__ void gelu(const __half* __restrict__ gate,
     // GELU approximation (tanh version, matches PyTorch)
     float gelu_g = 0.5f * g * (1.0f + tanhf(0.7978845608f * (g + 0.044715f * g * g * g)));
     out[idx] = __float2half(gelu_g * u);
+}
+
+// --- Batched GELU split for fused expert gate+up output ---
+// fused shape: [batch, 2 * expert_ff]
+// out   shape: [batch, expert_ff]
+__global__ void gelu_split_batch(const __half* __restrict__ fused,
+                                 __half* __restrict__ out,
+                                 int expert_ff,
+                                 int batch) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = expert_ff * batch;
+    if (idx >= total) return;
+
+    int row = idx / expert_ff;
+    int col = idx - row * expert_ff;
+    const __half* row_ptr = fused + row * expert_ff * 2;
+    float g = __half2float(row_ptr[col]);
+    float u = __half2float(row_ptr[expert_ff + col]);
+    float gelu_g = 0.5f * g * (1.0f + tanhf(0.7978845608f * (g + 0.044715f * g * g * g)));
+    out[idx] = __float2half(gelu_g * u);
+}
+
+// --- Weighted row sum ---
+// rows shape: [batch, dim]
+// weights shape: [batch] (f32)
+// out shape: [dim]
+__global__ void weighted_sum_rows_f16(const __half* __restrict__ rows,
+                                      const float* __restrict__ weights,
+                                      __half* __restrict__ out,
+                                      int dim,
+                                      int batch) {
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= dim) return;
+
+    float acc = 0.0f;
+    for (int row = 0; row < batch; ++row) {
+        acc += __half2float(rows[row * dim + col]) * weights[row];
+    }
+    out[col] = __float2half(acc);
 }
 
 // --- RMSNorm without weight multiplication (for V norm) ---

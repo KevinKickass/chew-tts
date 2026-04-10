@@ -45,6 +45,20 @@ pub fn sample_token(
         }
     }
 
+    // Greedy decoding for temperature <= 0. This is important for deterministic
+    // evals and matches the expected semantics of temp=0 requests.
+    if params.temperature <= 0.0 {
+        let mut best_idx = 0u32;
+        let mut best_logit = f32::NEG_INFINITY;
+        for (i, &logit) in logits_f32.iter().enumerate() {
+            if logit > best_logit {
+                best_logit = logit;
+                best_idx = i as u32;
+            }
+        }
+        return best_idx;
+    }
+
     // Temperature
     if params.temperature > 0.0 && params.temperature != 1.0 {
         for l in logits_f32.iter_mut() {

@@ -1,5 +1,5 @@
 use crate::loader::{self, KernelError};
-use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, CudaStream, CudaView, LaunchConfig, PushKernelArg};
+use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, CudaStream, CudaView, CudaViewMut, LaunchConfig, PushKernelArg};
 use std::sync::Arc;
 
 const DEQUANT_CU: &str = include_str!("cuda/dequant.cu");
@@ -79,6 +79,27 @@ impl DequantKernels {
         &self,
         src: &CudaView<'_, u8>,
         dst: &mut CudaSlice<half::f16>,
+        n_elements: u32,
+        quant_type: chew_gguf::GgmlType,
+    ) -> Result<(), KernelError> {
+        let (kernel, cfg, n) = self.prepare_dequant(n_elements, quant_type)?;
+        unsafe {
+            self.stream
+                .launch_builder(kernel)
+                .arg(src)
+                .arg(dst)
+                .arg(&n)
+                .launch(cfg)
+                .map_err(|e| KernelError::Launch(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Dequantize into a mutable view of an output buffer.
+    pub fn dequant_to_view(
+        &self,
+        src: &CudaView<'_, u8>,
+        dst: &mut CudaViewMut<'_, half::f16>,
         n_elements: u32,
         quant_type: chew_gguf::GgmlType,
     ) -> Result<(), KernelError> {

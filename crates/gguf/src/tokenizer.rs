@@ -17,6 +17,7 @@ use tracing::info;
 const TOKEN_TYPE_NORMAL: i32 = 1;
 const TOKEN_TYPE_UNKNOWN: i32 = 2;
 const TOKEN_TYPE_CONTROL: i32 = 3;
+const TOKEN_TYPE_USER_DEFINED: i32 = 4;
 
 const TOKEN_TYPE_BYTE: i32 = 6;
 
@@ -94,7 +95,10 @@ fn build_tokenizer_json(
 
     for (id, token) in tokens.iter().enumerate() {
         let tt = types.get(id).copied().unwrap_or(TOKEN_TYPE_NORMAL);
-        let is_special = matches!(tt, TOKEN_TYPE_CONTROL | TOKEN_TYPE_UNKNOWN | TOKEN_TYPE_BYTE)
+        let is_special = matches!(
+            tt,
+            TOKEN_TYPE_CONTROL | TOKEN_TYPE_UNKNOWN | TOKEN_TYPE_USER_DEFINED | TOKEN_TYPE_BYTE
+        )
             || Some(id as u32) == bos_id
             || Some(id as u32) == eos_id
             || Some(id as u32) == unk_id
@@ -172,7 +176,16 @@ fn build_tokenizer_json(
                 "use_regex": true
             });
         }
-        "llama" | "gemma" | "gemma2" | "gemma3" | "gemma4" => {
+        "gemma4" => {
+            result["pre_tokenizer"] = Value::Null;
+            result["decoder"] = json!({
+                "type": "Sequence",
+                "decoders": [
+                    {"type": "ByteFallback"}
+                ]
+            });
+        }
+        "llama" | "gemma" | "gemma2" | "gemma3" => {
             // SentencePiece-style: ▁ = space marker in vocab
             // Pre-tokenizer: prepend ▁ then replace all spaces with ▁
             // so the BPE model can match tokens like "▁Hello"

@@ -59,7 +59,7 @@ impl WeightStorage {
         match self {
             WeightStorage::Normal(w) => w.per_layer_token_embd.as_ref(),
             WeightStorage::Streaming(w) => w.per_layer_token_embd.as_ref(),
-            WeightStorage::Moe(_) => None, // MoE models have no per-layer embeddings
+            WeightStorage::Moe(w) => w.per_layer_token_embd.as_ref(),
         }
     }
 
@@ -67,7 +67,7 @@ impl WeightStorage {
         match self {
             WeightStorage::Normal(w) => w.per_layer_model_proj.as_ref(),
             WeightStorage::Streaming(w) => w.per_layer_model_proj.as_ref(),
-            WeightStorage::Moe(_) => None,
+            WeightStorage::Moe(w) => w.per_layer_model_proj.as_ref(),
         }
     }
 
@@ -75,7 +75,7 @@ impl WeightStorage {
         match self {
             WeightStorage::Normal(w) => w.per_layer_proj_norm.as_ref(),
             WeightStorage::Streaming(w) => w.per_layer_proj_norm.as_ref(),
-            WeightStorage::Moe(_) => None,
+            WeightStorage::Moe(w) => w.per_layer_proj_norm.as_ref(),
         }
     }
 
@@ -345,8 +345,11 @@ impl ChewEngine {
             self.kernels.ops.scale_f32_inplace(&mut hidden, prefill_len * self.config.dim, scale)?;
         }
 
+        let debug_logits = std::env::var("CHEW_DEBUG_LOGITS").is_ok();
+        let debug_decode = std::env::var("CHEW_DEBUG_DECODE").is_ok();
+
         // Debug: dump hidden state for last position after embedding+scale
-        if self.config.is_gemma4() {
+        if self.config.is_gemma4() && debug_decode {
             let last_off = ((prefill_len - 1) * self.config.dim) as usize;
             let mut dbg = vec![0.0f32; 8];
             self.stream.memcpy_dtoh(&hidden.slice(last_off..last_off+8), &mut dbg)
@@ -380,22 +383,18 @@ impl ChewEngine {
             logits_f32[i] = v.to_f32();
         }
 
-        // Debug: check logits sanity
-        let nan_count = logits_f32.iter().filter(|x| x.is_nan()).count();
-        let inf_count = logits_f32.iter().filter(|x| x.is_infinite()).count();
-        let zero_count = logits_f32.iter().filter(|x| **x == 0.0).count();
-        let max_logit = logits_f32.iter().cloned().filter(|x| x.is_finite()).fold(f32::NEG_INFINITY, f32::max);
-        let min_logit = logits_f32.iter().cloned().filter(|x| x.is_finite()).fold(f32::INFINITY, f32::min);
-        info!(nan_count, inf_count, zero_count, max_logit, min_logit, vocab = logits_f32.len(), "prefill logits");
+        if debug_logits {
+            let nan_count = logits_f32.iter().filter(|x| x.is_nan()).count();
+            let inf_count = logits_f32.iter().filter(|x| x.is_infinite()).count();
+            let zero_count = logits_f32.iter().filter(|x| **x == 0.0).count();
+            let max_logit = logits_f32.iter().cloned().filter(|x| x.is_finite()).fold(f32::NEG_INFINITY, f32::max);
+            let min_logit = logits_f32.iter().cloned().filter(|x| x.is_finite()).fold(f32::INFINITY, f32::min);
+            info!(nan_count, inf_count, zero_count, max_logit, min_logit, vocab = logits_f32.len(), "prefill logits");
 
-        // Debug: show top 10 tokens and known-good token logits
-        {
             let mut indexed: Vec<(usize, f32)> = logits_f32.iter().cloned().enumerate().collect();
             indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             let top10: Vec<(usize, f32)> = indexed.into_iter().take(10).collect();
             info!(?top10, "top 10 logit tokens");
-            // Check where reference top tokens rank in chew's output
-            // Reference with chat template: 60704='Paris'(24.82), 791='The'(24.25), 1131='...'(19.55)
             if logits_f32.len() > 60704 {
                 info!(
                     tok_60704_paris = logits_f32[60704],
@@ -404,7 +403,6 @@ impl ChewEngine {
                     tok_334_stars = logits_f32[334],
                     "reference token logits"
                 );
-                // Dump a few logit ranges to see if there's a pattern
                 let first5: Vec<f32> = logits_f32[0..5].to_vec();
                 let mid5: Vec<f32> = logits_f32[60700..60710].to_vec();
                 info!(?first5, ?mid5, "logit samples");
@@ -441,6 +439,7 @@ impl ChewEngine {
         let mut decode_graph: Option<forward::DecodeGraph> = None;
 
         let greedy = params.temperature == 0.0;
+        let profile = std::env::var("CHEW_PROFILE").is_ok();
 
         if greedy {
             // ZERO-SYNC GREEDY PATH:
@@ -475,8 +474,7 @@ impl ChewEngine {
                     self.kernels.ops.scale_f32_inplace(&mut decode_hidden, self.config.dim, scale)?;
                 }
 
-                // Debug: check decode embedding
-                if _step == 1 {
+                if _step == 1 && debug_decode {
                     let mut tok_host = [0i32];
                     self.stream.memcpy_dtoh(&tok_gpu, &mut tok_host).ok();
                     let mut emb = vec![0.0f32; 4];
@@ -505,12 +503,36 @@ impl ChewEngine {
                         }
                     }
                 } else {
+                    let pe_t0 = if profile && self.config.is_gemma4() {
+                        Some(std::time::Instant::now())
+                    } else {
+                        None
+                    };
                     let decode_pe = if self.config.is_gemma4() {
                         self.compute_per_layer_embeddings(&tok_gpu, &decode_hidden, 1)?
                     } else {
                         None
                     };
+                    if let Some(t0) = pe_t0 {
+                        info!(compute_pe_us = t0.elapsed().as_micros(), "PROFILE decode compute_pe");
+                    }
                     self.run_forward(&mut decode_hidden, decode_pe.as_ref(), 1)?;
+                }
+
+                if _step == 1 && debug_logits {
+                    let vocab = self.config.vocab_size as usize;
+                    let mut logits_f16 = vec![half::f16::ZERO; vocab];
+                    let mut logits_f32 = vec![0.0f32; vocab];
+                    self.stream
+                        .memcpy_dtoh(&self.scratch.logits.slice(0..vocab), &mut logits_f16)
+                        .map_err(EngineError::Driver)?;
+                    for (i, &v) in logits_f16.iter().enumerate() {
+                        logits_f32[i] = v.to_f32();
+                    }
+                    let mut indexed: Vec<(usize, f32)> = logits_f32.iter().cloned().enumerate().collect();
+                    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                    let top10: Vec<(usize, f32)> = indexed.into_iter().take(10).collect();
+                    info!(?top10, "decode step1 top 10 logit tokens");
                 }
 
                 // GPU argmax → tok_gpu (stays on GPU)
@@ -622,17 +644,17 @@ impl ChewEngine {
             arch::gemma4_moe::forward_moe_streaming(
                 hidden, moe_w, &self.config,
                 &mut self.kernels, &mut self.kv_cache, &mut self.scratch,
-                seq_len, &self.stream,
+                seq_len, pe, &self.stream,
             )?;
         } else if let WeightStorage::Normal(ref w) = self.weights {
             if self.config.is_gemma4() {
-                forward::forward_gemma4(
+                arch::gemma4_dense::forward(
                     hidden, w, &self.config,
                     &mut self.kernels, &mut self.kv_cache, &mut self.scratch,
                     seq_len, pe,
                 )?;
             } else {
-                forward::forward(
+                arch::llama::forward(
                     hidden, w, &self.config,
                     &mut self.kernels, &mut self.kv_cache, &mut self.scratch,
                     seq_len,

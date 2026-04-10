@@ -1,7 +1,7 @@
 use crate::dequant::DequantKernels;
 use crate::loader::KernelError;
-use cudarc::cublas::{CudaBlas, Gemm as GemmTrait, GemmConfig};
-use cudarc::driver::{CudaSlice, CudaStream};
+use cudarc::cublas::{CudaBlas, Gemm as GemmTrait, GemmConfig, StridedBatchedConfig};
+use cudarc::driver::{CudaSlice, CudaStream, CudaView};
 use std::sync::Arc;
 
 /// Max dequant scratch size: 64M f16 elements = 128 MB.
@@ -116,6 +116,116 @@ impl Gemm {
         Ok(())
     }
 
+    pub fn matmul_dequant_view(
+        &mut self,
+        a: &CudaSlice<half::f16>,
+        b_quant: &CudaView<'_, u8>,
+        b_type: chew_gguf::GgmlType,
+        b_elements: u32,
+        c: &mut CudaSlice<half::f16>,
+        m: u32,
+        n: u32,
+        k: u32,
+        dequant: &DequantKernels,
+    ) -> Result<(), KernelError> {
+        let total_elements = (n * k) as usize;
+
+        if total_elements <= self.scratch_elements {
+            dequant.dequant_view(b_quant, &mut self.dequant_scratch, b_elements, b_type)?;
+            self.matmul_f16(a, &self.dequant_scratch, c, m, n, k)?;
+        } else {
+            let chunk_n_max = (self.scratch_elements / k as usize) as u32;
+            assert!(chunk_n_max > 0, "scratch too small for even 1 row of weight matrix");
+
+            let bs = b_type.block_size() as u32;
+            let bb = b_type.block_bytes() as u64;
+            let chunk_n_aligned = if bs > 1 {
+                (chunk_n_max / bs) * bs
+            } else {
+                chunk_n_max
+            };
+            assert!(chunk_n_aligned > 0, "chunk_n too small after block alignment");
+
+            let mut n_done: u32 = 0;
+            while n_done < n {
+                let remaining = n - n_done;
+                let chunk = if remaining <= chunk_n_max {
+                    remaining
+                } else {
+                    chunk_n_aligned
+                };
+
+                let chunk_elements = chunk * k;
+                let blocks_per_row = (k as u64 + bs as u64 - 1) / bs as u64;
+                let row_bytes = blocks_per_row * bb;
+                let byte_offset = n_done as u64 * row_bytes;
+                let chunk_byte_len = chunk as u64 * row_bytes;
+                let b_chunk = b_quant.slice(byte_offset as usize..(byte_offset + chunk_byte_len) as usize);
+
+                dequant.dequant_view(&b_chunk, &mut self.dequant_scratch, chunk_elements, b_type)?;
+                self.gemm_chunked(
+                    a,
+                    &self.dequant_scratch,
+                    c,
+                    m, n, k,
+                    chunk, n_done,
+                )?;
+
+                n_done += chunk;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Batched version for several quantized B matrices with identical shape/type.
+    pub fn matmul_dequant_strided_batched(
+        &mut self,
+        a: &CudaSlice<half::f16>,
+        b_quants: &[CudaView<'_, u8>],
+        b_type: chew_gguf::GgmlType,
+        b_elements_per_problem: u32,
+        c: &mut CudaSlice<half::f16>,
+        m: u32,
+        n: u32,
+        k: u32,
+        dequant: &DequantKernels,
+    ) -> Result<(), KernelError> {
+        let batch_size = b_quants.len() as u32;
+        if batch_size == 0 {
+            return Ok(());
+        }
+
+        let total_elements = (batch_size * n * k) as usize;
+        if total_elements > self.scratch_elements {
+            return Err(KernelError::Cublas(format!(
+                "batched dequant scratch too small: need {} elements, have {}",
+                total_elements, self.scratch_elements
+            )));
+        }
+
+        let per_problem = (n * k) as usize;
+        for (i, bq) in b_quants.iter().enumerate() {
+            let start = i * per_problem;
+            let end = start + per_problem;
+            let mut dst = self.dequant_scratch.slice_mut(start..end);
+            dequant.dequant_to_view(bq, &mut dst, b_elements_per_problem, b_type)?;
+        }
+
+        self.matmul_f16_strided_batched_with_strides(
+            a,
+            &self.dequant_scratch,
+            c,
+            m,
+            n,
+            k,
+            batch_size,
+            0,
+            (n * k) as i64,
+            (m * n) as i64,
+        )
+    }
+
     /// GEMM for a chunk: writes to C[:, n_offset..n_offset+chunk_n]
     fn gemm_chunked(
         &self,
@@ -194,6 +304,73 @@ impl Gemm {
         unsafe {
             self.blas
                 .gemm(cfg, b, a, c)
+                .map_err(|e| KernelError::Cublas(e.to_string()))?;
+        }
+
+        Ok(())
+    }
+
+    /// Strided batched f16 GEMM.
+    ///
+    /// A batch: [batch, m, k] row-major
+    /// B batch: [batch, n, k] row-major
+    /// C batch: [batch, m, n] row-major
+    pub fn matmul_f16_strided_batched(
+        &self,
+        a: &CudaSlice<half::f16>,
+        b: &CudaSlice<half::f16>,
+        c: &mut CudaSlice<half::f16>,
+        m: u32,
+        n: u32,
+        k: u32,
+        batch_size: u32,
+    ) -> Result<(), KernelError> {
+        self.matmul_f16_strided_batched_with_strides(
+            a, b, c, m, n, k, batch_size,
+            (m * k) as i64,
+            (n * k) as i64,
+            (m * n) as i64,
+        )
+    }
+
+    pub fn matmul_f16_strided_batched_with_strides(
+        &self,
+        a: &CudaSlice<half::f16>,
+        b: &CudaSlice<half::f16>,
+        c: &mut CudaSlice<half::f16>,
+        m: u32,
+        n: u32,
+        k: u32,
+        batch_size: u32,
+        stride_a: i64,
+        stride_b: i64,
+        stride_c: i64,
+    ) -> Result<(), KernelError> {
+        let alpha = half::f16::from_f32(1.0);
+        let beta = half::f16::from_f32(0.0);
+
+        let cfg = StridedBatchedConfig {
+            gemm: GemmConfig {
+                transa: cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_T,
+                transb: cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N,
+                m: n as i32,
+                n: m as i32,
+                k: k as i32,
+                alpha,
+                lda: k as i32,
+                ldb: k as i32,
+                beta,
+                ldc: n as i32,
+            },
+            batch_size: batch_size as i32,
+            stride_a,
+            stride_b,
+            stride_c,
+        };
+
+        unsafe {
+            self.blas
+                .gemm_strided_batched(cfg, b, a, c)
                 .map_err(|e| KernelError::Cublas(e.to_string()))?;
         }
 
