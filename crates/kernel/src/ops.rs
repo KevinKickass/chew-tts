@@ -56,6 +56,9 @@ pub struct OpsKernels {
     pe_strided_mul: CudaFunction,
     // Fused kernels for launch reduction
     rope_kv_write: CudaFunction,
+    // MoE GPU router
+    softmax_topk: CudaFunction,
+    fused_moe_router: CudaFunction,
 }
 
 impl OpsKernels {
@@ -108,6 +111,8 @@ impl OpsKernels {
             gather_rows_quant: loader::get_fn(&module, "gather_rows_quant")?,
             pe_strided_mul: loader::get_fn(&module, "pe_strided_mul")?,
             rope_kv_write: loader::get_fn(&module, "rope_kv_write")?,
+            softmax_topk: loader::get_fn(&module, "softmax_topk")?,
+            fused_moe_router: loader::get_fn(&module, "fused_moe_router")?,
             _module: module,
         })
     }
@@ -1343,6 +1348,72 @@ impl OpsKernels {
             scalar_ptr(&scale), scalar_ptr(&softcap),
         ];
         unsafe { self.fast.fire(&self.mha_naive, (n_heads, seq_len, 1), (1, 1, 1), smem, &mut args); }
+        Ok(())
+    }
+
+    /// MoE router: softmax + top-k selection on GPU.
+    /// logits: [n_experts] f16 router logits
+    /// out_ids: [top_k] i32 selected expert indices
+    /// out_weights: [top_k] f32 renormalized weights
+    /// softcap: if > 0, apply tanh softcap; 0 = skip
+    /// Launch: single block of n_experts threads (must be power of 2, padded if needed).
+    pub fn softmax_topk(
+        &self,
+        logits: &CudaSlice<half::f16>,
+        out_ids: &mut CudaSlice<i32>,
+        out_weights: &mut CudaSlice<f32>,
+        n_experts: u32,
+        top_k: u32,
+        softcap: f32,
+    ) -> Result<(), KernelError> {
+        // Block size must be power of 2 for reductions, >= n_experts
+        let block_size = n_experts.next_power_of_two();
+        let cfg = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (block_size, 1, 1),
+            shared_mem_bytes: (n_experts + block_size) * 4, // probs[n_experts] + reduce[block_size]
+        };
+        let ne = n_experts as i32;
+        let tk = top_k as i32;
+        let mut args: [*mut c_void; 6] = [
+            slice_ptr(logits), slice_ptr_mut(out_ids), slice_ptr_mut(out_weights),
+            scalar_ptr(&ne), scalar_ptr(&tk), scalar_ptr(&softcap),
+        ];
+        unsafe { self.fast.fire(&self.softmax_topk, (1, 1, 1), (block_size, 1, 1), cfg.shared_mem_bytes, &mut args); }
+        Ok(())
+    }
+
+    /// Fused MoE router: RMS-norm + scale + GEMV + softcap + softmax + top-k.
+    /// Single kernel launch replaces 6 separate launches.
+    /// hidden: [dim] f32 input, gate_scale: [dim] f16, gate_weights: [n_experts, dim] f16
+    /// out_ids: [top_k] i32, out_weights: [top_k] f32
+    pub fn fused_moe_router(
+        &self,
+        hidden: &CudaSlice<f32>,
+        gate_scale: &CudaSlice<half::f16>,
+        gate_weights: &CudaSlice<half::f16>,
+        out_ids: &mut CudaSlice<i32>,
+        out_weights: &mut CudaSlice<f32>,
+        dim: u32,
+        n_experts: u32,
+        top_k: u32,
+        eps: f32,
+        inv_sqrt_dim: f32,
+        softcap: f32,
+    ) -> Result<(), KernelError> {
+        let block_size = n_experts.next_power_of_two();
+        // shared mem: [dim] normed input + [n_experts] probs + [block_size] reduce
+        let smem = (dim + n_experts + block_size) * 4;
+        let dim_i = dim as i32;
+        let ne = n_experts as i32;
+        let tk = top_k as i32;
+        let mut args: [*mut c_void; 11] = [
+            slice_ptr(hidden), slice_ptr(gate_scale), slice_ptr(gate_weights),
+            slice_ptr_mut(out_ids), slice_ptr_mut(out_weights),
+            scalar_ptr(&dim_i), scalar_ptr(&ne), scalar_ptr(&tk),
+            scalar_ptr(&eps), scalar_ptr(&inv_sqrt_dim), scalar_ptr(&softcap),
+        ];
+        unsafe { self.fast.fire(&self.fused_moe_router, (1, 1, 1), (block_size, 1, 1), smem, &mut args); }
         Ok(())
     }
 

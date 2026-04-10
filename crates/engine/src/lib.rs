@@ -289,6 +289,14 @@ impl ChewEngine {
         // 6. Allocate scratch buffers
         let scratch = ScratchBuffers::alloc(&config, max_batch, max_seq, &stream)?;
 
+        // 7. Expand expert cache with remaining VRAM headroom
+        let mut weights = weights;
+        if let WeightStorage::Moe(moe) = &mut weights {
+            if let Err(e) = moe.expand_expert_cache(&stream, &config) {
+                tracing::warn!(%e, "failed to expand expert cache (non-fatal)");
+            }
+        }
+
         info!(context = max_seq, max_batch, "engine ready");
 
         Ok(Self {

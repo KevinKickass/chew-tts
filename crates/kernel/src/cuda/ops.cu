@@ -1593,4 +1593,149 @@ __global__ void pe_strided_mul(const __half* __restrict__ a,
     out[idx] = __float2half(av * ev);
 }
 
+// --- Fused MoE Router: RMS-norm + scale + GEMV + softcap + softmax + top-k ---
+// Single kernel replaces 6 separate launches. One thread per expert computes its dot product.
+//
+// hidden: [dim] f32 input (residual stream)
+// gate_scale: [dim] f16 per-element scale
+// gate_weights: [n_experts, dim] f16 (row-major, pre-dequanted)
+// out_ids: [top_k] int32 selected expert indices
+// out_weights: [top_k] float renormalized weights
+// dim, n_experts, top_k: scalar params
+// eps, inv_sqrt_dim, softcap: float params
+//
+// Launch: <<<1, n_experts>>> with shared_mem = (dim + n_experts + blockDim.x) * sizeof(float)
+__global__ void fused_moe_router(const float* __restrict__ hidden,
+                                  const __half* __restrict__ gate_scale,
+                                  const __half* __restrict__ gate_weights,
+                                  int* __restrict__ out_ids,
+                                  float* __restrict__ out_weights,
+                                  int dim,
+                                  int n_experts,
+                                  int top_k,
+                                  float eps,
+                                  float inv_sqrt_dim,
+                                  float softcap) {
+    extern __shared__ float sdata[];
+    // Layout: [dim] normed input | [n_experts] probs | [blockDim.x] reduce
+    float* s_input = sdata;
+    float* probs = sdata + dim;
+    float* reduce = probs + n_experts;
+
+    int tid = threadIdx.x;
+
+    // Step 1: Cooperative load + RMS norm of hidden into shared memory
+    // All threads participate to load dim elements (dim >> n_experts typically)
+    float local_sum = 0.0f;
+    for (int i = tid; i < dim; i += blockDim.x) {
+        float v = hidden[i];
+        local_sum += v * v;
+    }
+    reduce[tid] = local_sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) reduce[tid] += reduce[tid + s];
+        __syncthreads();
+    }
+    float rms = sqrtf(reduce[0] / (float)dim + eps);
+    float scale = inv_sqrt_dim / rms;
+
+    // Apply RMS norm + gate_scale + inv_sqrt_dim, store in shared mem
+    for (int i = tid; i < dim; i += blockDim.x) {
+        s_input[i] = hidden[i] * scale * __half2float(gate_scale[i]);
+    }
+    __syncthreads();
+
+    // Step 2: Each thread computes dot product for its expert
+    float logit = 0.0f;
+    if (tid < n_experts) {
+        const __half* row = gate_weights + tid * dim;
+        for (int i = 0; i < dim; i++) {
+            logit += s_input[i] * __half2float(row[i]);
+        }
+        if (softcap > 0.0f) {
+            logit = tanhf(logit / softcap) * softcap;
+        }
+    }
+
+    // Step 3: Softmax
+    float v = (tid < n_experts) ? logit : -1e30f;
+    reduce[tid] = v;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) reduce[tid] = fmaxf(reduce[tid], reduce[tid + s]);
+        __syncthreads();
+    }
+    float max_val = reduce[0];
+
+    float exp_v = (tid < n_experts) ? expf(v - max_val) : 0.0f;
+    reduce[tid] = exp_v;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) reduce[tid] += reduce[tid + s];
+        __syncthreads();
+    }
+    float sum_exp = reduce[0];
+
+    if (tid < n_experts) {
+        probs[tid] = exp_v / sum_exp;
+    }
+    __syncthreads();
+
+    // Step 4: Top-k + renormalize (thread 0)
+    if (tid == 0) {
+        float renorm_sum = 0.0f;
+        for (int ki = 0; ki < top_k && ki < n_experts; ki++) {
+            float best = -1.0f;
+            int best_idx = 0;
+            for (int i = 0; i < n_experts; i++) {
+                if (probs[i] > best) {
+                    best = probs[i];
+                    best_idx = i;
+                }
+            }
+            out_ids[ki] = best_idx;
+            out_weights[ki] = best;
+            renorm_sum += best;
+            probs[best_idx] = -1.0f;
+        }
+        if (renorm_sum > 0.0f) {
+            for (int ki = 0; ki < top_k; ki++) {
+                out_weights[ki] /= renorm_sum;
+            }
+        }
+    }
+}
+
+// Keep the standalone softmax_topk for potential future use
+__global__ void softmax_topk(const __half* __restrict__ logits,
+                             int* __restrict__ out_ids,
+                             float* __restrict__ out_weights,
+                             int n_experts,
+                             int top_k,
+                             float softcap) {
+    extern __shared__ float sdata[];
+    float* probs = sdata;
+    float* reduce = sdata + n_experts;
+    int tid = threadIdx.x;
+    float v = (tid < n_experts) ? __half2float(logits[tid]) : -1e30f;
+    if (tid < n_experts && softcap > 0.0f) v = tanhf(v / softcap) * softcap;
+    reduce[tid] = v; __syncthreads();
+    for (int s = blockDim.x/2; s > 0; s >>= 1) { if (tid < s) reduce[tid] = fmaxf(reduce[tid], reduce[tid+s]); __syncthreads(); }
+    float max_val = reduce[0];
+    float exp_v = (tid < n_experts) ? expf(v - max_val) : 0.0f;
+    reduce[tid] = exp_v; __syncthreads();
+    for (int s = blockDim.x/2; s > 0; s >>= 1) { if (tid < s) reduce[tid] += reduce[tid+s]; __syncthreads(); }
+    if (tid < n_experts) probs[tid] = exp_v / reduce[0]; __syncthreads();
+    if (tid == 0) {
+        float rs = 0.0f;
+        for (int ki = 0; ki < top_k; ki++) {
+            float best = -1.0f; int bi = 0;
+            for (int i = 0; i < n_experts; i++) { if (probs[i] > best) { best = probs[i]; bi = i; } }
+            out_ids[ki] = bi; out_weights[ki] = best; rs += best; probs[bi] = -1.0f;
+        }
+        if (rs > 0.0f) for (int ki = 0; ki < top_k; ki++) out_weights[ki] /= rs;
+    }
+}
+
 } // extern "C"

@@ -480,7 +480,7 @@ pub fn allocate_shell(
         ffn_up: mk_qw(max_sizes[5])?,          // ffn_up (shared)
         ffn_down: mk_qw(max_sizes[6])?,        // ffn_down (shared)
         post_ffw_norm: alloc_f16(d)?,
-        moe_gate: mk_qw(tiny_quant_bytes)?,    // router runs from host weights
+        moe_gate: mk_qw(tiny_quant_bytes)?,    // router uses persistent router_gates instead
         moe_gate_scale: alloc_f16(d)?,
         moe_gate_host: Arc::from([]),
         moe_gate_scale_host: Arc::from([]),
@@ -529,8 +529,8 @@ pub fn upload_to_shell(
     upload_slot(host_slice, base, &layout.ffn_gate, &mut shell.ffn_gate, stream)?;
     upload_slot(host_slice, base, &layout.ffn_up, &mut shell.ffn_up, stream)?;
     upload_slot(host_slice, base, &layout.ffn_down, &mut shell.ffn_down, stream)?;
-    // Router runs on CPU from host weights, and streamed expert tensors are fetched
-    // on-demand per selected expert instead of uploading the full expert banks.
+    // Router gate weights are permanently GPU-resident (router_gates), no shell DMA needed.
+    // Streamed expert tensors (gate_up_exps, down_exps) are fetched on-demand per selected expert.
     if let (Some(slot), Some(qw)) = (&layout.inp_gate, &mut shell.inp_gate) {
         upload_slot(host_slice, base, slot, qw, stream)?;
     }
@@ -615,6 +615,10 @@ pub struct ExpertDmaSlot {
     pub cached_expert_id: Option<usize>,
     pub ready: Option<CudaEvent>,
     pub age: u64,
+    /// Generation counter: slots loaded in the current token's generation are
+    /// preferred eviction targets (they won't be reused until next token).
+    /// Cross-token ("stale") entries are preserved for cache hits in later layers.
+    pub load_generation: u64,
 }
 
 /// All weights for a Gemma 4 MoE model in streaming mode.
@@ -646,8 +650,19 @@ pub struct MoeModelWeights {
     pub expert_gate_up_batch_out: CudaSlice<half::f16>,
     pub expert_act_batch_in: CudaSlice<half::f16>,
     pub expert_down_batch_out: CudaSlice<half::f16>,
+    // GPU router: persistent gate weights pre-dequanted to F16 (~20 MB) + scratch buffers
+    pub router_gates: Vec<CudaSlice<half::f16>>,   // [n_layers] — gate weights as f16 on GPU
+    pub router_norm_buf: CudaSlice<half::f16>,     // [dim] f16 — normed+scaled hidden for router
+    pub router_logits_buf: CudaSlice<half::f16>,   // [n_experts] f16 — router logits
+    pub router_topk_ids: CudaSlice<i32>,           // [top_k] i32 — selected expert indices
+    pub router_topk_weights: CudaSlice<f32>,       // [top_k] f32 — renormalized weights
+    /// Generation counter for expert cache eviction. Incremented each decode token.
+    /// Slots from the current generation (loaded this token) are preferred eviction
+    /// targets over stale cross-token entries.
+    pub expert_cache_generation: u64,
 }
 
+/// Reserve VRAM for KV cache (~880 MB), scratch (~300 MB), cuBLAS (~32 MB), headroom.
 const POST_LOAD_RESERVE_BYTES: u64 = 1024 * 1024 * 1024;
 
 impl MoeModelWeights {
@@ -780,6 +795,7 @@ impl MoeModelWeights {
                 cached_expert_id: None,
                 ready: None,
                 age: 0,
+                load_generation: 0,
             });
         }
         let expert_ff = config.expert_ff_dim as usize;
@@ -791,6 +807,34 @@ impl MoeModelWeights {
         let expert_act_batch_in = stream.alloc_zeros::<half::f16>(config.n_experts_per_tok as usize * expert_ff)
             .map_err(|e| LoadError::Vram(chew_vram::VramError::Alloc(e.to_string())))?;
         let expert_down_batch_out = stream.alloc_zeros::<half::f16>(config.n_experts_per_tok as usize * d)
+            .map_err(|e| LoadError::Vram(chew_vram::VramError::Alloc(e.to_string())))?;
+        // GPU router: upload all gate weights as F16 permanently (~20 MB for 30 layers)
+        let mut router_gates: Vec<CudaSlice<half::f16>> = Vec::with_capacity(n_layers);
+        for layer in 0..n_layers {
+            let name = format!("blk.{layer}.ffn_gate_inp.weight");
+            let qw = upload_quantized(gguf, &name, alloc, gpu_idx)?;
+            // Dequant F32 → F16 once at load time
+            let n_elems = qw.n_elements as usize;
+            let mut f16_buf = stream.alloc_zeros::<half::f16>(n_elems)
+                .map_err(|e| LoadError::Vram(chew_vram::VramError::Alloc(e.to_string())))?;
+            dequant.dequant(&qw.data, &mut f16_buf, qw.n_elements, qw.quant_type)
+                .map_err(|e| LoadError::Vram(chew_vram::VramError::Alloc(e.to_string())))?;
+            drop(qw); // free F32 GPU buffer
+            router_gates.push(f16_buf);
+        }
+        info!(
+            n_layers,
+            gate_mb = router_gates.iter().map(|g| g.len() * 2).sum::<usize>() / (1024 * 1024),
+            "GPU router: gate weights uploaded (F16)"
+        );
+        // GPU router scratch (tiny: ~6KB total)
+        let router_norm_buf = stream.alloc_zeros::<half::f16>(d)
+            .map_err(|e| LoadError::Vram(chew_vram::VramError::Alloc(e.to_string())))?;
+        let router_logits_buf = stream.alloc_zeros::<half::f16>(config.n_experts as usize)
+            .map_err(|e| LoadError::Vram(chew_vram::VramError::Alloc(e.to_string())))?;
+        let router_topk_ids = stream.alloc_zeros::<i32>(config.n_experts_per_tok as usize)
+            .map_err(|e| LoadError::Vram(chew_vram::VramError::Alloc(e.to_string())))?;
+        let router_topk_weights = stream.alloc_zeros::<f32>(config.n_experts_per_tok as usize)
             .map_err(|e| LoadError::Vram(chew_vram::VramError::Alloc(e.to_string())))?;
 
         let mut model = Self {
@@ -816,6 +860,12 @@ impl MoeModelWeights {
             expert_gate_up_batch_out,
             expert_act_batch_in,
             expert_down_batch_out,
+            router_gates,
+            router_norm_buf,
+            router_logits_buf,
+            router_topk_ids,
+            router_topk_weights,
+            expert_cache_generation: 0,
         };
 
         model.refill_resident_layers(
@@ -888,6 +938,74 @@ impl MoeModelWeights {
             );
         }
 
+        Ok(())
+    }
+
+    /// Expand expert cache slots to fill available VRAM headroom.
+    /// Called after KV cache + scratch are allocated, so we use only truly free VRAM.
+    /// More slots = higher cache hit rate between consecutive tokens.
+    pub fn expand_expert_cache(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        config: &ModelConfig,
+    ) -> Result<(), LoadError> {
+        if self.host_layer_offsets.is_empty() {
+            return Ok(()); // no streamed layers, no expert DMA needed
+        }
+
+        let (free, _) = stream.context().mem_get_info()
+            .map_err(|e| LoadError::Vram(chew_vram::VramError::Alloc(e.to_string())))?;
+
+        // Reserve headroom for runtime allocations
+        let headroom = 128 * 1024 * 1024usize; // 128 MB
+        let available = if free > headroom { free - headroom } else { return Ok(()); };
+
+        let expert_gate_up_bytes = self.host_layer_offsets.iter()
+            .map(|l| l.moe_gate_up_exps.size / config.n_experts as usize)
+            .max()
+            .unwrap_or(0)
+            .max(64);
+        let expert_down_bytes = self.host_layer_offsets.iter()
+            .map(|l| l.moe_down_exps.size / config.n_experts as usize)
+            .max()
+            .unwrap_or(0)
+            .max(64);
+
+        let slot_bytes = expert_gate_up_bytes + expert_down_bytes;
+        if slot_bytes == 0 { return Ok(()); }
+
+        // Target: cache all streamed-layer experts between tokens
+        let n_streamed = self.host_layer_offsets.len();
+        let target = n_streamed * config.n_experts_per_tok as usize;
+        let additional = target.saturating_sub(self.expert_slots.len());
+        let can_afford = available / slot_bytes;
+        let to_add = additional.min(can_afford);
+
+        if to_add == 0 { return Ok(()); }
+
+        for _ in 0..to_add {
+            let gate_up_data = stream.alloc_zeros::<u8>(expert_gate_up_bytes)
+                .map_err(|e| LoadError::Vram(chew_vram::VramError::Alloc(e.to_string())))?;
+            let down_data = stream.alloc_zeros::<u8>(expert_down_bytes)
+                .map_err(|e| LoadError::Vram(chew_vram::VramError::Alloc(e.to_string())))?;
+            self.expert_slots.push(ExpertDmaSlot {
+                gate_up: QuantWeight { data: gate_up_data, quant_type: GgmlType::F16, n_elements: 0 },
+                down: QuantWeight { data: down_data, quant_type: GgmlType::F16, n_elements: 0 },
+                cached_streamed_idx: None,
+                cached_expert_id: None,
+                ready: None,
+                age: 0,
+                load_generation: 0,
+            });
+        }
+
+        info!(
+            slots = self.expert_slots.len(),
+            added = to_add,
+            target,
+            vram_mb = to_add * slot_bytes / (1024 * 1024),
+            "expanded expert cache for cross-token reuse"
+        );
         Ok(())
     }
 }
@@ -1050,7 +1168,7 @@ pub fn forward_moe_streaming(
     let mut t_expert_wait_miss = 0u128;
     let mut t_expert_wait_first = 0u128;
     let mut t_expert_wait_later = 0u128;
-    let mut t_expert_load = 0u128;
+    let t_expert_load = 0u128;
     let mut t_expert_gate_up = 0u128;
     let mut t_expert_split = 0u128;
     let mut t_expert_act = 0u128;
@@ -1116,6 +1234,16 @@ pub fn forward_moe_streaming(
             .map_err(|e| KernelError::Launch(e.to_string()))?;
         info!(?h, "MoE forward START hidden (decode)");
     }
+
+    let _generation_unused = moe_weights.expert_cache_generation; // kept for struct compat
+
+    // Raw pointers for GPU router buffers — disjoint from layer weights, safe to use
+    // while `layer: &MoeLayerWeights` borrows resident_layers/shells.
+    let router_gates_ptr = moe_weights.router_gates.as_ptr(); // persistent gate weights for all layers
+    let router_norm_ptr = &mut moe_weights.router_norm_buf as *mut CudaSlice<half::f16>;
+    let router_logits_ptr = &mut moe_weights.router_logits_buf as *mut CudaSlice<half::f16>;
+    let router_ids_ptr = &mut moe_weights.router_topk_ids as *mut CudaSlice<i32>;
+    let router_weights_ptr = &mut moe_weights.router_topk_weights as *mut CudaSlice<f32>;
 
     for layer_idx in 0..n_layers {
         let hd = config.layer_head_dim(layer_idx);
@@ -1306,17 +1434,10 @@ pub fn forward_moe_streaming(
 
         sync_check!("QKV_norms");
         // ── 4. RoPE ──
-        if !is_swa {
-            timed!(t_rope, {
-                kernels.ops.rope_neox(&mut scratch.q, seq_len, config.n_heads, hd, pos, rope_theta)?;
-                kernels.ops.rope_neox(&mut scratch.k, seq_len, kv_heads, hd, pos, rope_theta)
-            })?;
-        } else {
-            timed!(t_rope, {
-                kernels.ops.rope_neox(&mut scratch.q, seq_len, config.n_heads, hd, pos, rope_theta)?;
-                kernels.ops.rope_neox(&mut scratch.k, seq_len, kv_heads, hd, pos, rope_theta)
-            })?;
-        }
+        timed!(t_rope, {
+            kernels.ops.rope_neox(&mut scratch.q, seq_len, config.n_heads, hd, pos, rope_theta)?;
+            kernels.ops.rope_neox(&mut scratch.k, seq_len, kv_heads, hd, pos, rope_theta)
+        })?;
 
         sync_check!("RoPE");
         if debug_decode && matches!(layer_idx, 5 | 11) && seq_len == 1 {
@@ -1414,9 +1535,123 @@ pub fn forward_moe_streaming(
         // ══════════════════════════════════════════════════════════════
         // FFN: Shared MLP + MoE run in PARALLEL on attn_out (= hidden)
         // Following llama.cpp gemma4-iswa.cpp exactly
+        //
+        // OPTIMIZATION: Router + expert DMA enqueue run BEFORE the shared FFN.
+        // The router only needs `hidden` (post-attention), not the FFN output.
+        // This lets expert DMA overlap with ~5ms of shared FFN compute.
         // ══════════════════════════════════════════════════════════════
 
-        // ── 9a. Shared MLP: norm(attn_out) → gate+up → GELU → down → post_ffw_norm_1 ──
+        // ── PHASE A: Router + Expert DMA enqueue (before shared FFN) ──
+        let expert_ff = config.expert_ff_dim;
+        let n_experts = config.n_experts;
+        let streamed_idx = if layer_idx >= moe_weights.n_resident {
+            Some(layer_idx - moe_weights.n_resident)
+        } else {
+            None
+        };
+
+        let selected_per_token = if seq_len == 1 {
+            // GPU router for decode: avoids full-stream sync from memcpy_dtoh
+            let gate_weights = unsafe { &*router_gates_ptr.add(layer_idx) };
+            let out_ids = unsafe { &mut *router_ids_ptr };
+            let out_weights = unsafe { &mut *router_weights_ptr };
+            let inv_sqrt_dim = 1.0f32 / (config.dim as f32).sqrt();
+            let softcap = config.router_logit_softcap.unwrap_or(0.0);
+            timed!(t_router, kernels.ops.fused_moe_router(
+                hidden,
+                &layer.moe_gate_scale,
+                gate_weights,
+                out_ids,
+                out_weights,
+                config.dim,
+                config.n_experts,
+                config.n_experts_per_tok,
+                config.rms_norm_eps,
+                inv_sqrt_dim,
+                softcap,
+            ))?;
+            // Small D2H copy (top_k ints + top_k floats) — no full-stream sync
+            let top_k = config.n_experts_per_tok as usize;
+            let mut ids_host = vec![0i32; top_k];
+            let mut weights_host = vec![0.0f32; top_k];
+            stream.memcpy_dtoh(&out_ids.slice(..top_k), &mut ids_host)
+                .map_err(|e| KernelError::Launch(e.to_string()))?;
+            stream.memcpy_dtoh(&out_weights.slice(..top_k), &mut weights_host)
+                .map_err(|e| KernelError::Launch(e.to_string()))?;
+            let selected: Vec<(usize, f32)> = ids_host.iter().zip(weights_host.iter())
+                .map(|(&id, &w)| (id as usize, w))
+                .collect();
+            vec![selected]
+        } else {
+            // CPU router for prefill (batch > 1)
+            let mut hidden_host = vec![0.0f32; (seq_len * config.dim) as usize];
+            stream.memcpy_dtoh(&hidden.slice(..), &mut hidden_host)
+                .map_err(|e| KernelError::Launch(e.to_string()))?;
+            timed!(t_router, Ok::<_, KernelError>(compute_router_topk_cpu(&hidden_host, layer, config, seq_len)))?
+        };
+        if seq_len == 1 {
+            let current: Vec<usize> = selected_per_token[0].iter().map(|(expert_id, _)| *expert_id).collect();
+            let prev = &moe_weights.prev_selected_experts[layer_idx];
+            if !prev.is_empty() {
+                for expert_id in current.iter() {
+                    if prev.contains(expert_id) {
+                        expert_overlap_hits += 1;
+                    }
+                }
+                expert_overlap_total += current.len() as u32;
+            }
+            moe_weights.prev_selected_experts[layer_idx] = current;
+        } else {
+            moe_weights.prev_selected_experts[layer_idx].clear();
+        }
+
+        // For DECODE (seq_len==1): reserve + enqueue DMA now, overlaps with shared FFN (Phase A/B/C)
+        // For PREFILL (seq_len>1): defer reservation to per-token expert loop (HEAD-style interlocked)
+        // to avoid cross-token slot stomping.
+        let mut decode_selected_slots: Vec<usize> = Vec::new();
+        let mut decode_selected_cache_hits: Vec<bool> = Vec::new();
+        if seq_len == 1 {
+            let dma_stream = Arc::clone(&moe_weights.expert_dma_stream);
+            let host_layer_data = &moe_weights.host_layer_data;
+            let expert_slots = &mut moe_weights.expert_slots;
+            let selected = &selected_per_token[0];
+            if let (Some(layout), Some(streamed_idx)) = (&streamed_layout, streamed_idx) {
+                let mut misses = Vec::with_capacity(selected.len());
+                for &(expert_id, _) in selected.iter() {
+                    let mut cache_hit = false;
+                    let slot_idx = reserve_streamed_expert_slot(
+                        expert_slots,
+                        streamed_idx,
+                        expert_id,
+                        &decode_selected_slots,
+                        &mut cache_hit,
+                    )?;
+                    if cache_hit { expert_cache_hits += 1; } else { expert_cache_misses += 1; }
+                    if !cache_hit {
+                        misses.push((expert_id, slot_idx));
+                    }
+                    decode_selected_slots.push(slot_idx);
+                    decode_selected_cache_hits.push(cache_hit);
+                }
+                misses.sort_unstable_by_key(|&(expert_id, _)| expert_id);
+                for (expert_id, slot_idx) in misses {
+                    let ev = enqueue_streamed_expert_prefetch(
+                        &dma_stream,
+                        host_layer_data,
+                        expert_slots,
+                        layout,
+                        expert_id,
+                        slot_idx,
+                        n_experts,
+                        None,
+                    )?;
+                    expert_slots[slot_idx].ready = Some(ev);
+                }
+            }
+        }
+
+        // ── PHASE B: Shared MLP (expert DMA overlaps!) ──
+        // norm(attn_out) → gate+up → GELU → down → post_ffw_norm_1
         if seq_len == 1 && is_resident {
             let x_q8 = kernels.gemv.x_q8_mut();
             timed!(t_norm, kernels.ops.rms_norm_f32in_q8(
@@ -1445,7 +1680,6 @@ pub fn forward_moe_streaming(
             seq_len * config.ff_dim,
         ))?;
 
-        // cur_mlp → ffn_out
         if seq_len == 1 && is_resident {
             timed!(t_gemm, kernels.gemv.quantize_input(&scratch.ffn_silu_out, config.ff_dim))?;
         }
@@ -1454,7 +1688,7 @@ pub fn forward_moe_streaming(
             seq_len, config.dim, config.ff_dim))?;
         if profile { t_gemm_ffn_down += t_gemm - _g0; }
 
-        // RMSNorm the shared MLP output (post_ffw_norm_1): ffn_out → attn_out → ffn_out
+        // RMSNorm shared MLP output (post_ffw_norm_1): ffn_out → attn_out → ffn_out
         timed!(t_norm, kernels.ops.rms_norm(
             &scratch.ffn_out, &layer.post_ffw_norm_1, &mut scratch.attn_out,
             seq_len, config.dim, config.rms_norm_eps,
@@ -1471,107 +1705,70 @@ pub fn forward_moe_streaming(
             info!(layer_idx, ?h, "decode hidden before MoE");
         }
 
-        // ── 9b. MoE Router ──
+        // ── PHASE C: MoE input norm + Expert compute ──
         {
-        // Router operates on attn_out (= hidden), NOT on the MLP output
-        // llama.cpp: tmp = rms_norm(attn_out) * (1/sqrt(n_embd)) * gate_inp_scale
-        //            logits = tmp @ gate_inp
         {
-            let expert_ff = config.expert_ff_dim;
-            let n_experts = config.n_experts;
-
-            let mut hidden_host = vec![0.0f32; (seq_len * config.dim) as usize];
-            stream.memcpy_dtoh(&hidden.slice(..), &mut hidden_host)
-                .map_err(|e| KernelError::Launch(e.to_string()))?;
-            let selected_per_token = timed!(t_router, Ok::<_, KernelError>(compute_router_topk_cpu(&hidden_host, layer, config, seq_len)))?;
-            if seq_len == 1 {
-                let current: Vec<usize> = selected_per_token[0].iter().map(|(expert_id, _)| *expert_id).collect();
-                let prev = &moe_weights.prev_selected_experts[layer_idx];
-                if !prev.is_empty() {
-                    for expert_id in current.iter() {
-                        if prev.contains(expert_id) {
-                            expert_overlap_hits += 1;
-                        }
-                    }
-                    expert_overlap_total += current.len() as u32;
-                }
-                moe_weights.prev_selected_experts[layer_idx] = current;
-            } else {
-                moe_weights.prev_selected_experts[layer_idx].clear();
-            }
-            let dma_stream = Arc::clone(&moe_weights.expert_dma_stream);
-            let host_layer_data = &moe_weights.host_layer_data;
             let expert_slots = &mut moe_weights.expert_slots;
-            // ── 9c. MoE FFN input (separate norm on attn_out) ──
-            // cur_moe_input = pre_ffw_norm_2(attn_out)
+            let dma_stream_c = Arc::clone(&moe_weights.expert_dma_stream);
+            let host_layer_data_c = &moe_weights.host_layer_data;
+
+            // MoE FFN input norm: pre_ffw_norm_2(hidden) → norm_out
             timed!(t_norm, kernels.ops.rms_norm_f32in(
                 hidden, &layer.pre_ffw_norm_2, &mut scratch.norm_out,
                 seq_len, config.dim, config.rms_norm_eps,
             ))?;
-            // norm_out now holds cur_moe input
 
-            // ── 9d. Expert selection (CPU for decode) ──
-            // Route each token through its top-k experts
             for tok in 0..seq_len as usize {
-                // For multi-token prefill: copy this token's MoE input to start of norm_out
-                // so Expert GEMMs (M=1) see the right data
                 if seq_len > 1 && tok > 0 {
                     let d = config.dim as usize;
                     let src = scratch.norm_out.slice(tok * d..(tok + 1) * d);
                     let mut dst = scratch.attn_out.slice_mut(0..d);
                     timed!(t_add, stream.memcpy_dtod(&src, &mut dst))
                         .map_err(|e| KernelError::Launch(e.to_string()))?;
-                    // Copy back to norm_out[0..d] for Expert GEMMs
                     let src2 = scratch.attn_out.slice(0..d);
                     let mut dst2 = scratch.norm_out.slice_mut(0..d);
                     timed!(t_add, stream.memcpy_dtod(&src2, &mut dst2))
                         .map_err(|e| KernelError::Launch(e.to_string()))?;
                 }
-                // ── 9e. Expert computation ──
+
                 let selected = &selected_per_token[tok];
-                let mut first_expert = true;
-                let mut selected_slots = Vec::with_capacity(selected.len());
-                let mut selected_cache_hits = Vec::with_capacity(selected.len());
-                let streamed_idx = if layer_idx >= moe_weights.n_resident {
-                    Some(layer_idx - moe_weights.n_resident)
-                } else {
-                    None
-                };
-                if let (Some(layout), Some(streamed_idx)) = (&streamed_layout, streamed_idx) {
-                    let mut misses = Vec::with_capacity(selected.len());
-                    for &(expert_id, _) in selected.iter() {
-                        let mut cache_hit = false;
-                        let slot_idx = reserve_streamed_expert_slot(
-                            expert_slots,
-                            streamed_idx,
-                            expert_id,
-                            &selected_slots,
-                            &mut cache_hit,
-                        )?;
-                        if profile {
+
+                // For prefill: reserve+DMA per-token (HEAD-style interlocked)
+                // For decode: use pre-reserved slots from Phase A
+                let (selected_slots_owned, selected_cache_hits_owned);
+                let (selected_slots, selected_cache_hits): (&[usize], &[bool]) = if seq_len > 1 {
+                    let mut slots = Vec::with_capacity(selected.len());
+                    let mut hits = Vec::with_capacity(selected.len());
+                    if let (Some(layout), Some(streamed_idx)) = (&streamed_layout, streamed_idx) {
+                        let mut misses = Vec::with_capacity(selected.len());
+                        for &(expert_id, _) in selected.iter() {
+                            let mut cache_hit = false;
+                            let slot_idx = reserve_streamed_expert_slot(
+                                expert_slots, streamed_idx, expert_id,
+                                &slots, &mut cache_hit,
+                            )?;
                             if cache_hit { expert_cache_hits += 1; } else { expert_cache_misses += 1; }
+                            if !cache_hit { misses.push((expert_id, slot_idx)); }
+                            slots.push(slot_idx);
+                            hits.push(cache_hit);
                         }
-                        if !cache_hit {
-                            misses.push((expert_id, slot_idx));
+                        misses.sort_unstable_by_key(|&(eid, _)| eid);
+                        for (eid, sid) in misses {
+                            let ev = enqueue_streamed_expert_prefetch(
+                                &dma_stream_c, host_layer_data_c, expert_slots,
+                                layout, eid, sid, n_experts, None,
+                            )?;
+                            expert_slots[sid].ready = Some(ev);
                         }
-                        selected_slots.push(slot_idx);
-                        selected_cache_hits.push(cache_hit);
                     }
-                    misses.sort_unstable_by_key(|&(expert_id, _)| expert_id);
-                    for (expert_id, slot_idx) in misses {
-                        let ev = enqueue_streamed_expert_prefetch(
-                            &dma_stream,
-                            host_layer_data,
-                            expert_slots,
-                            layout,
-                            expert_id,
-                            slot_idx,
-                            n_experts,
-                            None,
-                        )?;
-                        expert_slots[slot_idx].ready = Some(ev);
-                    }
-                }
+                    selected_slots_owned = slots;
+                    selected_cache_hits_owned = hits;
+                    (&selected_slots_owned, &selected_cache_hits_owned)
+                } else {
+                    (&decode_selected_slots[..], &decode_selected_cache_hits[..])
+                };
+
+                let mut first_expert = true;
                 for (expert_pos, &(expert_id, weight)) in selected.iter().enumerate() {
                     let mut w_norm = weight;
                     if let Some(&exp_scale) = layer.moe_down_scale.get(expert_id) {
@@ -1579,7 +1776,7 @@ pub fn forward_moe_streaming(
                     }
 
                     let slot_idx = if streamed_layout.is_some() { selected_slots[expert_pos] } else { expert_pos };
-                    let resident_slices = if streamed_layout.is_some() {
+                    if streamed_layout.is_some() {
                         if let Some(ready) = expert_slots[slot_idx].ready.as_ref() {
                             let _e0 = t_expert;
                             timed!(t_expert, stream.wait(ready)).map_err(|e| KernelError::Launch(e.to_string()))?;
@@ -1598,18 +1795,7 @@ pub fn forward_moe_streaming(
                                 }
                             }
                         }
-                        None
-                    } else {
-                        let resident_gu_info = expert_slice_info(&layer.moe_gate_up_exps, expert_id as u32, n_experts);
-                        let resident_dn_info = expert_slice_info(&layer.moe_down_exps, expert_id as u32, n_experts);
-                        let resident_gate_up = layer.moe_gate_up_exps.data.slice(
-                            resident_gu_info.byte_offset..resident_gu_info.byte_offset + resident_gu_info.byte_size
-                        );
-                        let resident_down = layer.moe_down_exps.data.slice(
-                            resident_dn_info.byte_offset..resident_dn_info.byte_offset + resident_dn_info.byte_size
-                        );
-                        Some((resident_gate_up, resident_gu_info, resident_down, resident_dn_info))
-                    };
+                    }
 
                     let fused_dim = expert_ff * 2;
                     let _e0 = t_expert;
@@ -1621,45 +1807,43 @@ pub fn forward_moe_streaming(
                             &mut scratch.ffn_gate_out, 1, fused_dim, config.dim, &kernels.dequant,
                         ))?;
                     } else {
-                        let (resident_gate_up, resident_gu_info, _, _) = resident_slices.as_ref().unwrap();
+                        let resident_gu_info = expert_slice_info(&layer.moe_gate_up_exps, expert_id as u32, n_experts);
+                        let resident_gate_up = layer.moe_gate_up_exps.data.slice(
+                            resident_gu_info.byte_offset..resident_gu_info.byte_offset + resident_gu_info.byte_size
+                        );
                         timed!(t_expert, kernels.gemm.matmul_dequant_view(
-                            &scratch.norm_out, resident_gate_up,
+                            &scratch.norm_out, &resident_gate_up,
                             resident_gu_info.quant_type, resident_gu_info.n_elements,
                             &mut scratch.ffn_gate_out, 1, fused_dim, config.dim, &kernels.dequant,
                         ))?;
                     }
                     if profile { t_expert_gate_up += t_expert - _e0; }
 
-                    let n = expert_ff as usize;
                     let _e0 = t_expert;
-                    timed!(t_expert, stream.memcpy_dtod(
-                        &scratch.ffn_gate_out.slice(0..n),
-                        &mut scratch.ffn_silu_out.slice_mut(0..n),
-                    )).map_err(|e| KernelError::Launch(e.to_string()))?;
-                    timed!(t_expert, stream.memcpy_dtod(
-                        &scratch.ffn_gate_out.slice(n..n*2),
-                        &mut scratch.ffn_up_out.slice_mut(0..n),
-                    )).map_err(|e| KernelError::Launch(e.to_string()))?;
-                    if profile { t_expert_split += t_expert - _e0; }
-                    let _e0 = t_expert;
-                    timed!(t_expert, kernels.ops.gelu(
-                        &scratch.ffn_silu_out, &scratch.ffn_up_out, &mut scratch.ffn_gate_out,
-                        expert_ff,
+                    // Fused split+gelu: ffn_gate_out [1, 2*expert_ff] → ffn_silu_out [1, expert_ff]
+                    timed!(t_expert, kernels.ops.gelu_split_batch(
+                        &scratch.ffn_gate_out, &mut scratch.ffn_silu_out,
+                        expert_ff, 1,
                     ))?;
-                    if profile { t_expert_act += t_expert - _e0; }
+                    if profile { t_expert_split += t_expert - _e0; }
+                    // t_expert_act is included in split now (fused)
+                    if profile { t_expert_act += 0; }
 
                     let _e0 = t_expert;
                     if streamed_layout.is_some() {
                         let down_qw = &expert_slots[slot_idx].down;
                         timed!(t_expert, kernels.gemm.matmul_dequant(
-                            &scratch.ffn_gate_out, &down_qw.data,
+                            &scratch.ffn_silu_out, &down_qw.data,
                             down_qw.quant_type, down_qw.n_elements,
                             &mut scratch.attn_out, 1, config.dim, expert_ff, &kernels.dequant,
                         ))?;
                     } else {
-                        let (_, _, resident_down, resident_dn_info) = resident_slices.as_ref().unwrap();
+                        let resident_dn_info = expert_slice_info(&layer.moe_down_exps, expert_id as u32, n_experts);
+                        let resident_down = layer.moe_down_exps.data.slice(
+                            resident_dn_info.byte_offset..resident_dn_info.byte_offset + resident_dn_info.byte_size
+                        );
                         timed!(t_expert, kernels.gemm.matmul_dequant_view(
-                            &scratch.ffn_gate_out, resident_down,
+                            &scratch.ffn_silu_out, &resident_down,
                             resident_dn_info.quant_type, resident_dn_info.n_elements,
                             &mut scratch.attn_out, 1, config.dim, expert_ff, &kernels.dequant,
                         ))?;
@@ -1685,10 +1869,8 @@ pub fn forward_moe_streaming(
                     }
                 }
 
-                // For multi-token: copy MoE result from position 0 to correct token offset
                 if seq_len > 1 && tok > 0 {
                     let d = config.dim as usize;
-                    // attn_mha_out[0..d] → attn_out[0..d] → attn_mha_out[tok*d..(tok+1)*d]
                     let src = scratch.attn_mha_out.slice(0..d);
                     let mut tmp = scratch.attn_out.slice_mut(0..d);
                     timed!(t_add, stream.memcpy_dtod(&src, &mut tmp))
@@ -1699,13 +1881,6 @@ pub fn forward_moe_streaming(
                         .map_err(|e| KernelError::Launch(e.to_string()))?;
                 }
             }
-            // attn_mha_out now holds cur_moe (weighted expert sum) for all tokens
-
-            // Sync to catch any pending CUDA errors from expert loop
-            timed!(t_expert, stream.synchronize()).map_err(|e| {
-                tracing::error!(%e, "CUDA error after expert loop");
-                KernelError::Launch(e.to_string())
-            })?;
 
             // RMSNorm cur_moe (post_ffw_norm_2): attn_mha_out → norm_out
             timed!(t_norm, kernels.ops.rms_norm(
@@ -1713,9 +1888,7 @@ pub fn forward_moe_streaming(
                 seq_len, config.dim, config.rms_norm_eps,
             ))?;
 
-            // ── 9f. Combine: cur = cur_mlp + cur_moe ──
-            // ffn_out = cur_mlp, norm_out = normed cur_moe
-            // Result into ffn_out
+            // Combine: cur = cur_mlp + cur_moe
             timed!(t_add, kernels.ops.add_f16(&scratch.norm_out, &scratch.ffn_out, &mut scratch.attn_out,
                 seq_len * config.dim))?;
             // Copy result back to ffn_out for post-FFN norm
@@ -1903,6 +2076,19 @@ pub fn forward_moe_streaming(
             resident = moe_weights.n_resident,
             "PROFILE decode step (gemma4_moe)"
         );
+    } else if seq_len == 1 && (expert_cache_hits > 0 || expert_cache_misses > 0) {
+        let total = expert_cache_hits + expert_cache_misses;
+        let hit_pct = if total > 0 { expert_cache_hits as f32 / total as f32 * 100.0 } else { 0.0 };
+        tracing::debug!(
+            expert_cache_hits,
+            expert_cache_misses,
+            hit_pct = format_args!("{hit_pct:.1}%"),
+            slots = moe_weights.expert_slots.len(),
+            gen = moe_weights.expert_cache_generation,
+            expert_overlap_hits,
+            expert_overlap_total,
+            "expert cache stats"
+        );
     }
 
     Ok(())
@@ -1964,6 +2150,7 @@ fn reserve_streamed_expert_slot(
 ) -> Result<usize, KernelError> {
     let now = expert_slots.iter().map(|s| s.age).max().unwrap_or(0).wrapping_add(1);
 
+    // Cache hit — update age and return
     for (slot_idx, slot) in expert_slots.iter_mut().enumerate() {
         if slot.cached_streamed_idx == Some(streamed_idx) && slot.cached_expert_id == Some(expert_id) {
             slot.age = now;
@@ -1972,21 +2159,45 @@ fn reserve_streamed_expert_slot(
         }
     }
 
+    // Eviction: 1) Empty, 2) Stale same-layer (safe to evict), 3) Global LRU
     let mut victim = None;
     let mut victim_age = u64::MAX;
+
+    // Priority 1: empty slot
     for (slot_idx, slot) in expert_slots.iter().enumerate() {
-        if protected_slots.contains(&slot_idx) {
-            continue;
-        }
+        if protected_slots.contains(&slot_idx) { continue; }
         if slot.cached_streamed_idx.is_none() {
             victim = Some(slot_idx);
             break;
         }
-        if slot.age < victim_age {
-            victim_age = slot.age;
-            victim = Some(slot_idx);
+    }
+
+    // Priority 2: stale same-layer entry (different expert, guaranteed not needed this token)
+    if victim.is_none() {
+        for (slot_idx, slot) in expert_slots.iter().enumerate() {
+            if protected_slots.contains(&slot_idx) { continue; }
+            if slot.cached_streamed_idx == Some(streamed_idx)
+                && slot.cached_expert_id != Some(expert_id)
+                && slot.age < victim_age
+            {
+                victim_age = slot.age;
+                victim = Some(slot_idx);
+            }
         }
     }
+
+    // Priority 3: global LRU fallback
+    if victim.is_none() {
+        victim_age = u64::MAX;
+        for (slot_idx, slot) in expert_slots.iter().enumerate() {
+            if protected_slots.contains(&slot_idx) { continue; }
+            if slot.age < victim_age {
+                victim_age = slot.age;
+                victim = Some(slot_idx);
+            }
+        }
+    }
+
     let slot_idx = victim.unwrap_or(0);
     let slot = &mut expert_slots[slot_idx];
     slot.cached_streamed_idx = Some(streamed_idx);
