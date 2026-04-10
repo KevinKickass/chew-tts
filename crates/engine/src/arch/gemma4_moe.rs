@@ -950,11 +950,17 @@ pub fn forward_moe_streaming(
                 let mut indexed: Vec<(usize, f32)> = probs.iter().cloned().enumerate().collect();
                 indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
                 let selected: Vec<(usize, f32)> = indexed.into_iter().take(top_k as usize).collect();
+                // Renormalize top-k weights to sum to 1 (matches HuggingFace reference)
+                let sel_sum: f32 = selected.iter().map(|(_, w)| w).sum();
+
                 // ── 9e. Expert computation ──
-                // Use raw softmax weights (no renormalization — matches llama.cpp)
                 let mut first_expert = true;
                 for &(expert_id, weight) in &selected {
-                    let w_norm = weight; // raw softmax probability
+                    // Normalize weight + apply per-expert scale to WEIGHT (not output)
+                    let mut w_norm = weight / sel_sum;
+                    if let Some(&exp_scale) = layer.moe_down_scale.get(expert_id) {
+                        w_norm *= exp_scale;
+                    }
 
                     // Copy expert gate_up slice to scratch
                     let gu_info = expert_slice_info(&layer.moe_gate_up_exps, expert_id as u32, n_experts);
@@ -1011,14 +1017,7 @@ pub fn forward_moe_streaming(
                         &mut scratch.attn_out, 1, config.dim, expert_ff, &kernels.dequant,
                     )?;
 
-                    // Apply per-expert down scale (ffn_down_exps.scale)
-                    if let Some(&exp_scale) = layer.moe_down_scale.get(expert_id) {
-                        let src_ptr = &scratch.attn_out as *const CudaSlice<half::f16>;
-                        let dst_ptr = &mut scratch.attn_out as *mut CudaSlice<half::f16>;
-                        unsafe { kernels.ops.scale_f16(&*src_ptr, &mut *dst_ptr, config.dim, exp_scale)?; }
-                    }
-
-                    // Weighted accumulate into attn_mha_out (reuse as moe accumulator)
+                    // Weighted accumulate (per-expert scale already applied to w_norm above) into attn_mha_out (reuse as moe accumulator)
                     if first_expert {
                         kernels.ops.scale_f16(&scratch.attn_out, &mut scratch.attn_mha_out,
                             config.dim, w_norm)?;
