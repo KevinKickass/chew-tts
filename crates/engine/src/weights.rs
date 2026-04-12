@@ -2,7 +2,7 @@ use crate::config::ModelConfig;
 use crate::vram_plan::StreamingPlan;
 use chew_gguf::{GgmlType, GgufFile, GgufError};
 use chew_vram::VramAllocator;
-use cudarc::driver::{CudaSlice, CudaStream};
+use cudarc::driver::{CudaEvent, CudaSlice, CudaStream};
 use chew_kernel::{DequantKernels, KernelError};
 use std::sync::Arc;
 use tracing::info;
@@ -135,6 +135,14 @@ pub struct StreamingLayerNorms {
 ///
 /// All layer norms are always on GPU (tiny, ~0.8MB total) so the forward pass
 /// can fuse residual-add + RMSNorm for the next layer without waiting for DMA.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamingShellSlot {
+    pub loaded: Option<usize>,
+    pub in_flight: Option<usize>,
+    pub locked: bool,
+    pub last_used_tick: u64,
+}
+
 pub struct StreamingWeights {
     // Always on GPU (same as ModelWeights)
     pub token_embd: CudaSlice<half::f16>,
@@ -155,6 +163,9 @@ pub struct StreamingWeights {
     // Double-buffer GPU shells for streaming layers
     pub shell_a: LayerWeights,
     pub shell_b: LayerWeights,
+    pub dma_stream: Arc<CudaStream>,
+    pub shell_ready: [Option<CudaEvent>; 2],
+    pub shell_slots: [StreamingShellSlot; 2],
 
     // Gemma4 specific (same as ModelWeights)
     pub per_layer_token_embd: Option<QuantWeight>,
@@ -439,6 +450,8 @@ impl StreamingWeights {
         let stream = alloc.stream(gpu_idx);
         let shell_a = allocate_layer_shell(config, plan.max_layer_bytes as usize, stream, is_gemma4)?;
         let shell_b = allocate_layer_shell(config, plan.max_layer_bytes as usize, stream, is_gemma4)?;
+        let dma_stream = stream.context().new_stream()
+            .map_err(|e| LoadError::Vram(chew_vram::VramError::Alloc(e.to_string())))?;
 
         info!("streaming weights loaded: {} resident, {} streamed",
             n_resident, n_layers - n_resident);
@@ -454,6 +467,12 @@ impl StreamingWeights {
             host_layer_offsets,
             shell_a,
             shell_b,
+            dma_stream,
+            shell_ready: [None, None],
+            shell_slots: [
+                StreamingShellSlot { loaded: None, in_flight: None, locked: false, last_used_tick: 0 },
+                StreamingShellSlot { loaded: None, in_flight: None, locked: false, last_used_tick: 0 },
+            ],
             per_layer_token_embd,
             per_layer_model_proj,
             per_layer_proj_norm,

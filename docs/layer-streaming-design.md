@@ -1,139 +1,206 @@
-# Layer Streaming: GPU/CPU Mixed Inference
+# Layer Streaming: GGUF-Driven Residency and Honest Limits
 
-Run models that don't fit in VRAM by using an adaptive weight cache.
+Layer streaming in `chew` is driven by the model as it actually exists in GGUF, not by an idealized splitter.
 
-## When to use
+## Core principle
 
-| Model | Weights | Fits 10GB VRAM? | Mode |
-|-------|---------|-----------------|------|
-| Llama 3.1 8B Q4_K | 4.5G | ✓ | normal |
-| Gemma 4 E4B Q4_K | 4.6G | ✓ | normal |
-| Magistral Small 24B Q4_K | 13.3G | ❌ | **streaming** |
-| OLMo 3 32B Q4_K | 18.1G | ❌ | **streaming** |
+`chew` does **not** assume models can be arbitrarily chopped into tiny interchangeable pieces.
+It reads the tensor and stack layout from GGUF and streams at the granularity the artifact actually provides.
 
-## Architecture: Adaptive Weight Cache
+That means:
 
-NOT a fixed 2-slot ping-pong. Instead: **fill VRAM with as many layers as possible**, stream only the rest.
+- fill VRAM with as much permanently resident data as possible
+- keep fixed state resident first: KV cache, scratch, embeddings, norms, workspaces
+- keep as many layers / model blocks resident as the remaining VRAM allows
+- stream only the non-resident remainder
+- keep compute on GPU; only weight storage/transport spills to host RAM
 
-```
-VRAM:
-┌──────────────────────────────────┐
-│ Fixed: KV Cache + Scratch + Emb  │  ~2.5 GB (always resident)
-├──────────────────────────────────┤
-│ Weight Cache: max layers         │  ~5-7 GB (depends on model/ctx)
-│ [L0][L1][L2]...[LN-1]           │  e.g. 44 of 48 layers for 24B
-├──────────────────────────────────┤
-│ DMA Buffer: 2 streaming slots    │  ~0.3 GB (for non-resident layers)
-└──────────────────────────────────┘
-```
+This is the design goal:
 
-### Key insight
+> Use VRAM as aggressively as possible, then degrade honestly into streaming.
 
-For Magistral 24B on 10GB VRAM:
-- Fixed overhead: ~2.5GB
-- Available for weights: ~7.2GB
-- Per layer: ~161MB
-- **44 of 48 layers fit permanently** in VRAM
-- Only 4 layers need streaming
-- 4 × 6.4ms PCIe transfer = 25.6ms extra per token
-- During the 44 resident layers (~8.8ms compute), we can preload ~1.4 streamed layers
-- **Effective: ~35-40 tok/s** (vs 3.3 tok/s with naive 2-slot design)
+## Why this matters
 
-### Predictive preloading
+Many inference stacks behave like a black box:
 
-```
-Resident layers:  [L0] [L1] ... [L43]     ← GPU compute, no DMA needed
-                                     ↓ during this compute time, DMA streams ahead:
-DMA stream:       ............[L44→slot A] [L45→slot B]
-                  
-Streamed layers:  [L44 from A] [L45 from B] [L46→A preloaded] [L47→B preloaded]
-```
+- try to load
+- allocate a lot
+- maybe OOM
+- maybe suggest random flags
+- give poor visibility into what actually fit and what did not
 
-While GPU executes the resident layers, the DMA stream prefetches the first streamed layers. By the time GPU reaches L44, it's already in VRAM.
+`chew` takes the opposite approach:
 
-### Algorithm
+- inspect GGUF metadata first
+- compute a concrete VRAM plan
+- decide what can remain resident
+- stream only what really must move
+- expose the resulting constraint to the operator
 
-```
-1. At load time:
-   - Calculate: n_resident = (vram_free - fixed - 2*layer_size) / layer_size
-   - Load layers 0..n_resident directly to VRAM (permanent)
-   - Allocate 2 DMA slots for remaining layers
-   - Copy all layer weights to pinned host RAM
+The point is not magical success on every model.
+The point is to know **before and during runtime** what the system is doing.
 
-2. At decode time:
-   for layer in 0..n_layers:
-     if layer < n_resident:
-       // Fast path: weights already in VRAM
-       execute_layer(resident_weights[layer])
-       // Predictive: if close to end of resident zone, start DMA
-       if layer == n_resident - 2:
-         dma_stream.copy(host[n_resident] → slot_a)
-     else:
-       // Streaming path: use DMA slot
-       slot = (layer - n_resident) % 2
-       compute_stream.wait(event[slot])  // wait for DMA
-       execute_layer(slot_weights[slot])
-       // Prefetch next streamed layer
-       next_stream = n_resident + ((layer - n_resident) + 2)
-       if next_stream < n_layers:
-         dma_stream.copy(host[next_stream] → slot[other])
-         dma_stream.record(event[other])
-```
+## Streaming is constrained by GGUF reality
 
-## VRAM Budget (Magistral Small 24B, 4k context)
+Streaming granularity comes from the structure encoded in GGUF:
 
-| Component | Size |
-|-----------|------|
-| Token embeddings (Q4_K) | 378 MB |
-| Output projection (Q4_K) | 378 MB |
-| Norms (all layers, f16) | 2 MB |
-| KV cache (4k context) | 960 MB |
-| Scratch + cuBLAS | 165 MB |
-| Driver headroom | 256 MB |
-| **Fixed total** | **~2,139 MB** |
-| Available for weights | **~7,731 MB** |
-| Per-layer weight size | 161 MB |
-| 2 DMA slots | 322 MB |
-| **Resident layers** | **(7731 - 322) / 161 = 46** |
-| Streamed layers | **2 of 48** |
+- tensor names
+- tensor sizes
+- layer/block grouping
+- architecture-specific stack layout
+- model-specific large tensor boundaries
 
-With only 2 layers streaming: 2 × 6.4ms = 12.8ms extra, fully hidden by prefetch during resident compute. **Effectively zero overhead** — near full GPU speed (~45-50 tok/s for 24B).
+So the useful split unit is often "whatever the model file naturally gives us", not "whatever would be convenient in theory".
 
-## Performance Estimates
+This matters a lot for larger models.
 
-| Model | Layers | Resident | Streamed | Extra latency | Est. tok/s |
-|-------|--------|----------|----------|---------------|-----------|
-| Magistral 24B Q4_K (4k ctx) | 48 | 46 | 2 | ~0ms (hidden) | **~45** |
-| Magistral 24B Q4_K (8k ctx) | 48 | 40 | 8 | ~25ms | **~30** |
-| OLMo 32B Q4_K (4k ctx) | 64 | 30 | 34 | ~180ms | **~5** |
-| OLMo 32B Q4_K (2k ctx) | 64 | 38 | 26 | ~130ms | **~7** |
+### Example: large chunked stacks
 
-## Implementation
+Some models expose very large natural chunks.
+For example, a stack may be effectively split into ~3 GB sections.
+In that case:
 
-### Files to modify
+- you cannot finely shuffle tiny subpieces in and out
+- only a small number of chunks may fit at once
+- throughput is then dominated by the non-resident remainder
+- this is a hardware/artifact constraint, not just a software policy
 
-| File | Change |
-|------|--------|
-| `vram_plan.rs` | `compute_streaming()`: calculate n_resident, slot sizes |
-| `weights.rs` | `StreamingWeights`: resident + host + slots |
-| `forward.rs` | `forward_streaming()`: fast path + DMA path |
-| `lib.rs` | Auto-fallback: try normal → try streaming |
+In other words:
 
-### CUDA Graph compatibility
+> If only two chunks fit, then only two chunks fit. After that, physics takes over.
 
-- **Resident layers**: CUDA Graph works (same pointers every time)
-- **Streamed layers**: no Graph (pointers change)
-- Hybrid: capture Graph for resident portion, fall through to non-graph for streamed layers
+## Residency strategy
 
-## OLMo2 Architecture
+`chew` uses an adaptive residency strategy instead of a naive fixed ping-pong design.
 
-OLMo2 differs from Llama in **norm placement**: post-norm instead of pre-norm.
+### Resident first
 
-```
-Llama:  x = x + attn(norm(x))     // norm BEFORE sublayer
-OLMo2:  x = x + norm(attn(x))     // norm AFTER sublayer
-```
+VRAM is allocated in this order:
 
-Needs: new `forward_olmo2()` or parameterized norm placement in `forward()`.
-New kernel: `rmsnorm_add_f32_f16` (norm the delta, add to residual).
-Weight loading: same tensor names, just different application order.
+1. fixed runtime state
+   - KV cache
+   - forward scratch
+   - dequant scratch
+   - cuBLAS workspace
+   - embeddings / norms / small always-hot tensors
+2. permanently resident model data
+   - as many layers / blocks as will fit
+3. streaming buffers
+   - DMA slots for the remaining non-resident layers / blocks
+
+The result is not "stream the whole model".
+It is:
+
+- keep as much as possible local
+- stream the minimum unavoidable tail
+
+This is especially important on smaller cards, where partial residency can be the difference between:
+
+- useful throughput
+- and complete collapse
+
+## Conservative first-pass, aggressive post-boot packing
+
+`chew` intentionally starts with a conservative fit calculation.
+It reserves headroom during the first planning step so the engine can boot reliably instead of gambling on a paper-perfect allocation.
+
+That means the first pass is deliberately cautious:
+
+- leave safety margin for runtime overhead
+- avoid loading right up against the cliff edge
+- prefer a successful start over a theoretical maximum residency count
+
+After boot, `chew` can look at the memory that is actually still free and opportunistically densify residency:
+
+- check real post-start free VRAM
+- see whether another resident layer / block fits safely
+- keep adding residents until the useful capacity is actually full
+
+So the runtime behavior is:
+
+1. conservative admission
+2. successful startup
+3. observed-memory recheck
+4. pack VRAM with as many residents as reality allows
+
+This is intentional.
+It is better to come up safely and then fill the card than to chase a fragile pre-boot optimum and crash during initialization.
+
+## Compute stays on GPU
+
+Streaming mode is **not** CPU inference.
+
+Host RAM is used as overflow storage for non-resident weights.
+The math still happens on the GPU:
+
+- weights move host -> device as needed
+- dequant / kernels / GEMM run on GPU
+- KV stays on GPU
+- forward compute stays on GPU
+
+So the fallback is:
+
+- storage spills to RAM
+- compute does not
+
+That keeps the degraded mode much more honest and performant than a full CPU fallback.
+
+## What the real limit becomes
+
+For dense models that fit, `chew` can run close to the speed of highly tuned baselines.
+For oversized or MoE models in streaming mode, the bottleneck often stops being raw compute and becomes:
+
+- host->device transfer bandwidth
+- chunk size / layer granularity
+- overlap quality between DMA and compute
+- how much of the model can remain resident
+
+On constrained hardware, this can produce a hard throughput ceiling even when the GPU appears fully busy.
+That does **not** automatically mean there is a bug.
+It may simply mean the pipeline is already saturating the available transport + compute path.
+
+## Operator-facing philosophy
+
+`chew` should tell the truth plainly:
+
+- what is resident
+- what is streamed
+- which granularity is imposed by the model artifact
+- what the steady-state and peak VRAM costs are
+- whether the likely bottleneck is VRAM fit, transfer bandwidth, or compute
+
+The goal is not to promise that every model will be fast on every card.
+The goal is to make the limits legible.
+
+## Architectural implication
+
+Different model families expose different realities:
+
+- dense vs MoE
+- per-layer embeddings vs standard embeddings
+- shared-KV vs explicit V projections
+- different stack layouts and split granularity
+
+Because of that, streaming logic should remain grounded in model-specific architecture modules where needed, while sharing generic infrastructure for:
+
+- VRAM planning
+- residency decisions
+- host buffer management
+- DMA slots
+- reporting
+
+In short:
+
+- generic infrastructure for the mechanism
+- model-specific logic for the truth of each architecture
+
+## Summary
+
+Layer streaming in `chew` is built on four rules:
+
+1. **Trust the GGUF artifact** rather than an imaginary ideal split
+2. **Max out useful residency** before streaming anything
+3. **Keep compute on GPU** even when storage spills to RAM
+4. **Report the real limit honestly** when throughput is bounded by chunk size, PCIe, or residency
+
+That makes streaming mode a controlled degradation path instead of an opaque failure mode.
