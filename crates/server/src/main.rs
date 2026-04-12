@@ -101,6 +101,7 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/", get(ui_handler))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/embeddings", post(embeddings))
         .route("/v1/models", get(list_models))
         .route("/health", get(health))
         .layer(CorsLayer::permissive())
@@ -142,6 +143,41 @@ fn default_top_p() -> f32 { 0.9 }
 struct ChatMessage {
     role: String,
     content: String,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum EmbeddingInput {
+    Single(String),
+    Batch(Vec<String>),
+}
+
+#[derive(Deserialize)]
+struct EmbeddingsRequest {
+    #[serde(default)]
+    model: String,
+    input: EmbeddingInput,
+}
+
+#[derive(Serialize)]
+struct EmbeddingObject {
+    object: String,
+    embedding: Vec<f32>,
+    index: usize,
+}
+
+#[derive(Serialize)]
+struct EmbeddingsUsage {
+    prompt_tokens: u32,
+    total_tokens: u32,
+}
+
+#[derive(Serialize)]
+struct EmbeddingsResponse {
+    object: String,
+    data: Vec<EmbeddingObject>,
+    model: String,
+    usage: EmbeddingsUsage,
 }
 
 #[derive(Serialize)]
@@ -490,6 +526,88 @@ struct ModelEntry {
     id: String,
     object: String,
     owned_by: String,
+}
+
+fn l2_normalize(v: &mut [f32]) {
+    let norm = v.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>().sqrt() as f32;
+    if norm > 0.0 {
+        for x in v {
+            *x /= norm;
+        }
+    }
+}
+
+fn mean_pool_last_hidden(hidden: &[f32], seq_len: usize, dim: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; dim];
+    if seq_len == 0 {
+        return out;
+    }
+    for t in 0..seq_len {
+        let row = &hidden[t * dim..(t + 1) * dim];
+        for (o, &x) in out.iter_mut().zip(row.iter()) {
+            *o += x;
+        }
+    }
+    let inv = 1.0 / seq_len as f32;
+    for x in &mut out {
+        *x *= inv;
+    }
+    l2_normalize(&mut out);
+    out
+}
+
+async fn embeddings(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<EmbeddingsRequest>,
+) -> Result<Json<EmbeddingsResponse>, AppError> {
+    let texts: Vec<String> = match req.input {
+        EmbeddingInput::Single(s) => vec![s],
+        EmbeddingInput::Batch(v) => v,
+    };
+
+    let model = if req.model.is_empty() {
+        format!("{}-embeddings", state.model_name)
+    } else {
+        req.model
+    };
+
+    let mut data = Vec::with_capacity(texts.len());
+    let mut total_tokens = 0u32;
+
+    for (index, text) in texts.iter().enumerate() {
+        let mut tokens = encode_prompt(&state.tokenizer, &state.model_arch, text)
+            .map_err(|e| AppError(format!("tokenize: {e}")))?;
+        if let Some(bos) = state.bos_token_id {
+            if tokens.first().copied() != Some(bos) {
+                tokens.insert(0, bos);
+            }
+        }
+        total_tokens += tokens.len() as u32;
+
+        let hidden = {
+            let mut engine = state.engine.lock().await;
+            engine
+                .encode_hidden(&tokens)
+                .map_err(|e| AppError(format!("embed: {e}")))?
+        };
+        let dim = hidden.len() / tokens.len().max(1);
+        let embedding = mean_pool_last_hidden(&hidden, tokens.len(), dim);
+        data.push(EmbeddingObject {
+            object: "embedding".into(),
+            embedding,
+            index,
+        });
+    }
+
+    Ok(Json(EmbeddingsResponse {
+        object: "list".into(),
+        data,
+        model,
+        usage: EmbeddingsUsage {
+            prompt_tokens: total_tokens,
+            total_tokens,
+        },
+    }))
 }
 
 async fn list_models(State(state): State<Arc<AppState>>) -> Json<ModelsResponse> {

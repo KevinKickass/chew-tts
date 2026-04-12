@@ -310,6 +310,54 @@ impl ChewEngine {
         })
     }
 
+    /// Encode tokens into final hidden states without sampling.
+    /// Returns the final hidden state tensor on CPU as row-major f32: [seq_len, dim].
+    pub fn encode_hidden(
+        &mut self,
+        input_tokens: &[u32],
+    ) -> Result<Vec<f32>, EngineError> {
+        self.kv_cache.reset();
+
+        let seq_len = input_tokens.len() as u32;
+        let token_ids_i32: Vec<i32> = input_tokens.iter().map(|&t| t as i32).collect();
+        let mut token_ids_gpu = self.stream
+            .alloc_zeros::<i32>(seq_len as usize)
+            .map_err(EngineError::Driver)?;
+        self.stream
+            .memcpy_htod(&token_ids_i32, &mut token_ids_gpu)
+            .map_err(EngineError::Driver)?;
+
+        let mut hidden = self.stream
+            .alloc_zeros::<f32>((seq_len * self.config.dim) as usize)
+            .map_err(EngineError::Driver)?;
+        self.kernels.ops.embed_tokens_f32(
+            self.weights.token_embd(),
+            &token_ids_gpu,
+            &mut hidden,
+            seq_len,
+            self.config.dim,
+        )?;
+
+        if self.config.is_gemma4() {
+            let scale = (self.config.dim as f32).sqrt();
+            self.kernels.ops.scale_f32_inplace(&mut hidden, seq_len * self.config.dim, scale)?;
+        }
+
+        let pe = if self.config.is_gemma4() {
+            self.compute_per_layer_embeddings(&token_ids_gpu, &hidden, seq_len)?
+        } else {
+            None
+        };
+
+        self.run_forward(&mut hidden, pe.as_ref(), seq_len)?;
+
+        let mut out = vec![0.0f32; (seq_len * self.config.dim) as usize];
+        self.stream
+            .memcpy_dtoh(&hidden, &mut out)
+            .map_err(EngineError::Driver)?;
+        Ok(out)
+    }
+
     /// Generate tokens from input token IDs.
     ///
     /// Returns generated token IDs (excluding the input).
