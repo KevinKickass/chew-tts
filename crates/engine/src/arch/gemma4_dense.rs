@@ -1,5 +1,6 @@
 use crate::config::ModelConfig;
-use crate::forward::{PerLayerEmbeddings, ScratchBuffers, gemm_q};
+use crate::arch::gemma4_common::PerLayerEmbeddings;
+use crate::forward::{ScratchBuffers, gemm_q};
 use crate::kv_cache::KvCache;
 use crate::weights::ModelWeights;
 use chew_kernel::{GpuKernels, KernelError};

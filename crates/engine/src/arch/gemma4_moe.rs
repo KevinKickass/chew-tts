@@ -1059,7 +1059,7 @@ fn resident_layer_gpu_bytes(gguf: &GgufFile, layer: usize) -> Result<u64, LoadEr
 // ─── Forward pass ───────────────────────────────────────────────────────────
 
 use crate::forward::{ScratchBuffers, gemm_q};
-use crate::forward::PerLayerEmbeddings;
+use crate::arch::gemma4_common::PerLayerEmbeddings;
 use crate::kv_cache::KvCache;
 use chew_kernel::{GpuKernels, KernelError};
 

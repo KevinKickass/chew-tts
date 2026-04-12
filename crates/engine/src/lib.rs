@@ -637,7 +637,7 @@ impl ChewEngine {
     fn run_forward(
         &mut self,
         hidden: &mut cudarc::driver::CudaSlice<f32>,
-        pe: Option<&forward::PerLayerEmbeddings>,
+        pe: Option<&arch::gemma4_common::PerLayerEmbeddings>,
         seq_len: u32,
     ) -> Result<(), EngineError> {
         // Dispatch by weight storage type
@@ -686,7 +686,7 @@ impl ChewEngine {
         token_ids_gpu: &cudarc::driver::CudaSlice<i32>,
         hidden_f32: &cudarc::driver::CudaSlice<f32>,
         n_tokens: u32,
-    ) -> Result<Option<forward::PerLayerEmbeddings>, EngineError> {
+    ) -> Result<Option<arch::gemma4_common::PerLayerEmbeddings>, EngineError> {
         let epl = match self.config.embd_per_layer {
             Some(e) => e,
             None => return Ok(None),
@@ -848,7 +848,7 @@ impl ChewEngine {
                 }
             }
 
-            Ok(Some(forward::PerLayerEmbeddings {
+            Ok(Some(arch::gemma4_common::PerLayerEmbeddings {
                 data: result,
                 epl,
                 row_width,
@@ -866,7 +866,7 @@ impl ChewEngine {
                 }
             }
 
-            Ok(Some(forward::PerLayerEmbeddings {
+            Ok(Some(arch::gemma4_common::PerLayerEmbeddings {
                 data: tok_embd,
                 epl,
                 row_width,
