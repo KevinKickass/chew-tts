@@ -385,9 +385,17 @@ impl ChewEngine {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(eb.steps);
+        let envf = |k: &str, d: f32| {
+            std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+        };
+        // Tunables: temp schedule length (was stretched over max steps -> temp
+        // stayed high -> slow convergence), early-stop confidence + stability.
+        let sched = envf("CHEW_DIFF_SCHED", s as f32).max(1.0);
+        let conf = envf("CHEW_DIFF_CONF", eb.confidence);
+        let stab = envf("CHEW_DIFF_STAB", eb.stability as f32) as u32;
         for step_idx in 0..s {
-            let cur_step = s - step_idx;
-            let t = eb.t_min + (eb.t_max - eb.t_min) * (cur_step as f32 / s as f32);
+            let frac = (step_idx as f32 / sched).min(1.0);
+            let t = eb.t_max + (eb.t_min - eb.t_max) * frac;
             let temp_inv = 1.0 / t;
             let sc_use = if step_idx == 0 || no_sc { 0.0 } else { 1.0 };
 
@@ -523,9 +531,9 @@ impl ChewEngine {
             }
             let stable = prev_argmax.as_ref() == Some(&step.argmax);
             held = if stable { held + 1 } else { 0 };
-            let confident = step.mean_entropy < eb.confidence;
+            let confident = step.mean_entropy < conf;
             prev_argmax = Some(step.argmax);
-            if held >= eb.stability && confident {
+            if held >= stab && confident {
                 break;
             }
         }
