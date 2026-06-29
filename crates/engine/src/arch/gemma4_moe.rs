@@ -1769,7 +1769,10 @@ pub fn forward_moe_streaming(
     let decode_gpu_router = seq_len == 1 && std::env::var("CHEW_NO_GPU_ROUTER_DECODE").is_err();
     // Prefill GPU router is opt-in for now: per-token GPU routing can regress
     // vs. the vectorized CPU path on some setups.
-    let prefill_gpu_router = seq_len > 1 && std::env::var("CHEW_GPU_ROUTER_PREFILL").is_ok();
+    // GPU router for prefill: default ON for diffusion (the CPU router runs
+    // per-token and dominated the step), opt-in otherwise.
+    let prefill_gpu_router = seq_len > 1
+        && (diffusion.is_some() || std::env::var("CHEW_GPU_ROUTER_PREFILL").is_ok());
     let prefill_top_k_default = config.n_experts_per_tok as usize;
     let prefill_top_k = if seq_len > 1 {
         match std::env::var("CHEW_MOE_PREFILL_TOPK") {
@@ -3459,6 +3462,21 @@ pub fn forward_moe_streaming(
     // cache itself. scratch.norm_out now holds the final-normed hidden for every
     // position; skip the autoregressive last-logit projection + advance.
     if diffusion.is_some() {
+        if profile {
+            tracing::info!(
+                kv_len = total_kv_len,
+                expert_us = t_expert,
+                expert_gate_up_us = t_expert_gate_up,
+                expert_down_us = t_expert_down,
+                expert_accum_us = t_expert_accum,
+                router_us = t_router,
+                gemm_qkv_us = t_gemm_qkv,
+                full_mha_us = t_full_mha,
+                swa_mha_us = t_swa_mha,
+                norm_us = t_norm,
+                "PROFILE diffusion canvas step"
+            );
+        }
         return Ok(());
     }
 
