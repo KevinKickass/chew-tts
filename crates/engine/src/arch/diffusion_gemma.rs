@@ -262,6 +262,40 @@ pub struct EbStep {
 /// bound decoder: per-position argmax + entropy + multinomial sample, then
 /// accept the lowest-entropy positions up to `entropy_bound` (cumulative),
 /// renoise the rest. Mirrors diffusion.cpp:583-665.
+/// Host post-processing for the device-side entropy-bound reduce: accept the
+/// lowest-entropy positions up to the cumulative bound, renoise the rest.
+pub fn eb_accept(
+    argmax: &[u32],
+    entropy: &[f32],
+    sampled: &[u32],
+    entropy_bound: f32,
+    vocab: u32,
+    rng: &mut Rng,
+) -> EbStep {
+    let c_len = argmax.len();
+    let mut order: Vec<usize> = (0..c_len).collect();
+    order.sort_by(|&a, &b| {
+        entropy[a].partial_cmp(&entropy[b]).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut accepted = vec![false; c_len];
+    let mut cum_e = 0.0f64;
+    for &pos in &order {
+        if cum_e <= entropy_bound as f64 {
+            accepted[pos] = true;
+        }
+        cum_e += entropy[pos] as f64;
+    }
+    let next_canvas: Vec<u32> = (0..c_len)
+        .map(|pos| if accepted[pos] { sampled[pos] } else { rng.next_token(vocab) })
+        .collect();
+    let mean_entropy = entropy.iter().sum::<f32>() / c_len as f32;
+    EbStep {
+        argmax: argmax.to_vec(),
+        next_canvas,
+        mean_entropy,
+    }
+}
+
 pub fn eb_step(
     logits: &[f32],
     c_len: usize,

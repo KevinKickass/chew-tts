@@ -366,8 +366,17 @@ impl ChewEngine {
             )?;
         }
 
-        let mut logits_host_f16 = vec![half::f16::ZERO; cl * vocabu];
-        let mut logits_host = vec![0f32; cl * vocabu];
+        // Device-side entropy-bound: logits stay on the GPU, the kernel reduces
+        // each position to argmax/entropy/sample; only these C-sized arrays come
+        // back (no 134MB readback).
+        let mut rnd_gpu = stream.alloc_zeros::<f32>(cl)?;
+        let mut argmax_gpu = stream.alloc_zeros::<u32>(cl)?;
+        let mut entropy_gpu = stream.alloc_zeros::<f32>(cl)?;
+        let mut sampled_gpu = stream.alloc_zeros::<u32>(cl)?;
+        let mut rnd_host = vec![0f32; cl];
+        let mut argmax_host = vec![0u32; cl];
+        let mut entropy_host = vec![0f32; cl];
+        let mut sampled_host = vec![0u32; cl];
         let mut argmax_out = vec![0u32; cl];
         let mut held = 0u32;
         let mut prev_argmax: Option<Vec<u32>> = None;
@@ -460,14 +469,36 @@ impl ChewEngine {
                     .ops
                     .logit_softcap_inplace(&mut canvas_logits, cl as u32 * vocab, cap)?;
             }
-            stream.memcpy_dtoh(&canvas_logits, &mut logits_host_f16)?;
             stream.synchronize().map_err(EngineError::Driver)?;
             let gpu_ms = t_gpu.elapsed().as_millis();
             let t_eb = std::time::Instant::now();
-            for (i, &v) in logits_host_f16.iter().enumerate() {
-                logits_host[i] = v.to_f32();
+            // device-side reduce: argmax/entropy/multinomial per position
+            for r in rnd_host.iter_mut() {
+                *r = rng.next_f32();
             }
-            let step = dg::eb_step(&logits_host, cl, vocabu, temp_inv, eb.entropy_bound, &mut rng);
+            stream.memcpy_htod(rnd_host.as_slice(), &mut rnd_gpu)?;
+            self.kernels.ops.eb_reduce(
+                &canvas_logits,
+                &rnd_gpu,
+                &mut argmax_gpu,
+                &mut entropy_gpu,
+                &mut sampled_gpu,
+                cl as u32,
+                vocab,
+                temp_inv,
+            )?;
+            stream.memcpy_dtoh(&argmax_gpu, &mut argmax_host)?;
+            stream.memcpy_dtoh(&entropy_gpu, &mut entropy_host)?;
+            stream.memcpy_dtoh(&sampled_gpu, &mut sampled_host)?;
+            stream.synchronize().map_err(EngineError::Driver)?;
+            let step = dg::eb_accept(
+                &argmax_host,
+                &entropy_host,
+                &sampled_host,
+                eb.entropy_bound,
+                vocab,
+                &mut rng,
+            );
             eprintln!(
                 "step {}/{}: gpu={}ms eb={}ms mean_H={:.4} held={} argmax[0..6]={:?}",
                 step_idx + 1,

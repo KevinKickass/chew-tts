@@ -1138,6 +1138,81 @@ __global__ void mha_naive_masked(const __half* __restrict__ q,
     }
 }
 
+// --- Entropy-bound reduce: per canvas position (one block), compute argmax,
+// entropy, and an inverse-CDF multinomial sample over the vocab. Reads logits
+// directly on-device (no 134MB readback). Grid: (c_len,), Block: (256,) ---
+__global__ void eb_reduce(const __half* __restrict__ logits,
+                          int vocab,
+                          float temp_inv,
+                          const float* __restrict__ rnd,
+                          unsigned int* __restrict__ argmax,
+                          float* __restrict__ entropy,
+                          unsigned int* __restrict__ sampled) {
+    int pos = blockIdx.x;
+    const __half* row = logits + (size_t)pos * vocab;
+    int tid = threadIdx.x;
+    int nt = blockDim.x;
+    __shared__ float s_val[256];
+    __shared__ int s_idx[256];
+
+    // pass 1: max(scaled) + argmax
+    float lmax = -1e30f;
+    int larg = 0;
+    for (int v = tid; v < vocab; v += nt) {
+        float s = __half2float(row[v]) * temp_inv;
+        if (s > lmax) { lmax = s; larg = v; }
+    }
+    s_val[tid] = lmax; s_idx[tid] = larg;
+    __syncthreads();
+    for (int o = nt / 2; o > 0; o >>= 1) {
+        if (tid < o && s_val[tid + o] > s_val[tid]) {
+            s_val[tid] = s_val[tid + o]; s_idx[tid] = s_idx[tid + o];
+        }
+        __syncthreads();
+    }
+    float mx = s_val[0];
+    int am = s_idx[0];
+
+    // pass 2: partition sum
+    float lsum = 0.0f;
+    for (int v = tid; v < vocab; v += nt)
+        lsum += __expf(__half2float(row[v]) * temp_inv - mx);
+    s_val[tid] = lsum;
+    __syncthreads();
+    for (int o = nt / 2; o > 0; o >>= 1) {
+        if (tid < o) s_val[tid] += s_val[tid + o];
+        __syncthreads();
+    }
+    float zsum = s_val[0];
+
+    // pass 3: entropy
+    float lh = 0.0f;
+    for (int v = tid; v < vocab; v += nt) {
+        float p = __expf(__half2float(row[v]) * temp_inv - mx) / zsum;
+        if (p > 0.0f) lh -= p * __logf(p);
+    }
+    s_val[tid] = lh;
+    __syncthreads();
+    for (int o = nt / 2; o > 0; o >>= 1) {
+        if (tid < o) s_val[tid] += s_val[tid + o];
+        __syncthreads();
+    }
+
+    // pass 4: inverse-CDF multinomial (single thread)
+    if (tid == 0) {
+        argmax[pos] = (unsigned int)am;
+        entropy[pos] = s_val[0];
+        float target = rnd[pos] * zsum;
+        float cum = 0.0f;
+        int tok = vocab - 1;
+        for (int v = 0; v < vocab; v++) {
+            cum += __expf(__half2float(row[v]) * temp_inv - mx);
+            if (cum >= target) { tok = v; break; }
+        }
+        sampled[pos] = (unsigned int)tok;
+    }
+}
+
 // --- Gather rows by index: dst[i,:] = src[idx[i],:] (f16) ---
 // Grid: (n_rows,), Block: (256,)
 __global__ void gather_rows_f16(const __half* __restrict__ src,

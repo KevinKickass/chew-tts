@@ -45,6 +45,7 @@ pub struct OpsKernels {
     mha_naive_masked: CudaFunction,
     gather_rows_f16: CudaFunction,
     scatter_add_rows_f16: CudaFunction,
+    eb_reduce: CudaFunction,
     // CUDA Graph-compatible variants
     rope_graph: CudaFunction,
     copy_f16_with_offset: CudaFunction,
@@ -111,6 +112,7 @@ impl OpsKernels {
             mha_naive_masked: loader::get_fn(&module, "mha_naive_masked")?,
             gather_rows_f16: loader::get_fn(&module, "gather_rows_f16")?,
             scatter_add_rows_f16: loader::get_fn(&module, "scatter_add_rows_f16")?,
+            eb_reduce: loader::get_fn(&module, "eb_reduce")?,
             rope_graph: loader::get_fn(&module, "rope_graph")?,
             copy_f16_with_offset: loader::get_fn(&module, "copy_f16_with_offset")?,
             mha_fused_graph: loader::get_fn(&module, "mha_fused_graph")?,
@@ -2012,6 +2014,38 @@ impl OpsKernels {
                 smem,
                 &mut args,
             );
+        }
+        Ok(())
+    }
+
+    /// Entropy-bound reduce: per canvas position compute argmax, entropy, and a
+    /// multinomial sample over the vocab, reading logits on-device.
+    /// logits: [c_len, vocab] f16; rnd: [c_len] f32 uniform in [0,1).
+    /// argmax/sampled: [c_len] u32; entropy: [c_len] f32.
+    #[allow(clippy::too_many_arguments)]
+    pub fn eb_reduce(
+        &self,
+        logits: &CudaSlice<half::f16>,
+        rnd: &CudaSlice<f32>,
+        argmax: &mut CudaSlice<u32>,
+        entropy: &mut CudaSlice<f32>,
+        sampled: &mut CudaSlice<u32>,
+        c_len: u32,
+        vocab: u32,
+        temp_inv: f32,
+    ) -> Result<(), KernelError> {
+        let vocab_i = vocab as i32;
+        let mut args: [*mut c_void; 7] = [
+            slice_ptr(logits),
+            scalar_ptr(&vocab_i),
+            scalar_ptr(&temp_inv),
+            slice_ptr(rnd),
+            slice_ptr_mut(argmax),
+            slice_ptr_mut(entropy),
+            slice_ptr_mut(sampled),
+        ];
+        unsafe {
+            self.fast.fire(&self.eb_reduce, (c_len, 1, 1), (256, 1, 1), 0, &mut args);
         }
         Ok(())
     }
