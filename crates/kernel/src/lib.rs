@@ -1,14 +1,14 @@
-mod loader;
 mod dequant;
-mod ops;
 mod gemm;
 mod gemv;
+mod loader;
+mod ops;
 
 pub use dequant::DequantKernels;
-pub use ops::OpsKernels;
 pub use gemm::Gemm;
 pub use gemv::GemvKernels;
 pub use loader::KernelError;
+pub use ops::OpsKernels;
 
 use cudarc::driver::CudaStream;
 use std::sync::Arc;
@@ -26,7 +26,11 @@ impl GpuKernels {
     ///
     /// `max_weight_elements`: largest single weight matrix element count.
     /// Used to size the dequant scratch buffer for on-the-fly GEMM.
-    pub fn load(stream: &Arc<CudaStream>, max_weight_elements: usize, max_k: usize) -> Result<Self, KernelError> {
+    pub fn load(
+        stream: &Arc<CudaStream>,
+        max_weight_elements: usize,
+        max_k: usize,
+    ) -> Result<Self, KernelError> {
         Ok(Self {
             dequant: DequantKernels::load(stream)?,
             ops: OpsKernels::load(stream)?,

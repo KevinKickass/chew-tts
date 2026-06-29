@@ -1,0 +1,8 @@
+[package]
+name = "chew-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+chew-cuda.workspace = true

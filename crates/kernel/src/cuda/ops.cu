@@ -120,6 +120,53 @@ __global__ void rms_norm_f32in_no_weight(const float* __restrict__ x,
     }
 }
 
+// --- LayerNorm (f32 input, f16 output) ---
+// out[row,i] = ((x[row,i] - mean) / sqrt(var + eps)) * weight[i] + bias[i]
+__global__ void layer_norm_f32in(const float* __restrict__ x,
+                                 const __half* __restrict__ weight,
+                                 const __half* __restrict__ bias,
+                                 __half* __restrict__ out,
+                                 int dim,
+                                 float eps) {
+    int row = blockIdx.x;
+    const float* x_row = x + row * dim;
+    __half* out_row = out + row * dim;
+
+    extern __shared__ float sdata[];
+    float* sum_buf = sdata;
+    float* sq_buf = sdata + blockDim.x;
+
+    float local_sum = 0.0f;
+    float local_sq = 0.0f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        float v = x_row[i];
+        local_sum += v;
+        local_sq += v * v;
+    }
+    sum_buf[threadIdx.x] = local_sum;
+    sq_buf[threadIdx.x] = local_sq;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            sum_buf[threadIdx.x] += sum_buf[threadIdx.x + s];
+            sq_buf[threadIdx.x] += sq_buf[threadIdx.x + s];
+        }
+        __syncthreads();
+    }
+
+    float mean = sum_buf[0] / (float)dim;
+    float var = sq_buf[0] / (float)dim - mean * mean;
+    float inv_std = rsqrtf(fmaxf(var, 0.0f) + eps);
+
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        float norm = (x_row[i] - mean) * inv_std;
+        float w = __half2float(weight[i]);
+        float b = __half2float(bias[i]);
+        out_row[i] = __float2half(norm * w + b);
+    }
+}
+
 // --- Element-wise Add: f16 + f16 -> f16 ---
 __global__ void add_f16(const __half* __restrict__ a,
                          const __half* __restrict__ b,
@@ -138,6 +185,48 @@ __global__ void add_f32_f16(const float* __restrict__ a,
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
     out[idx] = a[idx] + __half2float(b[idx]);
+}
+
+// --- Row-wise bias add on f16 matrix ---
+// out[row, col] = x[row, col] + bias[col]
+__global__ void add_bias_f16(const __half* __restrict__ x,
+                             const __half* __restrict__ bias,
+                             __half* __restrict__ out,
+                             int dim) {
+    int row = blockIdx.x;
+    int col = blockIdx.y * blockDim.x + threadIdx.x;
+    if (col >= dim) return;
+    int idx = row * dim + col;
+    out[idx] = __hadd(x[idx], bias[col]);
+}
+
+// --- Row-wise bias add in-place on f16 matrix ---
+__global__ void add_bias_f16_inplace(__half* __restrict__ x,
+                                     const __half* __restrict__ bias,
+                                     int dim) {
+    int row = blockIdx.x;
+    int col = blockIdx.y * blockDim.x + threadIdx.x;
+    if (col >= dim) return;
+    int idx = row * dim + col;
+    x[idx] = __hadd(x[idx], bias[col]);
+}
+
+// --- Copy f16 -> f32 ---
+__global__ void copy_f16_to_f32(const __half* __restrict__ src,
+                                float* __restrict__ dst,
+                                int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    dst[idx] = __half2float(src[idx]);
+}
+
+// --- In-place add: f32 += f32 ---
+__global__ void add_inplace_f32(const float* __restrict__ delta,
+                                float* __restrict__ x,
+                                int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    x[idx] += delta[idx];
 }
 
 // --- Fused Add + RMSNorm ---
@@ -650,11 +739,13 @@ __global__ void mha_fused(const __half* __restrict__ q,
                            int seq_len,
                            int kv_len,
                            int pos_offset,
+                           int window,
                            float scale,
                            float softcap) {
     const int head = blockIdx.x;
     const int q_pos = blockIdx.y;
     const int causal_limit = pos_offset + q_pos;
+    const int causal_start = window > 0 ? ((causal_limit - window + 1) > 0 ? (causal_limit - window + 1) : 0) : 0;
     const int kv_head = head / (n_heads / n_kv_heads);
     const int lane = threadIdx.x;  // 0..31
     const int warp = threadIdx.y;  // 0..3
@@ -713,7 +804,7 @@ __global__ void mha_fused(const __half* __restrict__ q,
             int kp = kv_base + kp_local;
 
             float dot = 0.0f;
-            if (kp < kv_len && kp <= causal_limit) {
+            if (kp < kv_len && kp >= causal_start && kp <= causal_limit) {
                 const __half* k_ptr = K_warp + kp_local * kv_stride;
                 #pragma unroll
                 for (int i = 0; i < q_elems; i++) {
@@ -850,6 +941,7 @@ __global__ void mha_naive(const __half* __restrict__ q,
                           int seq_len,
                           int kv_len,
                           int pos_offset,
+                          int window,
                           float scale,
                           float softcap) {
     if (threadIdx.x != 0 || threadIdx.y != 0) {
@@ -859,6 +951,7 @@ __global__ void mha_naive(const __half* __restrict__ q,
     const int head = blockIdx.x;
     const int q_pos = blockIdx.y;
     const int causal_limit = pos_offset + q_pos;
+    const int causal_start = window > 0 ? ((causal_limit - window + 1) > 0 ? (causal_limit - window + 1) : 0) : 0;
     const int kv_head = head / (n_heads / n_kv_heads);
     const int kv_stride = n_kv_heads * head_dim;
     const int D = head_dim;
@@ -873,7 +966,7 @@ __global__ void mha_naive(const __half* __restrict__ q,
     float max_score = -1e30f;
     for (int kp = 0; kp < kv_len; ++kp) {
         float dot = -1e30f;
-        if (kp <= causal_limit) {
+        if (kp >= causal_start && kp <= causal_limit) {
             const __half * K_ptr = k + kp * kv_stride + kv_head * D;
             dot = 0.0f;
             for (int d = 0; d < D; ++d) {
@@ -908,6 +1001,138 @@ __global__ void mha_naive(const __half* __restrict__ q,
             }
             const __half * V_ptr = v + kp * kv_stride + kv_head * D;
             acc += p * __half2float(V_ptr[d]);
+        }
+        out_ptr[d] = __float2half(acc);
+    }
+}
+
+// Bidirectional/full-attention fallback for encoder models.
+// Same implementation style as mha_naive, but without a causal mask.
+__global__ void mha_naive_full(const __half* __restrict__ q,
+                               const __half* __restrict__ k,
+                               const __half* __restrict__ v,
+                               __half* __restrict__ out,
+                               int head_dim,
+                               int n_heads,
+                               int n_kv_heads,
+                               int seq_len,
+                               int kv_len,
+                               int pos_offset,
+                               float scale,
+                               float softcap) {
+    if (threadIdx.x != 0 || threadIdx.y != 0) {
+        return;
+    }
+
+    const int head = blockIdx.x;
+    const int q_pos = blockIdx.y;
+    (void)pos_offset;
+    const int kv_head = head / (n_heads / n_kv_heads);
+    const int kv_stride = n_kv_heads * head_dim;
+    const int D = head_dim;
+
+    const __half * Q_ptr = q + q_pos * n_heads * D + head * D;
+    __half * out_ptr = out + q_pos * n_heads * D + head * D;
+
+    extern __shared__ float smem[];
+    float * scores = smem;
+    float * probs  = smem + kv_len;
+
+    float max_score = -3.402823466e+38F;
+    for (int kp = 0; kp < kv_len; kp++) {
+        const __half * K_ptr = k + kp * kv_stride + kv_head * D;
+        float score = 0.0f;
+        for (int d = 0; d < D; d++) {
+            score += __half2float(Q_ptr[d]) * __half2float(K_ptr[d]);
+        }
+        score *= scale;
+        if (softcap > 0.0f) score = tanhf(score / softcap) * softcap;
+        scores[kp] = score;
+        max_score = fmaxf(max_score, score);
+    }
+
+    float sum = 0.0f;
+    for (int kp = 0; kp < kv_len; kp++) {
+        float p = expf(scores[kp] - max_score);
+        probs[kp] = p;
+        sum += p;
+    }
+
+    float inv_sum = (sum > 0.0f) ? 1.0f / sum : 0.0f;
+    for (int d = 0; d < D; d++) {
+        float acc = 0.0f;
+        for (int kp = 0; kp < kv_len; kp++) {
+            const __half * V_ptr = v + kp * kv_stride + kv_head * D;
+            acc += (probs[kp] * inv_sum) * __half2float(V_ptr[d]);
+        }
+        out_ptr[d] = __float2half(acc);
+    }
+}
+
+// --- Naive MHA with an explicit additive attention mask (DiffusionGemma) ---
+// Same as mha_naive_full, but adds mask[q_pos * kv_len + kp] to each score
+// before the softmax. Mask convention: 0.0 = allowed, large-negative = blocked.
+// Used for non-causal region-aware attention where causality cannot be
+// expressed as a position window. Grid: (n_heads, seq_len), Block: (1,1).
+__global__ void mha_naive_masked(const __half* __restrict__ q,
+                                 const __half* __restrict__ k,
+                                 const __half* __restrict__ v,
+                                 const __half* __restrict__ mask,
+                                 __half* __restrict__ out,
+                                 int head_dim,
+                                 int n_heads,
+                                 int n_kv_heads,
+                                 int seq_len,
+                                 int kv_len,
+                                 int pos_offset,
+                                 float scale,
+                                 float softcap) {
+    if (threadIdx.x != 0 || threadIdx.y != 0) {
+        return;
+    }
+
+    const int head = blockIdx.x;
+    const int q_pos = blockIdx.y;
+    (void)pos_offset;
+    const int kv_head = head / (n_heads / n_kv_heads);
+    const int kv_stride = n_kv_heads * head_dim;
+    const int D = head_dim;
+
+    const __half * Q_ptr = q + q_pos * n_heads * D + head * D;
+    __half * out_ptr = out + q_pos * n_heads * D + head * D;
+    const __half * mask_row = mask + (long)q_pos * kv_len;
+
+    extern __shared__ float smem[];
+    float * scores = smem;
+    float * probs  = smem + kv_len;
+
+    float max_score = -3.402823466e+38F;
+    for (int kp = 0; kp < kv_len; kp++) {
+        const __half * K_ptr = k + kp * kv_stride + kv_head * D;
+        float score = 0.0f;
+        for (int d = 0; d < D; d++) {
+            score += __half2float(Q_ptr[d]) * __half2float(K_ptr[d]);
+        }
+        score *= scale;
+        if (softcap > 0.0f) score = tanhf(score / softcap) * softcap;
+        score += __half2float(mask_row[kp]);
+        scores[kp] = score;
+        max_score = fmaxf(max_score, score);
+    }
+
+    float sum = 0.0f;
+    for (int kp = 0; kp < kv_len; kp++) {
+        float p = expf(scores[kp] - max_score);
+        probs[kp] = p;
+        sum += p;
+    }
+
+    float inv_sum = (sum > 0.0f) ? 1.0f / sum : 0.0f;
+    for (int d = 0; d < D; d++) {
+        float acc = 0.0f;
+        for (int kp = 0; kp < kv_len; kp++) {
+            const __half * V_ptr = v + kp * kv_stride + kv_head * D;
+            acc += (probs[kp] * inv_sum) * __half2float(V_ptr[d]);
         }
         out_ptr[d] = __float2half(acc);
     }

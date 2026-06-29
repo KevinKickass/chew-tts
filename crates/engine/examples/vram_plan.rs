@@ -14,23 +14,33 @@ fn main() {
     let config = ModelConfig::from_gguf(&gguf.header).expect("failed to parse config");
 
     println!("Model: {path}");
-    println!("  Arch: {}, Layers: {}, Dim: {}, Heads: {}/{}, FF: {}, Vocab: {}",
-        config.arch, config.n_layers, config.dim,
-        config.n_heads, config.n_kv_heads, config.ff_dim, config.vocab_size);
+    println!(
+        "  Arch: {}, Layers: {}, Dim: {}, Heads: {}/{}, FF: {}, Vocab: {}",
+        config.arch,
+        config.n_layers,
+        config.dim,
+        config.n_heads,
+        config.n_kv_heads,
+        config.ff_dim,
+        config.vocab_size
+    );
     if gguf.find_tensor("output.weight").is_none() {
         println!("  Note: No output.weight — using tied embeddings");
     }
     println!();
 
     // Show budget for various context lengths
-    println!("{:<10} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8}",
-        "Context", "Weights", "Dequant", "KV", "Scratch", "cuBLAS", "Total", "Peak");
+    println!(
+        "{:<10} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8}",
+        "Context", "Weights", "Dequant", "KV", "Scratch", "cuBLAS", "Total", "Peak"
+    );
     println!("{}", "-".repeat(74));
 
     for ctx in [512, 1024, 2048, 4096, 8192, 16384, 32768] {
         let batch = (ctx as u32).min(2048);
         let plan = VramPlan::compute(&config, &gguf, ctx, batch);
-        println!("{:<10} {:>6} MB {:>6} MB {:>6} MB {:>6} MB {:>6} MB {:>6} MB {:>6} MB",
+        println!(
+            "{:<10} {:>6} MB {:>6} MB {:>6} MB {:>6} MB {:>6} MB {:>6} MB {:>6} MB",
             ctx,
             plan.weights_mb(),
             plan.dequant_scratch_mb(),
@@ -38,7 +48,8 @@ fn main() {
             plan.scratch_mb(),
             plan.cublas_bytes / (1024 * 1024),
             plan.total_mb(),
-            plan.peak_mb());
+            plan.peak_mb()
+        );
     }
 
     // Try to detect GPU and auto-fit

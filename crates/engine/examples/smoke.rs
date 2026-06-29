@@ -5,20 +5,17 @@ use chew_engine::ChewEngine;
 use chew_vram::VramAllocator;
 
 fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter("info")
-        .init();
+    tracing_subscriber::fmt().with_env_filter("info").init();
 
-    let path = std::env::args()
-        .nth(1)
-        .expect("usage: smoke <model.gguf>");
+    let path = std::env::args().nth(1).expect("usage: smoke <model.gguf>");
 
     println!("=== Chew Smoke Test ===");
     println!("Model: {path}");
 
     let alloc = VramAllocator::init().expect("CUDA init failed");
 
-    println!("\nGPU 0: {} MB free, {} MB total",
+    println!(
+        "\nGPU 0: {} MB free, {} MB total",
         alloc.free_bytes(0).unwrap() / (1024 * 1024),
         alloc.total_bytes(0).unwrap() / (1024 * 1024),
     );
@@ -39,8 +36,10 @@ fn main() {
             println!("  Context:    {}", cfg.context_length);
             println!("  GQA:        {}", cfg.is_gqa());
 
-            println!("\nGPU 0 after load: {} MB free",
-                alloc.free_bytes(0).unwrap() / (1024 * 1024));
+            println!(
+                "\nGPU 0 after load: {} MB free",
+                alloc.free_bytes(0).unwrap() / (1024 * 1024)
+            );
         }
         Err(e) => {
             eprintln!("\n=== Load FAILED ===");

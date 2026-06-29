@@ -23,11 +23,7 @@ impl Default for SampleParams {
 /// Sample a token from f16 logits on the CPU.
 ///
 /// Logits are downloaded from GPU, converted to f32, then sampled.
-pub fn sample_token(
-    logits_f32: &mut [f32],
-    params: &SampleParams,
-    recent_tokens: &[u32],
-) -> u32 {
+pub fn sample_token(logits_f32: &mut [f32], params: &SampleParams, recent_tokens: &[u32]) -> u32 {
     let vocab_size = logits_f32.len();
 
     // Repetition penalty
@@ -140,9 +136,15 @@ fn sift_down(heap: &mut [(f32, u32)], mut pos: usize) {
         let mut smallest = pos;
         let left = 2 * pos + 1;
         let right = 2 * pos + 2;
-        if left < len && heap[left].0 < heap[smallest].0 { smallest = left; }
-        if right < len && heap[right].0 < heap[smallest].0 { smallest = right; }
-        if smallest == pos { break; }
+        if left < len && heap[left].0 < heap[smallest].0 {
+            smallest = left;
+        }
+        if right < len && heap[right].0 < heap[smallest].0 {
+            smallest = right;
+        }
+        if smallest == pos {
+            break;
+        }
         heap.swap(pos, smallest);
         pos = smallest;
     }

@@ -9,7 +9,7 @@
 //! - `tokenizer.ggml.bos_token_id`, `eos_token_id`, etc.
 
 use crate::types::{GgufHeader, MetadataValue};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokenizers::Tokenizer;
 use tracing::info;
 
@@ -18,8 +18,6 @@ const TOKEN_TYPE_NORMAL: i32 = 1;
 const TOKEN_TYPE_UNKNOWN: i32 = 2;
 const TOKEN_TYPE_CONTROL: i32 = 3;
 const TOKEN_TYPE_USER_DEFINED: i32 = 4;
-
-const TOKEN_TYPE_BYTE: i32 = 6;
 
 /// Try to build a `Tokenizer` from GGUF metadata.
 /// Returns `None` if the required metadata keys are missing.
@@ -34,10 +32,22 @@ pub fn extract_tokenizer(header: &GgufHeader) -> Option<Tokenizer> {
         .and_then(|v| v.as_str())
         .unwrap_or("bpe");
 
-    let bos_id = header.metadata.get("tokenizer.ggml.bos_token_id").and_then(|v| v.as_u32());
-    let eos_id = header.metadata.get("tokenizer.ggml.eos_token_id").and_then(|v| v.as_u32());
-    let unk_id = header.metadata.get("tokenizer.ggml.unknown_token_id").and_then(|v| v.as_u32());
-    let pad_id = header.metadata.get("tokenizer.ggml.padding_token_id").and_then(|v| v.as_u32());
+    let bos_id = header
+        .metadata
+        .get("tokenizer.ggml.bos_token_id")
+        .and_then(|v| v.as_u32());
+    let eos_id = header
+        .metadata
+        .get("tokenizer.ggml.eos_token_id")
+        .and_then(|v| v.as_u32());
+    let unk_id = header
+        .metadata
+        .get("tokenizer.ggml.unknown_token_id")
+        .and_then(|v| v.as_u32());
+    let pad_id = header
+        .metadata
+        .get("tokenizer.ggml.padding_token_id")
+        .and_then(|v| v.as_u32());
 
     info!(
         vocab_size = tokens.len(),
@@ -89,7 +99,9 @@ fn build_tokenizer_json(
         .collect::<serde_json::Map<String, Value>>()
         .into();
 
-    // Collect added_tokens (control tokens, byte tokens, special tokens)
+    // Collect added_tokens (control/user-defined/special tokens).
+    // Byte tokens are part of the normal Gemma4/GPT-style vocabulary and must
+    // stay in the model vocab rather than being elevated to special tokens.
     let mut added_tokens = Vec::new();
     let types = token_types.unwrap_or(&[]);
 
@@ -97,9 +109,8 @@ fn build_tokenizer_json(
         let tt = types.get(id).copied().unwrap_or(TOKEN_TYPE_NORMAL);
         let is_special = matches!(
             tt,
-            TOKEN_TYPE_CONTROL | TOKEN_TYPE_UNKNOWN | TOKEN_TYPE_USER_DEFINED | TOKEN_TYPE_BYTE
-        )
-            || Some(id as u32) == bos_id
+            TOKEN_TYPE_CONTROL | TOKEN_TYPE_UNKNOWN | TOKEN_TYPE_USER_DEFINED
+        ) || Some(id as u32) == bos_id
             || Some(id as u32) == eos_id
             || Some(id as u32) == unk_id
             || Some(id as u32) == pad_id;
@@ -177,12 +188,27 @@ fn build_tokenizer_json(
             });
         }
         "gemma4" => {
-            result["pre_tokenizer"] = Value::Null;
-            result["decoder"] = json!({
+            // Gemma 4 uses a GPT-2 style regex splitter plus a byte-level decoder.
+            // Treating it like a SentencePiece tokenizer breaks both whitespace and
+            // control-token boundaries.
+            result["pre_tokenizer"] = json!({
                 "type": "Sequence",
-                "decoders": [
-                    {"type": "ByteFallback"}
+                "pretokenizers": [
+                    {
+                        "type": "Split",
+                        "pattern": {
+                            "Regex": "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)|\\s+"
+                        },
+                        "behavior": "Isolated",
+                        "invert": false
+                    }
                 ]
+            });
+            result["decoder"] = json!({
+                "type": "ByteLevel",
+                "add_prefix_space": false,
+                "trim_offsets": true,
+                "use_regex": false
             });
         }
         "llama" | "gemma" | "gemma2" | "gemma3" => {
@@ -207,6 +233,76 @@ fn build_tokenizer_json(
     }
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TOKEN_TYPE_CONTROL, TOKEN_TYPE_NORMAL, TOKEN_TYPE_UNKNOWN, build_tokenizer_json};
+    use tokenizers::Tokenizer;
+
+    #[test]
+    fn gemma4_tokenizer_preserves_spaces_and_control_tokens() {
+        let tokens = vec![
+            "<pad>".to_string(),
+            "<eos>".to_string(),
+            "<bos>".to_string(),
+            "<unk>".to_string(),
+            "<|channel>".to_string(),
+            "<channel|>".to_string(),
+            "<|turn>".to_string(),
+            "<turn|>".to_string(),
+            "Hello".to_string(),
+            " world".to_string(),
+            "!".to_string(),
+            "final".to_string(),
+        ];
+        let token_types = vec![
+            TOKEN_TYPE_CONTROL,
+            TOKEN_TYPE_CONTROL,
+            TOKEN_TYPE_CONTROL,
+            TOKEN_TYPE_UNKNOWN,
+            TOKEN_TYPE_CONTROL,
+            TOKEN_TYPE_CONTROL,
+            TOKEN_TYPE_CONTROL,
+            TOKEN_TYPE_CONTROL,
+            TOKEN_TYPE_NORMAL,
+            TOKEN_TYPE_NORMAL,
+            TOKEN_TYPE_NORMAL,
+            TOKEN_TYPE_NORMAL,
+        ];
+        let json = build_tokenizer_json(
+            &tokens,
+            Some(&[]),
+            Some(&token_types),
+            "gemma4",
+            Some(2),
+            Some(1),
+            Some(3),
+            Some(0),
+        );
+        let tokenizer =
+            Tokenizer::from_bytes(serde_json::to_vec(&json).expect("serialize tokenizer json"))
+                .expect("build tokenizer");
+
+        assert_eq!(tokenizer.token_to_id("<|channel>"), Some(4));
+        assert_eq!(tokenizer.token_to_id("<channel|>"), Some(5));
+        assert_eq!(tokenizer.token_to_id("<|turn>"), Some(6));
+        assert_eq!(tokenizer.token_to_id("<turn|>"), Some(7));
+        assert_eq!(
+            tokenizer
+                .decode(&[8, 9, 10], false)
+                .expect("decode plain text"),
+            "Hello world!"
+        );
+
+        let with_controls = tokenizer
+            .decode(&[4, 11, 5, 8, 9, 10, 7], false)
+            .expect("decode control tokens");
+        assert_eq!(
+            with_controls,
+            "<|channel>final<channel|>Hello world!<turn|>"
+        );
+    }
 }
 
 fn get_string_array(

@@ -11,7 +11,7 @@ PAYLOAD="${PAYLOAD:-{\"messages\":[{\"role\":\"user\",\"content\":\"Say only: hi
 
 cd "$ROOT"
 
-pkill -f "target/release/chew .*${PORT}" 2>/dev/null || true
+"$ROOT/scripts/kill-chew-port.sh" "$PORT"
 
 echo "Starting chew profile run"
 echo "  model:    $MODEL"

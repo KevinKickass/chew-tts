@@ -1,11 +1,13 @@
+use crate::WeightStorage;
 use crate::config::ModelConfig;
 use crate::kv_cache::KvCache;
-use crate::weights::{ModelWeights, QuantWeight, StreamingWeights, LayerWeights,
-    HostLayerLayout, StreamingLayerNorms, TensorSlot};
-use crate::WeightStorage;
+use crate::weights::{
+    HostLayerLayout, LayerWeights, ModelWeights, QuantWeight, StreamingLayerNorms,
+    StreamingWeights, TensorSlot,
+};
 use chew_kernel::{GpuKernels, KernelError};
-use cudarc::driver::{CudaSlice, CudaStream};
 use cudarc::driver::sys;
+use cudarc::driver::{CudaSlice, CudaStream};
 use std::sync::Arc;
 use tracing::info;
 
@@ -38,7 +40,7 @@ pub struct ScratchBuffers {
     pub ffn_silu_out: CudaSlice<half::f16>,
     /// FFN down / residual: [seq_len, dim] (f16)
     pub ffn_out: CudaSlice<half::f16>,
-    /// Logits: [seq_len, vocab_size] (f16)
+    /// Logits for the next-token decision: [vocab_size] (f16)
     pub logits: CudaSlice<half::f16>,
     // Per-layer embedding scratch buffers (Gemma 4)
     /// After inp_gate projection + GELU: [seq_len, epl] (f16)
@@ -86,11 +88,57 @@ impl ScratchBuffers {
             ffn_up_out: stream.alloc_zeros::<half::f16>(s * ff)?,
             ffn_silu_out: stream.alloc_zeros::<half::f16>(s * ff)?,
             ffn_out: stream.alloc_zeros::<half::f16>(s * d)?,
-            logits: stream.alloc_zeros::<half::f16>(s * v)?,
+            logits: stream.alloc_zeros::<half::f16>(v)?,
             pe_gate_out,
             pe_proj_out,
         })
     }
+}
+
+pub(crate) fn project_last_logits(
+    kernels: &mut GpuKernels,
+    stream: &Arc<CudaStream>,
+    final_norm: &CudaSlice<half::f16>,
+    row_scratch: &mut CudaSlice<half::f16>,
+    output: &QuantWeight,
+    logits: &mut CudaSlice<half::f16>,
+    seq_len: u32,
+    vocab: u32,
+    dim: u32,
+) -> Result<(), KernelError> {
+    if seq_len == 1 {
+        kernels.gemv.quantize_input(final_norm, dim)?;
+        return gemm_q(kernels, final_norm, output, logits, 1, vocab, dim);
+    }
+
+    let last_off = ((seq_len - 1) * dim) as usize;
+    let src = final_norm.slice(last_off..last_off + dim as usize);
+    let mut dst = row_scratch.slice_mut(0..dim as usize);
+    stream
+        .memcpy_dtod(&src, &mut dst)
+        .map_err(|e| KernelError::Launch(e.to_string()))?;
+
+    kernels.gemv.quantize_input(row_scratch, dim)?;
+    gemm_q(kernels, row_scratch, output, logits, 1, vocab, dim)
+}
+
+/// Project logits for ALL positions (block-diffusion canvas), not just the last.
+///
+/// `final_norm`: [seq_len, dim] f16 (final-normed hidden of every position).
+/// `logits`: [seq_len, vocab] f16 output.
+///
+/// Unlike `project_last_logits` (autoregressive: only the last row matters),
+/// diffusion needs the full `[C, vocab]` logit matrix every step.
+pub(crate) fn project_all_logits(
+    kernels: &mut GpuKernels,
+    final_norm: &CudaSlice<half::f16>,
+    output: &QuantWeight,
+    logits: &mut CudaSlice<half::f16>,
+    seq_len: u32,
+    vocab: u32,
+    dim: u32,
+) -> Result<(), KernelError> {
+    gemm_q(kernels, final_norm, output, logits, seq_len, vocab, dim)
 }
 
 /// Helper: dequant-GEMM for a quantized weight.
@@ -124,11 +172,12 @@ pub(crate) fn gemm_q(
         w.quant_type,
         w.n_elements,
         c,
-        m, n, k,
+        m,
+        n,
+        k,
         &kernels.dequant,
     )
 }
-
 
 // =============================================================
 // Streaming forward pass — layers partially on host RAM
@@ -143,9 +192,16 @@ fn upload_layer_to_shell_direct(
 ) -> Result<(), String> {
     let base = layout.offset;
 
-    fn upload_slot(host_data: &[u8], base: usize, slot: &TensorSlot, qw: &mut crate::weights::QuantWeight, stream: &Arc<CudaStream>) -> Result<(), String> {
+    fn upload_slot(
+        host_data: &[u8],
+        base: usize,
+        slot: &TensorSlot,
+        qw: &mut crate::weights::QuantWeight,
+        stream: &Arc<CudaStream>,
+    ) -> Result<(), String> {
         let src = &host_data[base + slot.off..base + slot.off + slot.size];
-        stream.memcpy_htod(src, &mut qw.data)
+        stream
+            .memcpy_htod(src, &mut qw.data)
             .map_err(|e| e.to_string())?;
         qw.quant_type = slot.quant_type;
         qw.n_elements = slot.n_elements;
@@ -155,10 +211,28 @@ fn upload_layer_to_shell_direct(
     upload_slot(host_data, base, &layout.attn_q, &mut shell.attn_q, stream)?;
     upload_slot(host_data, base, &layout.attn_k, &mut shell.attn_k, stream)?;
     upload_slot(host_data, base, &layout.attn_v, &mut shell.attn_v, stream)?;
-    upload_slot(host_data, base, &layout.attn_output, &mut shell.attn_output, stream)?;
-    upload_slot(host_data, base, &layout.ffn_gate, &mut shell.ffn_gate, stream)?;
+    upload_slot(
+        host_data,
+        base,
+        &layout.attn_output,
+        &mut shell.attn_output,
+        stream,
+    )?;
+    upload_slot(
+        host_data,
+        base,
+        &layout.ffn_gate,
+        &mut shell.ffn_gate,
+        stream,
+    )?;
     upload_slot(host_data, base, &layout.ffn_up, &mut shell.ffn_up, stream)?;
-    upload_slot(host_data, base, &layout.ffn_down, &mut shell.ffn_down, stream)?;
+    upload_slot(
+        host_data,
+        base,
+        &layout.ffn_down,
+        &mut shell.ffn_down,
+        stream,
+    )?;
 
     if let Some(ref slot) = layout.inp_gate {
         if let Some(ref mut qw) = shell.inp_gate {
@@ -181,8 +255,12 @@ fn copy_norms_to_shell_direct(
     shell: &mut LayerWeights,
     stream: &Arc<CudaStream>,
 ) -> Result<(), String> {
-    stream.memcpy_dtod(&norms.attn_norm, &mut shell.attn_norm).map_err(|e| e.to_string())?;
-    stream.memcpy_dtod(&norms.ffn_norm, &mut shell.ffn_norm).map_err(|e| e.to_string())?;
+    stream
+        .memcpy_dtod(&norms.attn_norm, &mut shell.attn_norm)
+        .map_err(|e| e.to_string())?;
+    stream
+        .memcpy_dtod(&norms.ffn_norm, &mut shell.ffn_norm)
+        .map_err(|e| e.to_string())?;
 
     if let (Some(src), Some(dst)) = (&norms.attn_q_norm, &mut shell.attn_q_norm) {
         stream.memcpy_dtod(src, dst).map_err(|e| e.to_string())?;
@@ -236,7 +314,11 @@ impl StreamingDemandQueue {
     }
 
     fn future_without(&self, streamed_idx: usize) -> Vec<usize> {
-        self.items.iter().copied().filter(|&idx| idx != streamed_idx).collect()
+        self.items
+            .iter()
+            .copied()
+            .filter(|&idx| idx != streamed_idx)
+            .collect()
     }
 
     fn iter_window(&self, limit: usize) -> impl Iterator<Item = usize> + '_ {
@@ -276,11 +358,19 @@ impl<'a> StreamingPrefetchScheduler<'a> {
     }
 
     fn shell_ref(&self, slot: usize) -> &LayerWeights {
-        if slot == 0 { &self.sw.shell_a } else { &self.sw.shell_b }
+        if slot == 0 {
+            &self.sw.shell_a
+        } else {
+            &self.sw.shell_b
+        }
     }
 
     fn shell_mut(&mut self, slot: usize) -> &mut LayerWeights {
-        if slot == 0 { &mut self.sw.shell_a } else { &mut self.sw.shell_b }
+        if slot == 0 {
+            &mut self.sw.shell_a
+        } else {
+            &mut self.sw.shell_b
+        }
     }
 
     fn initialize_queue(&mut self, streamed_total: usize) {
@@ -289,9 +379,10 @@ impl<'a> StreamingPrefetchScheduler<'a> {
     }
 
     fn has_layer(&self, streamed_idx: usize) -> bool {
-        self.sw.shell_slots.iter().any(|slot| {
-            slot.loaded == Some(streamed_idx) || slot.in_flight == Some(streamed_idx)
-        })
+        self.sw
+            .shell_slots
+            .iter()
+            .any(|slot| slot.loaded == Some(streamed_idx) || slot.in_flight == Some(streamed_idx))
     }
 
     fn next_use_distance(&self, loaded: Option<usize>, future: &[usize]) -> usize {
@@ -328,7 +419,8 @@ impl<'a> StreamingPrefetchScheduler<'a> {
             let dist = self.next_use_distance(meta.loaded, future);
             if best_slot.is_none()
                 || dist > best_distance
-                || (dist == best_distance && meta.last_used_tick < best_last_used) {
+                || (dist == best_distance && meta.last_used_tick < best_last_used)
+            {
                 best_slot = Some(slot);
                 best_distance = dist;
                 best_last_used = meta.last_used_tick;
@@ -341,7 +433,11 @@ impl<'a> StreamingPrefetchScheduler<'a> {
         best_slot.unwrap_or(0)
     }
 
-    fn ensure_prefetch(&mut self, streamed_idx: usize, future: &[usize]) -> Result<(), KernelError> {
+    fn ensure_prefetch(
+        &mut self,
+        streamed_idx: usize,
+        future: &[usize],
+    ) -> Result<(), KernelError> {
         if self.has_layer(streamed_idx) {
             self.stats.prefetch_hits += 1;
             return Ok(());
@@ -353,7 +449,9 @@ impl<'a> StreamingPrefetchScheduler<'a> {
         let norms = &self.sw.layer_norms[self.sw.n_resident + streamed_idx] as *const _;
 
         if let Some(ready) = self.sw.shell_ready[slot].take() {
-            self.sw.dma_stream.wait(&ready)
+            self.sw
+                .dma_stream
+                .wait(&ready)
                 .map_err(|e| KernelError::Launch(format!("dma wait: {e}")))?;
         }
 
@@ -370,7 +468,10 @@ impl<'a> StreamingPrefetchScheduler<'a> {
                 .map_err(|e| KernelError::Launch(format!("norm copy: {e}")))?;
         }
 
-        let ev = self.sw.dma_stream.record_event(None)
+        let ev = self
+            .sw
+            .dma_stream
+            .record_event(None)
             .map_err(|e| KernelError::Launch(format!("dma record event: {e}")))?;
         self.sw.shell_ready[slot] = Some(ev);
         self.sw.shell_slots[slot].loaded = None;
@@ -397,18 +498,29 @@ impl<'a> StreamingPrefetchScheduler<'a> {
         self.drain_prefetch_queue()
     }
 
-    fn acquire(&mut self, streamed_idx: usize, _streamed_total: usize, stream: &Arc<CudaStream>) -> Result<usize, KernelError> {
+    fn acquire(
+        &mut self,
+        streamed_idx: usize,
+        _streamed_total: usize,
+        stream: &Arc<CudaStream>,
+    ) -> Result<usize, KernelError> {
         self.tick += 1;
         self.queue.enqueue(streamed_idx);
         self.drain_prefetch_queue()?;
 
-        let slot = self.sw.shell_slots.iter().position(|meta| {
-            meta.loaded == Some(streamed_idx) || meta.in_flight == Some(streamed_idx)
-        }).expect("prefetched shell for streamed layer not found");
+        let slot = self
+            .sw
+            .shell_slots
+            .iter()
+            .position(|meta| {
+                meta.loaded == Some(streamed_idx) || meta.in_flight == Some(streamed_idx)
+            })
+            .expect("prefetched shell for streamed layer not found");
 
         if let Some(ready) = &self.sw.shell_ready[slot] {
             self.stats.waits_on_ready += 1;
-            stream.wait(ready)
+            stream
+                .wait(ready)
                 .map_err(|e| KernelError::Launch(format!("stream wait: {e}")))?;
         }
         self.sw.shell_slots[slot].loaded = Some(streamed_idx);
@@ -498,13 +610,22 @@ pub fn forward_streaming(
         if seq_len == 1 {
             let x_q8 = kernels.gemv.x_q8_mut();
             kernels.ops.rms_norm_f32in_q8(
-                hidden, norm, &mut scratch.norm_out,
-                x_q8, seq_len, config.dim, config.rms_norm_eps,
+                hidden,
+                norm,
+                &mut scratch.norm_out,
+                x_q8,
+                seq_len,
+                config.dim,
+                config.rms_norm_eps,
             )?;
         } else {
             kernels.ops.rms_norm_f32in(
-                hidden, norm, &mut scratch.norm_out,
-                seq_len, config.dim, config.rms_norm_eps,
+                hidden,
+                norm,
+                &mut scratch.norm_out,
+                seq_len,
+                config.dim,
+                config.rms_norm_eps,
             )?;
         }
     }
@@ -534,17 +655,36 @@ pub fn forward_streaming(
         } else {
             None
         };
-        let next_attn_norm: Option<&CudaSlice<half::f16>> = next_attn_norm_ptr.map(|ptr| unsafe { &*ptr });
+        let next_attn_norm: Option<&CudaSlice<half::f16>> =
+            next_attn_norm_ptr.map(|ptr| unsafe { &*ptr });
 
         if is_gemma4 {
             crate::arch::streaming_dense::forward_layer_gemma4(
-                hidden, layer, config, kernels, kv_cache, scratch,
-                seq_len, layer_idx, pos, total_kv_len, pe, scheduler.sw,
+                hidden,
+                layer,
+                config,
+                kernels,
+                kv_cache,
+                scratch,
+                seq_len,
+                layer_idx,
+                pos,
+                total_kv_len,
+                pe,
+                scheduler.sw,
             )?;
         } else {
             crate::arch::streaming_dense::forward_layer_llama(
-                hidden, layer, config, kernels, kv_cache, scratch,
-                seq_len, layer_idx, next_attn_norm, n_elems,
+                hidden,
+                layer,
+                config,
+                kernels,
+                kv_cache,
+                scratch,
+                seq_len,
+                layer_idx,
+                next_attn_norm,
+                n_elems,
             )?;
         }
 
@@ -557,20 +697,31 @@ pub fn forward_streaming(
 
     // === Final norm + logits ===
     kernels.ops.rms_norm_f32in(
-        hidden, &sw.output_norm, &mut scratch.norm_out,
-        seq_len, config.dim, config.rms_norm_eps,
+        hidden,
+        &sw.output_norm,
+        &mut scratch.norm_out,
+        seq_len,
+        config.dim,
+        config.rms_norm_eps,
     )?;
 
-    if seq_len == 1 {
-        kernels.gemv.quantize_input(&scratch.norm_out, config.dim)?;
-    }
-    gemm_q(kernels, &scratch.norm_out, &sw.output, &mut scratch.logits,
-        seq_len, config.vocab_size, config.dim)?;
+    project_last_logits(
+        kernels,
+        stream,
+        &scratch.norm_out,
+        &mut scratch.attn_out,
+        &sw.output,
+        &mut scratch.logits,
+        seq_len,
+        config.vocab_size,
+        config.dim,
+    )?;
 
     // Logit softcapping (Gemma4)
     if let Some(cap) = config.logit_softcap {
-        let n_logits = seq_len * config.vocab_size;
-        kernels.ops.logit_softcap_inplace(&mut scratch.logits, n_logits, cap)?;
+        kernels
+            .ops
+            .logit_softcap_inplace(&mut scratch.logits, config.vocab_size, cap)?;
     }
 
     kv_cache.advance(seq_len);
@@ -632,26 +783,37 @@ impl DecodeGraph {
         let total_kv_len = pos + 1; // decode: seq_len=1
         let kv_offset = pos * kv_stride;
         let params_host = [pos as i32, total_kv_len as i32, kv_offset as i32];
-        let mut decode_params = stream.alloc_zeros::<i32>(3)
+        let mut decode_params = stream
+            .alloc_zeros::<i32>(3)
             .map_err(|e| KernelError::Launch(e.to_string()))?;
-        stream.memcpy_htod(&params_host, &mut decode_params)
+        stream
+            .memcpy_htod(&params_host, &mut decode_params)
             .map_err(|e| KernelError::Launch(e.to_string()))?;
 
         // Synchronize before capture to ensure param upload is complete
-        stream.synchronize().map_err(|e| KernelError::Launch(e.to_string()))?;
+        stream
+            .synchronize()
+            .map_err(|e| KernelError::Launch(e.to_string()))?;
 
         // Begin stream capture
         unsafe {
             cudarc::driver::result::stream::begin_capture(
                 raw_stream,
                 sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED,
-            ).map_err(|e| KernelError::Launch(format!("begin_capture: {e}")))?;
+            )
+            .map_err(|e| KernelError::Launch(format!("begin_capture: {e}")))?;
         }
 
         // Run the graph-compatible forward pass (this records, not executes)
         let result = forward_for_graph(
-            hidden, weights, config, kernels, kv_cache, scratch,
-            &decode_params, max_kv_len,
+            hidden,
+            weights,
+            config,
+            kernels,
+            kv_cache,
+            scratch,
+            &decode_params,
+            max_kv_len,
         );
 
         // End capture regardless of forward result
@@ -668,7 +830,8 @@ impl DecodeGraph {
             cudarc::driver::result::graph::instantiate(
                 graph,
                 sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
-            ).map_err(|e| KernelError::Launch(format!("graph instantiate: {e}")))?
+            )
+            .map_err(|e| KernelError::Launch(format!("graph instantiate: {e}")))?
         };
 
         // Now actually execute the first step by launching the graph
@@ -708,7 +871,8 @@ impl DecodeGraph {
 
         // Upload new parameters (async — will complete before graph kernels read them
         // because they're on the same stream)
-        stream.memcpy_htod(&self.params_host, &mut self.decode_params)
+        stream
+            .memcpy_htod(&self.params_host, &mut self.decode_params)
             .map_err(|e| KernelError::Launch(e.to_string()))?;
 
         // Replay the graph
@@ -756,8 +920,13 @@ fn forward_for_graph(
     {
         let x_q8 = kernels.gemv.x_q8_mut();
         kernels.ops.rms_norm_f32in_q8(
-            hidden, &weights.layers[0].attn_norm, &mut scratch.norm_out,
-            x_q8, seq_len, config.dim, config.rms_norm_eps,
+            hidden,
+            &weights.layers[0].attn_norm,
+            &mut scratch.norm_out,
+            x_q8,
+            seq_len,
+            config.dim,
+            config.rms_norm_eps,
         )?;
     }
 
@@ -765,39 +934,78 @@ fn forward_for_graph(
         let layer = &weights.layers[layer_idx];
 
         // QKV: Q separate + K+V dual (fused, x_q8 already set)
-        gemm_q(kernels, &scratch.norm_out, &layer.attn_q, &mut scratch.q,
-            seq_len, config.n_heads * config.head_dim, config.dim)?;
+        gemm_q(
+            kernels,
+            &scratch.norm_out,
+            &layer.attn_q,
+            &mut scratch.q,
+            seq_len,
+            config.n_heads * config.head_dim,
+            config.dim,
+        )?;
         if layer.attn_k.quant_type == layer.attn_v.quant_type {
             let nk = config.n_kv_heads * config.head_dim;
             let _ = kernels.gemv.gemv_dual(
-                &layer.attn_k.data, &layer.attn_v.data,
-                &mut scratch.k, &mut scratch.v,
-                nk, config.dim, layer.attn_k.quant_type,
+                &layer.attn_k.data,
+                &layer.attn_v.data,
+                &mut scratch.k,
+                &mut scratch.v,
+                nk,
+                config.dim,
+                layer.attn_k.quant_type,
             )?;
         } else {
-            gemm_q(kernels, &scratch.norm_out, &layer.attn_k, &mut scratch.k,
-                seq_len, config.n_kv_heads * config.head_dim, config.dim)?;
-            gemm_q(kernels, &scratch.norm_out, &layer.attn_v, &mut scratch.v,
-                seq_len, config.n_kv_heads * config.head_dim, config.dim)?;
+            gemm_q(
+                kernels,
+                &scratch.norm_out,
+                &layer.attn_k,
+                &mut scratch.k,
+                seq_len,
+                config.n_kv_heads * config.head_dim,
+                config.dim,
+            )?;
+            gemm_q(
+                kernels,
+                &scratch.norm_out,
+                &layer.attn_v,
+                &mut scratch.v,
+                seq_len,
+                config.n_kv_heads * config.head_dim,
+                config.dim,
+            )?;
         }
 
         // RoPE (graph-compatible)
         kernels.ops.rope_graph(
-            &mut scratch.q, decode_params, seq_len, config.n_heads, config.head_dim, config.rope_theta,
+            &mut scratch.q,
+            decode_params,
+            seq_len,
+            config.n_heads,
+            config.head_dim,
+            config.rope_theta,
         )?;
         kernels.ops.rope_graph(
-            &mut scratch.k, decode_params, seq_len, config.n_kv_heads, config.head_dim, config.rope_theta,
+            &mut scratch.k,
+            decode_params,
+            seq_len,
+            config.n_kv_heads,
+            config.head_dim,
+            config.rope_theta,
         )?;
 
         // KV cache write (graph-compatible offset-based copy)
         let kv_elems = seq_len * config.n_kv_heads * config.head_dim;
         {
             let k_base = kv_cache.k_base_mut(layer_idx);
-            kernels.ops.copy_f16_with_offset(&scratch.k, k_base, decode_params, kv_elems)?;
+            kernels
+                .ops
+                .copy_f16_with_offset(&scratch.k, k_base, decode_params, kv_elems)?;
         }
         {
             let v_base = kv_cache.v_base_mut(layer_idx);
-            kernels.ops.copy_f16_with_offset(&scratch.v, v_base, decode_params, kv_elems)?;
+            kernels
+                .ops
+                .copy_f16_with_offset(&scratch.v, v_base, decode_params, kv_elems)?;
         }
 
         // MHA (tiled, graph-compatible, fixed smem)
@@ -805,74 +1013,142 @@ fn forward_for_graph(
             let k_base = kv_cache.k_base(layer_idx);
             let v_base = kv_cache.v_base(layer_idx);
             kernels.ops.mha_fused_graph(
-                &scratch.q, k_base, v_base, &mut scratch.attn_mha_out,
+                &scratch.q,
+                k_base,
+                v_base,
+                &mut scratch.attn_mha_out,
                 decode_params,
-                config.head_dim, config.n_heads, config.n_kv_heads,
-                seq_len, max_kv_len,
+                config.head_dim,
+                config.n_heads,
+                config.n_kv_heads,
+                seq_len,
+                max_kv_len,
             )?;
         }
 
         // Output projection
-        kernels.gemv.quantize_input(&scratch.attn_mha_out, config.n_heads * config.head_dim)?;
-        gemm_q(kernels, &scratch.attn_mha_out, &layer.attn_output, &mut scratch.attn_out,
-            seq_len, config.dim, config.n_heads * config.head_dim)?;
+        kernels
+            .gemv
+            .quantize_input(&scratch.attn_mha_out, config.n_heads * config.head_dim)?;
+        gemm_q(
+            kernels,
+            &scratch.attn_mha_out,
+            &layer.attn_output,
+            &mut scratch.attn_out,
+            seq_len,
+            config.dim,
+            config.n_heads * config.head_dim,
+        )?;
 
         // Fused add + RMSNorm + Q8_1 quantize
         {
             let x_q8 = kernels.gemv.x_q8_mut();
             kernels.ops.fused_add_rmsnorm_q8(
-                hidden, &scratch.attn_out, &layer.ffn_norm, &mut scratch.norm_out,
-                x_q8, seq_len, config.dim, config.rms_norm_eps,
+                hidden,
+                &scratch.attn_out,
+                &layer.ffn_norm,
+                &mut scratch.norm_out,
+                x_q8,
+                seq_len,
+                config.dim,
+                config.rms_norm_eps,
             )?;
         }
 
         // Gate+Up (dual fused, x_q8 already set)
         if layer.ffn_gate.quant_type == layer.ffn_up.quant_type {
             let _ = kernels.gemv.gemv_dual(
-                &layer.ffn_gate.data, &layer.ffn_up.data,
-                &mut scratch.ffn_gate_out, &mut scratch.ffn_up_out,
-                config.ff_dim, config.dim, layer.ffn_gate.quant_type,
+                &layer.ffn_gate.data,
+                &layer.ffn_up.data,
+                &mut scratch.ffn_gate_out,
+                &mut scratch.ffn_up_out,
+                config.ff_dim,
+                config.dim,
+                layer.ffn_gate.quant_type,
             )?;
         } else {
-            gemm_q(kernels, &scratch.norm_out, &layer.ffn_gate, &mut scratch.ffn_gate_out,
-                seq_len, config.ff_dim, config.dim)?;
-            gemm_q(kernels, &scratch.norm_out, &layer.ffn_up, &mut scratch.ffn_up_out,
-                seq_len, config.ff_dim, config.dim)?;
+            gemm_q(
+                kernels,
+                &scratch.norm_out,
+                &layer.ffn_gate,
+                &mut scratch.ffn_gate_out,
+                seq_len,
+                config.ff_dim,
+                config.dim,
+            )?;
+            gemm_q(
+                kernels,
+                &scratch.norm_out,
+                &layer.ffn_up,
+                &mut scratch.ffn_up_out,
+                seq_len,
+                config.ff_dim,
+                config.dim,
+            )?;
         }
 
         // SiLU
         kernels.ops.silu(
-            &scratch.ffn_gate_out, &scratch.ffn_up_out, &mut scratch.ffn_silu_out,
+            &scratch.ffn_gate_out,
+            &scratch.ffn_up_out,
+            &mut scratch.ffn_silu_out,
             seq_len * config.ff_dim,
         )?;
 
         // Down projection
-        kernels.gemv.quantize_input(&scratch.ffn_silu_out, config.ff_dim)?;
-        gemm_q(kernels, &scratch.ffn_silu_out, &layer.ffn_down, &mut scratch.ffn_out,
-            seq_len, config.dim, config.ff_dim)?;
+        kernels
+            .gemv
+            .quantize_input(&scratch.ffn_silu_out, config.ff_dim)?;
+        gemm_q(
+            kernels,
+            &scratch.ffn_silu_out,
+            &layer.ffn_down,
+            &mut scratch.ffn_out,
+            seq_len,
+            config.dim,
+            config.ff_dim,
+        )?;
 
         // Residual + next layer's fused norm+Q8
         if layer_idx + 1 < n_layers {
             let x_q8 = kernels.gemv.x_q8_mut();
             kernels.ops.fused_add_rmsnorm_q8(
-                hidden, &scratch.ffn_out,
-                &weights.layers[layer_idx + 1].attn_norm, &mut scratch.norm_out,
-                x_q8, seq_len, config.dim, config.rms_norm_eps,
+                hidden,
+                &scratch.ffn_out,
+                &weights.layers[layer_idx + 1].attn_norm,
+                &mut scratch.norm_out,
+                x_q8,
+                seq_len,
+                config.dim,
+                config.rms_norm_eps,
             )?;
         } else {
-            kernels.ops.add_inplace_f32_f16(hidden, &scratch.ffn_out, n_elems)?;
+            kernels
+                .ops
+                .add_inplace_f32_f16(hidden, &scratch.ffn_out, n_elems)?;
         }
     }
 
     // Final norm + logits
     kernels.ops.rms_norm_f32in(
-        hidden, &weights.output_norm, &mut scratch.norm_out,
-        seq_len, config.dim, config.rms_norm_eps,
+        hidden,
+        &weights.output_norm,
+        &mut scratch.norm_out,
+        seq_len,
+        config.dim,
+        config.rms_norm_eps,
     )?;
 
     kernels.gemv.quantize_input(&scratch.norm_out, config.dim)?;
-    gemm_q(kernels, &scratch.norm_out, &weights.output, &mut scratch.logits,
-        seq_len, config.vocab_size, config.dim)?;
+    gemm_q(
+        kernels,
+        &scratch.norm_out,
+        &weights.output,
+        &mut scratch.logits,
+        seq_len,
+        config.vocab_size,
+        config.dim,
+    )?;
 
     // NOTE: kv_cache.advance() is NOT called here — the caller handles it
     // (for capture: done in DecodeGraph::capture; for replay: done in the decode loop)

@@ -1,9 +1,9 @@
 use crate::config::ModelConfig;
 use crate::vram_plan::StreamingPlan;
-use chew_gguf::{GgmlType, GgufFile, GgufError};
+use chew_gguf::{GgmlType, GgufError, GgufFile};
+use chew_kernel::{DequantKernels, KernelError};
 use chew_vram::VramAllocator;
 use cudarc::driver::{CudaEvent, CudaSlice, CudaStream};
-use chew_kernel::{DequantKernels, KernelError};
 use std::sync::Arc;
 use tracing::info;
 
@@ -143,11 +143,28 @@ pub struct StreamingShellSlot {
     pub last_used_tick: u64,
 }
 
+/// Self-conditioning weights for DiffusionGemma (global, not per-layer).
+/// The SC subgraph re-embeds the previous denoising step's logits and feeds
+/// the result back into the canvas embedding via a gated MLP.
+pub struct ScWeights {
+    /// self_cond_pre_norm [n_embd] — RMSNorm weight
+    pub pre_norm: CudaSlice<half::f16>,
+    /// self_cond_gate [n_embd, n_ff] — SwiGLU gate projection
+    pub gate: QuantWeight,
+    /// self_cond_up [n_embd, n_ff] — SwiGLU up projection
+    pub up: QuantWeight,
+    /// self_cond_down [n_ff, n_embd] — SwiGLU down projection
+    pub down: QuantWeight,
+}
+
 pub struct StreamingWeights {
     // Always on GPU (same as ModelWeights)
     pub token_embd: CudaSlice<half::f16>,
     pub output_norm: CudaSlice<half::f16>,
     pub output: QuantWeight,
+
+    /// DiffusionGemma self-conditioning weights (None for non-diffusion models)
+    pub sc: Option<ScWeights>,
 
     // Per-layer norm weights — ALL on GPU (tiny)
     pub layer_norms: Vec<StreamingLayerNorms>,
@@ -209,8 +226,7 @@ impl ModelWeights {
 
         // Embeddings must be f16 for the embed_tokens kernel
         let token_embd = upload_and_dequant(gguf, "token_embd.weight", alloc, dequant, gpu_idx)?;
-        let output_norm =
-            upload_and_dequant(gguf, "output_norm.weight", alloc, dequant, gpu_idx)?;
+        let output_norm = upload_and_dequant(gguf, "output_norm.weight", alloc, dequant, gpu_idx)?;
 
         // Output projection: quantized (large matrix)
         let output = if gguf.find_tensor("output.weight").is_some() {
@@ -222,36 +238,59 @@ impl ModelWeights {
         };
 
         // Gemma 4 per-layer embedding weights
-        let per_layer_token_embd = if is_gemma4 && gguf.find_tensor("per_layer_token_embd.weight").is_some() {
-            Some(upload_quantized(gguf, "per_layer_token_embd.weight", alloc, gpu_idx)?)
-        } else {
-            None
-        };
-        let per_layer_model_proj = if is_gemma4 && gguf.find_tensor("per_layer_model_proj.weight").is_some() {
-            Some(upload_quantized(gguf, "per_layer_model_proj.weight", alloc, gpu_idx)?)
-        } else {
-            None
-        };
-        let per_layer_proj_norm = if is_gemma4 && gguf.find_tensor("per_layer_proj_norm.weight").is_some() {
-            Some(upload_and_dequant(gguf, "per_layer_proj_norm.weight", alloc, dequant, gpu_idx)?)
-        } else {
-            None
-        };
+        let per_layer_token_embd =
+            if is_gemma4 && gguf.find_tensor("per_layer_token_embd.weight").is_some() {
+                Some(upload_quantized(
+                    gguf,
+                    "per_layer_token_embd.weight",
+                    alloc,
+                    gpu_idx,
+                )?)
+            } else {
+                None
+            };
+        let per_layer_model_proj =
+            if is_gemma4 && gguf.find_tensor("per_layer_model_proj.weight").is_some() {
+                Some(upload_quantized(
+                    gguf,
+                    "per_layer_model_proj.weight",
+                    alloc,
+                    gpu_idx,
+                )?)
+            } else {
+                None
+            };
+        let per_layer_proj_norm =
+            if is_gemma4 && gguf.find_tensor("per_layer_proj_norm.weight").is_some() {
+                Some(upload_and_dequant(
+                    gguf,
+                    "per_layer_proj_norm.weight",
+                    alloc,
+                    dequant,
+                    gpu_idx,
+                )?)
+            } else {
+                None
+            };
 
         // RoPE proportional frequency factors (Gemma 4 full-attention layers)
         let rope_freq_factors = if gguf.find_tensor("rope_freqs.weight").is_some() {
-            let (ti, host_data) = gguf.tensor_data_by_name("rope_freqs.weight")
+            let (ti, host_data) = gguf
+                .tensor_data_by_name("rope_freqs.weight")
                 .map_err(|_| LoadError::MissingTensor("rope_freqs.weight".into()))?;
             let n = ti.n_elements() as usize;
             let stream = alloc.stream(gpu_idx);
             // This is F32 data — upload directly
             assert!(host_data.len() == n * 4, "rope_freqs.weight expected F32");
-            let f32_data: Vec<f32> = host_data.chunks_exact(4)
+            let f32_data: Vec<f32> = host_data
+                .chunks_exact(4)
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect();
-            let mut gpu_buf = stream.alloc_zeros::<f32>(n)
+            let mut gpu_buf = stream
+                .alloc_zeros::<f32>(n)
                 .map_err(|e| LoadError::Vram(chew_vram::VramError::Alloc(e.to_string())))?;
-            stream.memcpy_htod(&f32_data, &mut gpu_buf)
+            stream
+                .memcpy_htod(&f32_data, &mut gpu_buf)
                 .map_err(|e| LoadError::Vram(chew_vram::VramError::Alloc(e.to_string())))?;
             info!(n_factors = n, "loaded rope_freqs.weight");
             Some(gpu_buf)
@@ -265,16 +304,50 @@ impl ModelWeights {
             info!(layer = i, "loading layer weights");
 
             // Load Gemma 4 optional tensors
-            let attn_q_norm = try_upload_and_dequant(gguf, &format!("{pfx}.attn_q_norm.weight"), alloc, dequant, gpu_idx)?;
-            let attn_k_norm = try_upload_and_dequant(gguf, &format!("{pfx}.attn_k_norm.weight"), alloc, dequant, gpu_idx)?;
-            let post_attention_norm = try_upload_and_dequant(gguf, &format!("{pfx}.post_attention_norm.weight"), alloc, dequant, gpu_idx)?;
-            let post_ffw_norm = try_upload_and_dequant(gguf, &format!("{pfx}.post_ffw_norm.weight"), alloc, dequant, gpu_idx)?;
-            let post_norm = try_upload_and_dequant(gguf, &format!("{pfx}.post_norm.weight"), alloc, dequant, gpu_idx)?;
-            let inp_gate = try_upload_quantized(gguf, &format!("{pfx}.inp_gate.weight"), alloc, gpu_idx)?;
+            let attn_q_norm = try_upload_and_dequant(
+                gguf,
+                &format!("{pfx}.attn_q_norm.weight"),
+                alloc,
+                dequant,
+                gpu_idx,
+            )?;
+            let attn_k_norm = try_upload_and_dequant(
+                gguf,
+                &format!("{pfx}.attn_k_norm.weight"),
+                alloc,
+                dequant,
+                gpu_idx,
+            )?;
+            let post_attention_norm = try_upload_and_dequant(
+                gguf,
+                &format!("{pfx}.post_attention_norm.weight"),
+                alloc,
+                dequant,
+                gpu_idx,
+            )?;
+            let post_ffw_norm = try_upload_and_dequant(
+                gguf,
+                &format!("{pfx}.post_ffw_norm.weight"),
+                alloc,
+                dequant,
+                gpu_idx,
+            )?;
+            let post_norm = try_upload_and_dequant(
+                gguf,
+                &format!("{pfx}.post_norm.weight"),
+                alloc,
+                dequant,
+                gpu_idx,
+            )?;
+            let inp_gate =
+                try_upload_quantized(gguf, &format!("{pfx}.inp_gate.weight"), alloc, gpu_idx)?;
             let proj = try_upload_quantized(gguf, &format!("{pfx}.proj.weight"), alloc, gpu_idx)?;
 
             // Layer output scale: read F32 scalar from GGUF
-            let layer_output_scale = if let Some((_ti, data)) = gguf.tensor_data_by_name(&format!("{pfx}.layer_output_scale.weight")).ok() {
+            let layer_output_scale = if let Some((_ti, data)) = gguf
+                .tensor_data_by_name(&format!("{pfx}.layer_output_scale.weight"))
+                .ok()
+            {
                 if data.len() >= 4 {
                     let val = f32::from_le_bytes([data[0], data[1], data[2], data[3]]);
                     Some(val)
@@ -288,19 +361,42 @@ impl ModelWeights {
             let layer = LayerWeights {
                 // Norms are tiny — dequant to f16
                 attn_norm: upload_and_dequant(
-                    gguf, &format!("{pfx}.attn_norm.weight"), alloc, dequant, gpu_idx,
+                    gguf,
+                    &format!("{pfx}.attn_norm.weight"),
+                    alloc,
+                    dequant,
+                    gpu_idx,
                 )?,
                 ffn_norm: upload_and_dequant(
-                    gguf, &format!("{pfx}.ffn_norm.weight"), alloc, dequant, gpu_idx,
+                    gguf,
+                    &format!("{pfx}.ffn_norm.weight"),
+                    alloc,
+                    dequant,
+                    gpu_idx,
                 )?,
                 // Large matrices — keep quantized
                 attn_q: upload_quantized(gguf, &format!("{pfx}.attn_q.weight"), alloc, gpu_idx)?,
                 attn_k: upload_quantized(gguf, &format!("{pfx}.attn_k.weight"), alloc, gpu_idx)?,
                 attn_v: upload_quantized(gguf, &format!("{pfx}.attn_v.weight"), alloc, gpu_idx)?,
-                attn_output: upload_quantized(gguf, &format!("{pfx}.attn_output.weight"), alloc, gpu_idx)?,
-                ffn_gate: upload_quantized(gguf, &format!("{pfx}.ffn_gate.weight"), alloc, gpu_idx)?,
+                attn_output: upload_quantized(
+                    gguf,
+                    &format!("{pfx}.attn_output.weight"),
+                    alloc,
+                    gpu_idx,
+                )?,
+                ffn_gate: upload_quantized(
+                    gguf,
+                    &format!("{pfx}.ffn_gate.weight"),
+                    alloc,
+                    gpu_idx,
+                )?,
                 ffn_up: upload_quantized(gguf, &format!("{pfx}.ffn_up.weight"), alloc, gpu_idx)?,
-                ffn_down: upload_quantized(gguf, &format!("{pfx}.ffn_down.weight"), alloc, gpu_idx)?,
+                ffn_down: upload_quantized(
+                    gguf,
+                    &format!("{pfx}.ffn_down.weight"),
+                    alloc,
+                    gpu_idx,
+                )?,
                 // Gemma 4 specific
                 attn_q_norm,
                 attn_k_norm,
@@ -362,34 +458,78 @@ impl StreamingWeights {
             upload_quantized(gguf, "token_embd.weight", alloc, gpu_idx)?
         };
 
+        // DiffusionGemma self-conditioning weights (global gated MLP)
+        let sc = if config.is_diffusion_gemma()
+            && gguf.find_tensor("self_cond_gate.weight").is_some()
+        {
+            info!("loading DiffusionGemma self-conditioning weights");
+            Some(ScWeights {
+                pre_norm: upload_and_dequant(
+                    gguf,
+                    "self_cond_pre_norm.weight",
+                    alloc,
+                    dequant,
+                    gpu_idx,
+                )?,
+                gate: upload_quantized(gguf, "self_cond_gate.weight", alloc, gpu_idx)?,
+                up: upload_quantized(gguf, "self_cond_up.weight", alloc, gpu_idx)?,
+                down: upload_quantized(gguf, "self_cond_down.weight", alloc, gpu_idx)?,
+            })
+        } else {
+            None
+        };
+
         // Gemma4 extras
-        let per_layer_token_embd = if is_gemma4 && gguf.find_tensor("per_layer_token_embd.weight").is_some() {
-            Some(upload_quantized(gguf, "per_layer_token_embd.weight", alloc, gpu_idx)?)
-        } else {
-            None
-        };
-        let per_layer_model_proj = if is_gemma4 && gguf.find_tensor("per_layer_model_proj.weight").is_some() {
-            Some(upload_quantized(gguf, "per_layer_model_proj.weight", alloc, gpu_idx)?)
-        } else {
-            None
-        };
-        let per_layer_proj_norm = if is_gemma4 && gguf.find_tensor("per_layer_proj_norm.weight").is_some() {
-            Some(upload_and_dequant(gguf, "per_layer_proj_norm.weight", alloc, dequant, gpu_idx)?)
-        } else {
-            None
-        };
+        let per_layer_token_embd =
+            if is_gemma4 && gguf.find_tensor("per_layer_token_embd.weight").is_some() {
+                Some(upload_quantized(
+                    gguf,
+                    "per_layer_token_embd.weight",
+                    alloc,
+                    gpu_idx,
+                )?)
+            } else {
+                None
+            };
+        let per_layer_model_proj =
+            if is_gemma4 && gguf.find_tensor("per_layer_model_proj.weight").is_some() {
+                Some(upload_quantized(
+                    gguf,
+                    "per_layer_model_proj.weight",
+                    alloc,
+                    gpu_idx,
+                )?)
+            } else {
+                None
+            };
+        let per_layer_proj_norm =
+            if is_gemma4 && gguf.find_tensor("per_layer_proj_norm.weight").is_some() {
+                Some(upload_and_dequant(
+                    gguf,
+                    "per_layer_proj_norm.weight",
+                    alloc,
+                    dequant,
+                    gpu_idx,
+                )?)
+            } else {
+                None
+            };
         let rope_freq_factors = if gguf.find_tensor("rope_freqs.weight").is_some() {
-            let (ti, host_data) = gguf.tensor_data_by_name("rope_freqs.weight")
+            let (ti, host_data) = gguf
+                .tensor_data_by_name("rope_freqs.weight")
                 .map_err(|_| LoadError::MissingTensor("rope_freqs.weight".into()))?;
             let n = ti.n_elements() as usize;
             let stream = alloc.stream(gpu_idx);
             assert!(host_data.len() == n * 4, "rope_freqs.weight expected F32");
-            let f32_data: Vec<f32> = host_data.chunks_exact(4)
+            let f32_data: Vec<f32> = host_data
+                .chunks_exact(4)
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect();
-            let mut gpu_buf = stream.alloc_zeros::<f32>(n)
+            let mut gpu_buf = stream
+                .alloc_zeros::<f32>(n)
                 .map_err(|e| LoadError::Vram(chew_vram::VramError::Alloc(e.to_string())))?;
-            stream.memcpy_htod(&f32_data, &mut gpu_buf)
+            stream
+                .memcpy_htod(&f32_data, &mut gpu_buf)
                 .map_err(|e| LoadError::Vram(chew_vram::VramError::Alloc(e.to_string())))?;
             Some(gpu_buf)
         } else {
@@ -401,13 +541,55 @@ impl StreamingWeights {
         for i in 0..n_layers {
             let pfx = format!("blk.{i}");
             let norms = StreamingLayerNorms {
-                attn_norm: upload_and_dequant(gguf, &format!("{pfx}.attn_norm.weight"), alloc, dequant, gpu_idx)?,
-                ffn_norm: upload_and_dequant(gguf, &format!("{pfx}.ffn_norm.weight"), alloc, dequant, gpu_idx)?,
-                attn_q_norm: try_upload_and_dequant(gguf, &format!("{pfx}.attn_q_norm.weight"), alloc, dequant, gpu_idx)?,
-                attn_k_norm: try_upload_and_dequant(gguf, &format!("{pfx}.attn_k_norm.weight"), alloc, dequant, gpu_idx)?,
-                post_attention_norm: try_upload_and_dequant(gguf, &format!("{pfx}.post_attention_norm.weight"), alloc, dequant, gpu_idx)?,
-                post_ffw_norm: try_upload_and_dequant(gguf, &format!("{pfx}.post_ffw_norm.weight"), alloc, dequant, gpu_idx)?,
-                post_norm: try_upload_and_dequant(gguf, &format!("{pfx}.post_norm.weight"), alloc, dequant, gpu_idx)?,
+                attn_norm: upload_and_dequant(
+                    gguf,
+                    &format!("{pfx}.attn_norm.weight"),
+                    alloc,
+                    dequant,
+                    gpu_idx,
+                )?,
+                ffn_norm: upload_and_dequant(
+                    gguf,
+                    &format!("{pfx}.ffn_norm.weight"),
+                    alloc,
+                    dequant,
+                    gpu_idx,
+                )?,
+                attn_q_norm: try_upload_and_dequant(
+                    gguf,
+                    &format!("{pfx}.attn_q_norm.weight"),
+                    alloc,
+                    dequant,
+                    gpu_idx,
+                )?,
+                attn_k_norm: try_upload_and_dequant(
+                    gguf,
+                    &format!("{pfx}.attn_k_norm.weight"),
+                    alloc,
+                    dequant,
+                    gpu_idx,
+                )?,
+                post_attention_norm: try_upload_and_dequant(
+                    gguf,
+                    &format!("{pfx}.post_attention_norm.weight"),
+                    alloc,
+                    dequant,
+                    gpu_idx,
+                )?,
+                post_ffw_norm: try_upload_and_dequant(
+                    gguf,
+                    &format!("{pfx}.post_ffw_norm.weight"),
+                    alloc,
+                    dequant,
+                    gpu_idx,
+                )?,
+                post_norm: try_upload_and_dequant(
+                    gguf,
+                    &format!("{pfx}.post_norm.weight"),
+                    alloc,
+                    dequant,
+                    gpu_idx,
+                )?,
             };
             layer_norms.push(norms);
         }
@@ -418,8 +600,15 @@ impl StreamingWeights {
             let pfx = format!("blk.{i}");
             info!(layer = i, "loading resident layer weights");
 
-            let layer = load_layer_weights(gguf, &pfx, alloc, dequant, gpu_idx, is_gemma4,
-                &layer_norms[i])?;
+            let layer = load_layer_weights(
+                gguf,
+                &pfx,
+                alloc,
+                dequant,
+                gpu_idx,
+                is_gemma4,
+                &layer_norms[i],
+            )?;
             resident_layers.push(layer);
         }
 
@@ -448,18 +637,26 @@ impl StreamingWeights {
 
         // 5. Allocate two GPU shells (double-buffer) sized for the largest layer
         let stream = alloc.stream(gpu_idx);
-        let shell_a = allocate_layer_shell(config, plan.max_layer_bytes as usize, stream, is_gemma4)?;
-        let shell_b = allocate_layer_shell(config, plan.max_layer_bytes as usize, stream, is_gemma4)?;
-        let dma_stream = stream.context().new_stream()
+        let shell_a =
+            allocate_layer_shell(config, plan.max_layer_bytes as usize, stream, is_gemma4)?;
+        let shell_b =
+            allocate_layer_shell(config, plan.max_layer_bytes as usize, stream, is_gemma4)?;
+        let dma_stream = stream
+            .context()
+            .new_stream()
             .map_err(|e| LoadError::Vram(chew_vram::VramError::Alloc(e.to_string())))?;
 
-        info!("streaming weights loaded: {} resident, {} streamed",
-            n_resident, n_layers - n_resident);
+        info!(
+            "streaming weights loaded: {} resident, {} streamed",
+            n_resident,
+            n_layers - n_resident
+        );
 
         Ok(Self {
             token_embd,
             output_norm,
             output,
+            sc,
             layer_norms,
             resident_layers,
             n_resident,
@@ -470,8 +667,18 @@ impl StreamingWeights {
             dma_stream,
             shell_ready: [None, None],
             shell_slots: [
-                StreamingShellSlot { loaded: None, in_flight: None, locked: false, last_used_tick: 0 },
-                StreamingShellSlot { loaded: None, in_flight: None, locked: false, last_used_tick: 0 },
+                StreamingShellSlot {
+                    loaded: None,
+                    in_flight: None,
+                    locked: false,
+                    last_used_tick: 0,
+                },
+                StreamingShellSlot {
+                    loaded: None,
+                    in_flight: None,
+                    locked: false,
+                    last_used_tick: 0,
+                },
             ],
             per_layer_token_embd,
             per_layer_model_proj,
@@ -479,7 +686,6 @@ impl StreamingWeights {
             rope_freq_factors,
         })
     }
-
 }
 
 /// Load a full LayerWeights to GPU (for resident layers).
@@ -493,15 +699,47 @@ fn load_layer_weights(
     _is_gemma4: bool,
     _norms: &StreamingLayerNorms,
 ) -> Result<LayerWeights, LoadError> {
-    let attn_q_norm = try_upload_and_dequant(gguf, &format!("{pfx}.attn_q_norm.weight"), alloc, dequant, gpu_idx)?;
-    let attn_k_norm = try_upload_and_dequant(gguf, &format!("{pfx}.attn_k_norm.weight"), alloc, dequant, gpu_idx)?;
-    let post_attention_norm = try_upload_and_dequant(gguf, &format!("{pfx}.post_attention_norm.weight"), alloc, dequant, gpu_idx)?;
-    let post_ffw_norm = try_upload_and_dequant(gguf, &format!("{pfx}.post_ffw_norm.weight"), alloc, dequant, gpu_idx)?;
-    let post_norm = try_upload_and_dequant(gguf, &format!("{pfx}.post_norm.weight"), alloc, dequant, gpu_idx)?;
+    let attn_q_norm = try_upload_and_dequant(
+        gguf,
+        &format!("{pfx}.attn_q_norm.weight"),
+        alloc,
+        dequant,
+        gpu_idx,
+    )?;
+    let attn_k_norm = try_upload_and_dequant(
+        gguf,
+        &format!("{pfx}.attn_k_norm.weight"),
+        alloc,
+        dequant,
+        gpu_idx,
+    )?;
+    let post_attention_norm = try_upload_and_dequant(
+        gguf,
+        &format!("{pfx}.post_attention_norm.weight"),
+        alloc,
+        dequant,
+        gpu_idx,
+    )?;
+    let post_ffw_norm = try_upload_and_dequant(
+        gguf,
+        &format!("{pfx}.post_ffw_norm.weight"),
+        alloc,
+        dequant,
+        gpu_idx,
+    )?;
+    let post_norm = try_upload_and_dequant(
+        gguf,
+        &format!("{pfx}.post_norm.weight"),
+        alloc,
+        dequant,
+        gpu_idx,
+    )?;
     let inp_gate = try_upload_quantized(gguf, &format!("{pfx}.inp_gate.weight"), alloc, gpu_idx)?;
     let proj = try_upload_quantized(gguf, &format!("{pfx}.proj.weight"), alloc, gpu_idx)?;
 
-    let layer_output_scale = if let Ok((_ti, data)) = gguf.tensor_data_by_name(&format!("{pfx}.layer_output_scale.weight")) {
+    let layer_output_scale = if let Ok((_ti, data)) =
+        gguf.tensor_data_by_name(&format!("{pfx}.layer_output_scale.weight"))
+    {
         if data.len() >= 4 {
             Some(f32::from_le_bytes([data[0], data[1], data[2], data[3]]))
         } else {
@@ -512,8 +750,20 @@ fn load_layer_weights(
     };
 
     Ok(LayerWeights {
-        attn_norm: upload_and_dequant(gguf, &format!("{pfx}.attn_norm.weight"), alloc, dequant, gpu_idx)?,
-        ffn_norm: upload_and_dequant(gguf, &format!("{pfx}.ffn_norm.weight"), alloc, dequant, gpu_idx)?,
+        attn_norm: upload_and_dequant(
+            gguf,
+            &format!("{pfx}.attn_norm.weight"),
+            alloc,
+            dequant,
+            gpu_idx,
+        )?,
+        ffn_norm: upload_and_dequant(
+            gguf,
+            &format!("{pfx}.ffn_norm.weight"),
+            alloc,
+            dequant,
+            gpu_idx,
+        )?,
         attn_q: upload_quantized(gguf, &format!("{pfx}.attn_q.weight"), alloc, gpu_idx)?,
         attn_k: upload_quantized(gguf, &format!("{pfx}.attn_k.weight"), alloc, gpu_idx)?,
         attn_v: upload_quantized(gguf, &format!("{pfx}.attn_v.weight"), alloc, gpu_idx)?,
@@ -541,8 +791,14 @@ fn load_layer_to_host(
 ) -> Result<HostLayerLayout, LoadError> {
     let layer_start = buf.len();
 
-    fn read_tensor(gguf: &GgufFile, name: &str, buf: &mut Vec<u8>, base: usize) -> Result<TensorSlot, LoadError> {
-        let (ti, data) = gguf.tensor_data_by_name(name)
+    fn read_tensor(
+        gguf: &GgufFile,
+        name: &str,
+        buf: &mut Vec<u8>,
+        base: usize,
+    ) -> Result<TensorSlot, LoadError> {
+        let (ti, data) = gguf
+            .tensor_data_by_name(name)
             .map_err(|_| LoadError::MissingTensor(name.to_string()))?;
         let off = buf.len() - base;
         buf.extend_from_slice(data);
@@ -554,7 +810,12 @@ fn load_layer_to_host(
         })
     }
 
-    fn try_read_tensor(gguf: &GgufFile, name: &str, buf: &mut Vec<u8>, base: usize) -> Result<Option<TensorSlot>, LoadError> {
+    fn try_read_tensor(
+        gguf: &GgufFile,
+        name: &str,
+        buf: &mut Vec<u8>,
+        base: usize,
+    ) -> Result<Option<TensorSlot>, LoadError> {
         if gguf.find_tensor(name).is_some() {
             Ok(Some(read_tensor(gguf, name, buf, base)?))
         } else {
@@ -581,7 +842,9 @@ fn load_layer_to_host(
         None
     };
 
-    let layer_output_scale = if let Ok((_ti, data)) = gguf.tensor_data_by_name(&format!("{pfx}.layer_output_scale.weight")) {
+    let layer_output_scale = if let Ok((_ti, data)) =
+        gguf.tensor_data_by_name(&format!("{pfx}.layer_output_scale.weight"))
+    {
         if data.len() >= 4 {
             Some(f32::from_le_bytes([data[0], data[1], data[2], data[3]]))
         } else {
@@ -635,11 +898,13 @@ fn allocate_layer_shell(
     // For the quantized weight buffers, allocate max_layer_bytes each (overkill but safe).
     // The norm buffers (f16) are small — dim elements.
     let alloc_u8 = |size: usize| -> Result<CudaSlice<u8>, LoadError> {
-        stream.alloc_zeros::<u8>(size)
+        stream
+            .alloc_zeros::<u8>(size)
             .map_err(|e| LoadError::Vram(chew_vram::VramError::Alloc(e.to_string())))
     };
     let alloc_f16 = |size: usize| -> Result<CudaSlice<half::f16>, LoadError> {
-        stream.alloc_zeros::<half::f16>(size)
+        stream
+            .alloc_zeros::<half::f16>(size)
             .map_err(|e| LoadError::Vram(chew_vram::VramError::Alloc(e.to_string())))
     };
 
@@ -703,8 +968,16 @@ fn allocate_layer_shell(
         ffn_gate: mk_qw(gate_size)?,
         ffn_up: mk_qw(up_size)?,
         ffn_down: mk_qw(down_size)?,
-        attn_q_norm: if is_gemma4 { Some(alloc_f16(hd)?) } else { None },
-        attn_k_norm: if is_gemma4 { Some(alloc_f16(hd)?) } else { None },
+        attn_q_norm: if is_gemma4 {
+            Some(alloc_f16(hd)?)
+        } else {
+            None
+        },
+        attn_k_norm: if is_gemma4 {
+            Some(alloc_f16(hd)?)
+        } else {
+            None
+        },
         post_attention_norm: if is_gemma4 { Some(alloc_f16(d)?) } else { None },
         post_ffw_norm: if is_gemma4 { Some(alloc_f16(d)?) } else { None },
         post_norm: if is_gemma4 { Some(alloc_f16(d)?) } else { None },
@@ -770,10 +1043,87 @@ pub(crate) fn upload_and_dequant(
     let mut dst_gpu = stream
         .alloc_zeros::<half::f16>(n_elements)
         .map_err(|e| LoadError::Vram(chew_vram::VramError::Alloc(e.to_string())))?;
-    dequant.dequant(&src_gpu, &mut dst_gpu, n_elements as u32, tensor_info.ggml_type)?;
+    dequant.dequant(
+        &src_gpu,
+        &mut dst_gpu,
+        n_elements as u32,
+        tensor_info.ggml_type,
+    )?;
     // src_gpu dropped here, freeing quantized bytes
 
     Ok(dst_gpu)
+}
+
+/// Resolve the first tensor name that exists from a list of aliases.
+pub(crate) fn resolve_tensor_name<'a>(
+    gguf: &GgufFile,
+    names: &'a [&'a str],
+) -> Result<&'a str, LoadError> {
+    names
+        .iter()
+        .copied()
+        .find(|name| gguf.find_tensor(name).is_some())
+        .ok_or_else(|| LoadError::MissingTensor(names.join(" | ")))
+}
+
+/// Upload quantized tensor using the first available alias.
+pub(crate) fn upload_quantized_any(
+    gguf: &GgufFile,
+    names: &[&str],
+    alloc: &VramAllocator,
+    gpu_idx: usize,
+) -> Result<QuantWeight, LoadError> {
+    let name = resolve_tensor_name(gguf, names)?;
+    upload_quantized(gguf, name, alloc, gpu_idx)
+}
+
+/// Upload and dequantize tensor using the first available alias.
+pub(crate) fn upload_and_dequant_any(
+    gguf: &GgufFile,
+    names: &[&str],
+    alloc: &VramAllocator,
+    dequant: &DequantKernels,
+    gpu_idx: usize,
+) -> Result<CudaSlice<half::f16>, LoadError> {
+    let name = resolve_tensor_name(gguf, names)?;
+    upload_and_dequant(gguf, name, alloc, dequant, gpu_idx)
+}
+
+/// Optional quantized upload using the first available alias.
+pub(crate) fn try_upload_quantized_any(
+    gguf: &GgufFile,
+    names: &[&str],
+    alloc: &VramAllocator,
+    gpu_idx: usize,
+) -> Result<Option<QuantWeight>, LoadError> {
+    match names
+        .iter()
+        .copied()
+        .find(|name| gguf.find_tensor(name).is_some())
+    {
+        Some(name) => Ok(Some(upload_quantized(gguf, name, alloc, gpu_idx)?)),
+        None => Ok(None),
+    }
+}
+
+/// Optional dequantized upload using the first available alias.
+pub(crate) fn try_upload_and_dequant_any(
+    gguf: &GgufFile,
+    names: &[&str],
+    alloc: &VramAllocator,
+    dequant: &DequantKernels,
+    gpu_idx: usize,
+) -> Result<Option<CudaSlice<half::f16>>, LoadError> {
+    match names
+        .iter()
+        .copied()
+        .find(|name| gguf.find_tensor(name).is_some())
+    {
+        Some(name) => Ok(Some(upload_and_dequant(
+            gguf, name, alloc, dequant, gpu_idx,
+        )?)),
+        None => Ok(None),
+    }
 }
 
 /// Try to upload and dequant — returns None if tensor doesn't exist.
@@ -785,7 +1135,9 @@ fn try_upload_and_dequant(
     gpu_idx: usize,
 ) -> Result<Option<CudaSlice<half::f16>>, LoadError> {
     if gguf.find_tensor(name).is_some() {
-        Ok(Some(upload_and_dequant(gguf, name, alloc, dequant, gpu_idx)?))
+        Ok(Some(upload_and_dequant(
+            gguf, name, alloc, dequant, gpu_idx,
+        )?))
     } else {
         Ok(None)
     }

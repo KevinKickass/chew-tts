@@ -1,6 +1,6 @@
 //! Validate token_embd dequantization at specific rows (including BOS=128000).
 //! CPU-dequants Q4_K blocks for reference, then compares against GPU dequant.
-use chew_gguf::{GgufFile, GgmlType};
+use chew_gguf::{GgmlType, GgufFile};
 use chew_kernel::DequantKernels;
 use cudarc::driver::CudaContext;
 use std::sync::Arc;
@@ -54,14 +54,21 @@ fn dequant_q4k_row_cpu(raw: &[u8], row: usize, dim: usize) -> Vec<f32> {
 }
 
 fn main() {
-    let path = std::env::args().nth(1).expect("usage: validate_embedding <model.gguf>");
+    let path = std::env::args()
+        .nth(1)
+        .expect("usage: validate_embedding <model.gguf>");
     let gguf = GgufFile::open(&path).expect("failed to open GGUF");
 
-    let (tensor, raw) = gguf.tensor_data_by_name("token_embd.weight").expect("no token_embd.weight");
+    let (tensor, raw) = gguf
+        .tensor_data_by_name("token_embd.weight")
+        .expect("no token_embd.weight");
     let n_elements = tensor.n_elements() as usize;
     let dim = 4096usize;
     let vocab = n_elements / dim;
-    println!("token_embd: {:?}, vocab={}, dim={}, n_elements={}", tensor.ggml_type, vocab, dim, n_elements);
+    println!(
+        "token_embd: {:?}, vocab={}, dim={}, n_elements={}",
+        tensor.ggml_type, vocab, dim, n_elements
+    );
     println!("raw bytes: {}", raw.len());
 
     assert_eq!(tensor.ggml_type, GgmlType::Q4_K, "expected Q4_K embedding");
@@ -76,7 +83,10 @@ fn main() {
         let first8: Vec<f32> = cpu_row[..8].to_vec();
         let nonzero = cpu_row.iter().filter(|&&v| v.abs() > 1e-10).count();
         let sum: f32 = cpu_row.iter().sum();
-        println!("  row {:6}: first8={:?}  nonzero={}/{}  sum={:.6}", row, first8, nonzero, dim, sum);
+        println!(
+            "  row {:6}: first8={:?}  nonzero={}/{}  sum={:.6}",
+            row, first8, nonzero, dim, sum
+        );
     }
 
     // GPU dequant of full tensor
@@ -93,7 +103,9 @@ fn main() {
     let mut dst_gpu = stream.alloc_zeros::<half::f16>(n_elements).unwrap();
 
     // Dequantize
-    dequant.dequant(&src_gpu, &mut dst_gpu, n_elements as u32, GgmlType::Q4_K).unwrap();
+    dequant
+        .dequant(&src_gpu, &mut dst_gpu, n_elements as u32, GgmlType::Q4_K)
+        .unwrap();
 
     // Download specific rows and compare
     println!("\n=== GPU vs CPU comparison ===");
@@ -111,8 +123,12 @@ fn main() {
         let mut mismatches = 0;
         for i in 0..dim {
             let err = (gpu_f32[i] - cpu_row[i]).abs();
-            if err > max_err { max_err = err; }
-            if err > 0.01 { mismatches += 1; }
+            if err > max_err {
+                max_err = err;
+            }
+            if err > 0.01 {
+                mismatches += 1;
+            }
         }
 
         let gpu_first8: Vec<f32> = gpu_f32[..8].to_vec();
@@ -120,8 +136,10 @@ fn main() {
         let gpu_nonzero = gpu_f32.iter().filter(|&&v| v.abs() > 1e-10).count();
         let status = if mismatches == 0 { "PASS" } else { "FAIL" };
 
-        println!("  row {:6}: max_err={:.6}  mismatches={}  {}",
-            row, max_err, mismatches, status);
+        println!(
+            "  row {:6}: max_err={:.6}  mismatches={}  {}",
+            row, max_err, mismatches, status
+        );
         println!("    CPU first8: {:?}", cpu_first8);
         println!("    GPU first8: {:?}", gpu_first8);
         println!("    GPU nonzero: {}/{}", gpu_nonzero, dim);

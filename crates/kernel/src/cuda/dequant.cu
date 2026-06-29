@@ -60,6 +60,37 @@ __global__ void dequant_q4_0(const void* __restrict__ src,
 // --- Q5_1: 32 weights per block, 24 bytes/block ---
 // Layout: f16 d (scale), f16 m (min), u32 qh (high bits), 16 bytes qs (4-bit low)
 // val = d * (q_low + 16 * q_high) + m
+__global__ void dequant_q5_0(const void* __restrict__ src,
+                              __half* __restrict__ dst,
+                              int n_elements) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_elements) return;
+
+    int block_idx = idx / 32;
+    int in_block  = idx % 32;
+
+    // block_q5_0: d (f16) + qh (4 bytes) + qs (16 bytes) = 22 bytes / 32 values
+    const uint8_t* block = (const uint8_t*)src + block_idx * 22;
+    float d = __half2float(*(const __half*)block);
+    // Q5_0 block is 22 bytes — NOT 4-byte aligned, so read qh byte-wise to
+    // avoid a misaligned 32-bit load.
+    const uint8_t* qhb = block + 2;
+    uint32_t qh = (uint32_t)qhb[0] | ((uint32_t)qhb[1] << 8)
+                | ((uint32_t)qhb[2] << 16) | ((uint32_t)qhb[3] << 24);
+    const uint8_t* qs = block + 6;
+
+    // ggml Q5_0 layout: value v uses qs[v % 16], low nibble if v < 16 else high
+    // nibble; the 5th bit is qh bit v. (NOT the 2k/2k+1 interleaving used by
+    // chew's other legacy kernels — that ordering is wrong vs ggml.)
+    int j = in_block % 16;
+    uint8_t byte = qs[j];
+    int q_low = (in_block < 16) ? (byte & 0x0F) : ((byte >> 4) & 0x0F);
+    int q_high = (qh >> in_block) & 1;
+
+    // Q5_0: x = d * (q - 16), q = low4 | (high << 4)
+    dst[idx] = __float2half(d * ((float)(q_low | (q_high << 4)) - 16.0f));
+}
+
 __global__ void dequant_q5_1(const void* __restrict__ src,
                               __half* __restrict__ dst,
                               int n_elements) {

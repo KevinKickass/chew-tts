@@ -7,7 +7,10 @@ fn main() {
 
     println!("=== GGUF Header ===");
     println!("  Version:    {}", gguf.header.version);
-    println!("  Arch:       {}", gguf.header.architecture().unwrap_or("?"));
+    println!(
+        "  Arch:       {}",
+        gguf.header.architecture().unwrap_or("?")
+    );
     println!("  Model:      {}", gguf.header.model_name().unwrap_or("?"));
     println!("  Vocab:      {:?}", gguf.header.vocab_size());
     println!("  Layers:     {:?}", gguf.header.block_count());
@@ -19,11 +22,15 @@ fn main() {
     println!("  FF length:  {:?}", gguf.header.feed_forward_length());
     println!("  Context:    {:?}", gguf.header.context_length());
     println!("  Tensors:    {}", gguf.header.n_tensors);
-    println!("  Data size:  {:.1} MB", gguf.total_data_bytes() as f64 / (1024.0 * 1024.0));
+    println!(
+        "  Data size:  {:.1} MB",
+        gguf.total_data_bytes() as f64 / (1024.0 * 1024.0)
+    );
     println!();
 
     // Count quant types
-    let mut type_counts: std::collections::HashMap<String, (usize, u64)> = std::collections::HashMap::new();
+    let mut type_counts: std::collections::HashMap<String, (usize, u64)> =
+        std::collections::HashMap::new();
     for t in &gguf.tensors {
         let entry = type_counts.entry(format!("{}", t.ggml_type)).or_default();
         entry.0 += 1;
@@ -31,9 +38,14 @@ fn main() {
     }
     println!("=== Quant Type Distribution ===");
     let mut types: Vec<_> = type_counts.iter().collect();
-    types.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
+    types.sort_by(|a, b| b.1.1.cmp(&a.1.1));
     for (name, (count, bytes)) in &types {
-        println!("  {:10} {:4} tensors  {:8.1} MB", name, count, *bytes as f64 / (1024.0 * 1024.0));
+        println!(
+            "  {:10} {:4} tensors  {:8.1} MB",
+            name,
+            count,
+            *bytes as f64 / (1024.0 * 1024.0)
+        );
     }
     println!();
 

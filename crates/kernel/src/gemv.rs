@@ -1,6 +1,6 @@
+use crate::fast_launch::{FastStream, scalar_ptr, slice_ptr, slice_ptr_mut, view_ptr};
 use crate::loader::{self, KernelError};
-use crate::fast_launch::{FastStream, slice_ptr, slice_ptr_mut, scalar_ptr};
-use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
+use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, CudaStream, CudaView, LaunchConfig};
 use std::sync::Arc;
 
 const GEMV_CU: &str = include_str!("cuda/gemv.cu");
@@ -28,7 +28,8 @@ impl GemvKernels {
 
         // Q8_1: 36 bytes per 32 elements (half2 ds + int8_t qs[32])
         let q8_bytes = (max_k / 32) * 36;
-        let x_q8 = stream.alloc_zeros::<u8>(q8_bytes)
+        let x_q8 = stream
+            .alloc_zeros::<u8>(q8_bytes)
             .map_err(|e| KernelError::Launch(e.to_string()))?;
 
         Ok(Self {
@@ -76,9 +77,19 @@ impl GemvKernels {
     pub fn quantize_input(&mut self, x: &CudaSlice<half::f16>, k: u32) -> Result<(), KernelError> {
         let k_i32 = k as i32;
         let mut args = [
-            slice_ptr(x), slice_ptr_mut(&mut self.x_q8), scalar_ptr(&k_i32),
+            slice_ptr(x),
+            slice_ptr_mut(&mut self.x_q8),
+            scalar_ptr(&k_i32),
         ];
-        unsafe { self.fast.fire(&self.quantize_x, ((k+255)/256, 1, 1), (256, 1, 1), 0, &mut args); }
+        unsafe {
+            self.fast.fire(
+                &self.quantize_x,
+                ((k + 255) / 256, 1, 1),
+                (256, 1, 1),
+                0,
+                &mut args,
+            );
+        }
         Ok(())
     }
 
@@ -105,10 +116,51 @@ impl GemvKernels {
         let k_i32 = k as i32;
 
         let mut args = [
-            slice_ptr(w), slice_ptr(x), slice_ptr_mut(out),
-            scalar_ptr(&n_i32), scalar_ptr(&k_i32), slice_ptr(&self.x_q8),
+            slice_ptr(w),
+            slice_ptr(x),
+            slice_ptr_mut(out),
+            scalar_ptr(&n_i32),
+            scalar_ptr(&k_i32),
+            slice_ptr(&self.x_q8),
         ];
-        unsafe { self.fast.fire(kernel, (n, 1, 1), (128, 1, 1), 0, &mut args); }
+        unsafe {
+            self.fast.fire(kernel, (n, 1, 1), (128, 1, 1), 0, &mut args);
+        }
+        Ok(true)
+    }
+
+    /// Fused quantized GEMV over a sliced weight view (one expert slice, etc.).
+    /// Assumes quantize_input was called with the current x.
+    pub fn gemv_view(
+        &self,
+        w: &CudaView<'_, u8>,
+        x: &CudaSlice<half::f16>,
+        out: &mut CudaSlice<half::f16>,
+        n: u32,
+        k: u32,
+        quant_type: chew_gguf::GgmlType,
+    ) -> Result<bool, KernelError> {
+        let kernel = match quant_type {
+            chew_gguf::GgmlType::Q4_K => &self.q4_k,
+            chew_gguf::GgmlType::Q6_K => &self.q6_k,
+            chew_gguf::GgmlType::Q8_0 => &self.q8_0,
+            _ => return Ok(false),
+        };
+
+        let n_i32 = n as i32;
+        let k_i32 = k as i32;
+
+        let mut args = [
+            view_ptr(w),
+            slice_ptr(x),
+            slice_ptr_mut(out),
+            scalar_ptr(&n_i32),
+            scalar_ptr(&k_i32),
+            slice_ptr(&self.x_q8),
+        ];
+        unsafe {
+            self.fast.fire(kernel, (n, 1, 1), (128, 1, 1), 0, &mut args);
+        }
         Ok(true)
     }
 
@@ -139,12 +191,18 @@ impl GemvKernels {
         let k_i32 = k as i32;
 
         let mut args: [*mut std::ffi::c_void; 7] = [
-            slice_ptr(w_gate), slice_ptr(w_up),
-            slice_ptr_mut(out_gate), slice_ptr_mut(out_up),
-            scalar_ptr(&n_i32), scalar_ptr(&k_i32), slice_ptr(&self.x_q8),
+            slice_ptr(w_gate),
+            slice_ptr(w_up),
+            slice_ptr_mut(out_gate),
+            slice_ptr_mut(out_up),
+            scalar_ptr(&n_i32),
+            scalar_ptr(&k_i32),
+            slice_ptr(&self.x_q8),
         ];
-        unsafe { self.fast.fire(&self.dual_q4_k, (n, 1, 1), (128, 1, 1), 0, &mut args); }
+        unsafe {
+            self.fast
+                .fire(&self.dual_q4_k, (n, 1, 1), (128, 1, 1), 0, &mut args);
+        }
         Ok(true)
     }
-
 }

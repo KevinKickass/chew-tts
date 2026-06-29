@@ -60,7 +60,10 @@ impl VramPool {
     }
 
     /// Get a reference to an allocation's buffer for uploading data.
-    pub fn get_buffer_mut(&self, name: &str) -> Option<parking_lot::MappedRwLockWriteGuard<'_, GpuBuffer>> {
+    pub fn get_buffer_mut(
+        &self,
+        name: &str,
+    ) -> Option<parking_lot::MappedRwLockWriteGuard<'_, GpuBuffer>> {
         let guard = self.allocations.write();
         parking_lot::RwLockWriteGuard::try_map(guard, |map| map.get_mut(name)).ok()
     }

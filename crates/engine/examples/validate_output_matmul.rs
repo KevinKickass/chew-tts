@@ -1,7 +1,7 @@
 //! Validate the output projection matmul (which uses chunked GEMM).
 //! Creates a simple input vector, runs the matmul on GPU, and compares
 //! specific output elements against CPU-computed dot products.
-use chew_gguf::{GgufFile, GgmlType};
+use chew_gguf::{GgmlType, GgufFile};
 use chew_kernel::{DequantKernels, Gemm};
 use cudarc::driver::CudaContext;
 use std::sync::Arc;
@@ -23,8 +23,12 @@ fn dequant_q6k_row_cpu(raw: &[u8], row_idx: usize, k: usize) -> Vec<f32> {
         for idx in 0..256 {
             let sub = idx / 16;
             let scale = sc[sub] as i8;
-            let ql_val = if idx % 2 == 0 { ql[idx/2] & 0x0F } else { (ql[idx/2] >> 4) & 0x0F };
-            let qh_val = (qh[idx/4] >> (2 * (idx % 4))) & 0x03;
+            let ql_val = if idx % 2 == 0 {
+                ql[idx / 2] & 0x0F
+            } else {
+                (ql[idx / 2] >> 4) & 0x0F
+            };
+            let qh_val = (qh[idx / 4] >> (2 * (idx % 4))) & 0x03;
             let q = (ql_val | (qh_val << 4)) as i32 - 32;
             result[b * 256 + idx] = d * scale as f32 * q as f32;
         }
@@ -33,14 +37,24 @@ fn dequant_q6k_row_cpu(raw: &[u8], row_idx: usize, k: usize) -> Vec<f32> {
 }
 
 fn main() {
-    let path = std::env::args().nth(1).expect("usage: validate_output_matmul <model.gguf>");
+    let path = std::env::args()
+        .nth(1)
+        .expect("usage: validate_output_matmul <model.gguf>");
     let gguf = GgufFile::open(&path).expect("failed to open GGUF");
 
     // Get output.weight tensor
-    let (tensor, raw) = gguf.tensor_data_by_name("output.weight").expect("no output.weight");
+    let (tensor, raw) = gguf
+        .tensor_data_by_name("output.weight")
+        .expect("no output.weight");
     let k = 4096u32;
-    let n = (tensor.n_elements() as u32) / k;  // vocab_size
-    println!("output.weight: {:?}, n={}, k={}, n_elements={}", tensor.ggml_type, n, k, tensor.n_elements());
+    let n = (tensor.n_elements() as u32) / k; // vocab_size
+    println!(
+        "output.weight: {:?}, n={}, k={}, n_elements={}",
+        tensor.ggml_type,
+        n,
+        k,
+        tensor.n_elements()
+    );
 
     // Create simple input: all ones
     let input_f32: Vec<f32> = vec![1.0f32; k as usize];
@@ -51,7 +65,7 @@ fn main() {
     let mut cpu_dots = Vec::new();
     for &row in &test_rows {
         let weight_row = dequant_q6k_row_cpu(raw, row, k as usize);
-        let dot: f32 = weight_row.iter().sum();  // dot with all-ones = sum
+        let dot: f32 = weight_row.iter().sum(); // dot with all-ones = sum
         cpu_dots.push(dot);
         println!("CPU dot product (row {}): {:.6}", row, dot);
     }
@@ -82,9 +96,12 @@ fn main() {
         tensor.ggml_type,
         tensor.n_elements() as u32,
         &mut c_gpu,
-        1, n, k,
+        1,
+        n,
+        k,
         &dequant,
-    ).unwrap();
+    )
+    .unwrap();
 
     // Download result
     let mut c_host = vec![half::f16::ZERO; n as usize];
@@ -95,14 +112,24 @@ fn main() {
         let gpu_val = c_host[row].to_f32();
         let cpu_val = cpu_dots[i];
         let err = (gpu_val - cpu_val).abs();
-        let pct = if cpu_val.abs() > 1e-6 { err / cpu_val.abs() * 100.0 } else { 0.0 };
+        let pct = if cpu_val.abs() > 1e-6 {
+            err / cpu_val.abs() * 100.0
+        } else {
+            0.0
+        };
         let status = if pct < 1.0 { "OK" } else { "MISMATCH" };
-        println!("  row {:6}: gpu={:10.4} cpu={:10.4} err={:.4} ({:.1}%) {}",
-            row, gpu_val, cpu_val, err, pct, status);
+        println!(
+            "  row {:6}: gpu={:10.4} cpu={:10.4} err={:.4} ({:.1}%) {}",
+            row, gpu_val, cpu_val, err, pct, status
+        );
     }
 
     // Check top-5 by GPU value
-    let mut indexed: Vec<(usize, f32)> = c_host.iter().enumerate().map(|(i, h)| (i, h.to_f32())).collect();
+    let mut indexed: Vec<(usize, f32)> = c_host
+        .iter()
+        .enumerate()
+        .map(|(i, h)| (i, h.to_f32()))
+        .collect();
     indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     println!("\nGPU top 5 outputs:");
     for (idx, val) in indexed.iter().take(5) {

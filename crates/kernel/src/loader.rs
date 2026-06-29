@@ -1,5 +1,5 @@
 use cudarc::driver::{CudaFunction, CudaModule, CudaStream};
-use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions, Ptx};
+use cudarc::nvrtc::{CompileOptions, Ptx, compile_ptx_with_opts};
 use std::sync::Arc;
 use tracing::{info, warn};
 
@@ -14,7 +14,10 @@ fn find_cuda_include() -> Option<String> {
         }
         // Also check targets/ subdirectory
         let inc_targets = format!("{cuda_path}/targets/x86_64-linux/include");
-        if std::path::Path::new(&inc_targets).join("cuda_fp16.h").exists() {
+        if std::path::Path::new(&inc_targets)
+            .join("cuda_fp16.h")
+            .exists()
+        {
             return Some(inc_targets);
         }
     }
@@ -25,7 +28,10 @@ fn find_cuda_include() -> Option<String> {
         return Some(default.to_string());
     }
     let default_targets = "/usr/local/cuda/targets/x86_64-linux/include";
-    if std::path::Path::new(default_targets).join("cuda_fp16.h").exists() {
+    if std::path::Path::new(default_targets)
+        .join("cuda_fp16.h")
+        .exists()
+    {
         return Some(default_targets.to_string());
     }
 
@@ -113,7 +119,11 @@ fn downgrade_ptx_version_if_needed(ptx: Ptx) -> Ptx {
     let driver_version = {
         let mut ver: core::ffi::c_int = 0;
         let res = unsafe { cudarc::driver::sys::cuDriverGetVersion(&mut ver) };
-        if res == cudarc::driver::sys::CUresult::CUDA_SUCCESS { ver as u32 } else { 0 }
+        if res == cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+            ver as u32
+        } else {
+            0
+        }
     };
 
     // Map driver version to max PTX ISA version:
@@ -136,10 +146,14 @@ fn downgrade_ptx_version_if_needed(ptx: Ptx) -> Ptx {
         let after = &src[ver_start + 9..];
         if let Some(dot) = after.find('.') {
             let major_str = &after[..dot];
-            let minor_end = after[dot + 1..].find(|c: char| !c.is_ascii_digit()).unwrap_or(after.len() - dot - 1);
+            let minor_end = after[dot + 1..]
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(after.len() - dot - 1);
             let minor_str = &after[dot + 1..dot + 1 + minor_end];
 
-            if let (Ok(ptx_major), Ok(ptx_minor)) = (major_str.parse::<u32>(), minor_str.parse::<u32>()) {
+            if let (Ok(ptx_major), Ok(ptx_minor)) =
+                (major_str.parse::<u32>(), minor_str.parse::<u32>())
+            {
                 if ptx_major > max_ptx.0 || (ptx_major == max_ptx.0 && ptx_minor > max_ptx.1) {
                     let old_ver = format!(".version {ptx_major}.{ptx_minor}");
                     let new_ver = format!(".version {}.{}", max_ptx.0, max_ptx.1);

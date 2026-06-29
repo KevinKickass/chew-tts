@@ -75,8 +75,7 @@ impl GgufFile {
                 shape.push(cursor.read_u64::<LittleEndian>()?);
             }
             let type_id = cursor.read_u32::<LittleEndian>()?;
-            let ggml_type =
-                GgmlType::from_u32(type_id).ok_or(GgufError::UnknownType(type_id))?;
+            let ggml_type = GgmlType::from_u32(type_id).ok_or(GgufError::UnknownType(type_id))?;
             let offset = cursor.read_u64::<LittleEndian>()?;
 
             tensors.push(TensorInfo {
@@ -208,10 +207,7 @@ fn read_metadata_value(cursor: &mut Cursor<&[u8]>) -> Result<MetadataValue, Gguf
     }
 }
 
-fn read_typed_value(
-    cursor: &mut Cursor<&[u8]>,
-    type_id: u32,
-) -> Result<MetadataValue, GgufError> {
+fn read_typed_value(cursor: &mut Cursor<&[u8]>, type_id: u32) -> Result<MetadataValue, GgufError> {
     match type_id {
         0 => Ok(MetadataValue::Uint8(cursor.read_u8()?)),
         1 => Ok(MetadataValue::Int8(cursor.read_i8()?)),

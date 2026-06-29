@@ -3,7 +3,6 @@
 /// These run on CPU to extract f32 weights from quantized blocks.
 /// For GPU inference, the dequant happens in CUDA kernels (chew-kernel crate).
 /// This module is used for validation, debugging, and CPU fallback.
-
 use crate::types::GgmlType;
 
 /// Dequantize a block of quantized data to f32.

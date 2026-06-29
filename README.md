@@ -13,6 +13,7 @@ Built in Rust with raw CUDA (cudarc + NVRTC), no llama.cpp dependency.
 - **OpenAI-compatible API** — `/v1/chat/completions` endpoint.
 - **Built-in Web UI** — dark theme chat interface at `/`.
 - **NVRTC runtime compilation** — CUDA kernels compiled at startup, auto-detects GPU arch and patches PTX versions.
+- **Architecture-aware loader** — picks runtime path by GGUF arch (`llama`, `gemma4`, `mamba`, `bert`) instead of defaulting through a single transformer path.
 
 ## Architecture
 

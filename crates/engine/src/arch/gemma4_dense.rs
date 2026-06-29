@@ -1,6 +1,6 @@
-use crate::config::ModelConfig;
 use crate::arch::gemma4_common::PerLayerEmbeddings;
-use crate::forward::{ScratchBuffers, gemm_q};
+use crate::config::ModelConfig;
+use crate::forward::{ScratchBuffers, gemm_q, project_last_logits};
 use crate::kv_cache::KvCache;
 use crate::weights::ModelWeights;
 use chew_kernel::{GpuKernels, KernelError};
@@ -32,8 +32,11 @@ pub fn forward(
     for layer_idx in 0..n_layers {
         let layer = &weights.layers[layer_idx];
         let hd = config.layer_head_dim(layer_idx);
+        let kv_heads = config.layer_kv_heads(layer_idx);
         let has_kv = config.has_kv(layer_idx);
         let rope_theta = config.layer_rope_theta(layer_idx);
+        let attn_window = config.layer_attention_window(layer_idx);
+        let is_swa = config.is_swa(layer_idx);
 
         let dbg_layer = layer_idx <= 1 && seq_len > 1;
         macro_rules! check_nan {
@@ -43,16 +46,27 @@ pub fn forward(
                     let mut d = vec![half::f16::ZERO; cnt];
                     let _ = stream_ref.memcpy_dtoh(&$buf.slice(0..cnt), &mut d);
                     let nan = d.iter().any(|x| x.to_f32().is_nan());
-                    let mx = d.iter().map(|x| x.to_f32().abs()).filter(|x| x.is_finite()).fold(0f32, f32::max);
-                    if nan { tracing::error!(layer=layer_idx, mx, "NaN in {}", $label); }
-                    else { tracing::info!(layer=layer_idx, mx, "OK {}", $label); }
+                    let mx = d
+                        .iter()
+                        .map(|x| x.to_f32().abs())
+                        .filter(|x| x.is_finite())
+                        .fold(0f32, f32::max);
+                    if nan {
+                        tracing::error!(layer = layer_idx, mx, "NaN in {}", $label);
+                    } else {
+                        tracing::debug!(layer = layer_idx, mx, "OK {}", $label);
+                    }
                 }
             };
         }
 
         kernels.ops.rms_norm_f32in(
-            hidden, &layer.attn_norm, &mut scratch.norm_out,
-            seq_len, config.dim, config.rms_norm_eps,
+            hidden,
+            &layer.attn_norm,
+            &mut scratch.norm_out,
+            seq_len,
+            config.dim,
+            config.rms_norm_eps,
         )?;
         check_nan!(scratch.norm_out, seq_len * config.dim, "after_attn_norm");
 
@@ -60,33 +74,54 @@ pub fn forward(
         if deep_dbg {
             let last_off = ((seq_len - 1) * config.dim) as usize;
             let mut d = vec![half::f16::ZERO; 8];
-            let _ = stream_ref.memcpy_dtoh(&scratch.norm_out.slice(last_off..last_off+8), &mut d);
+            let _ = stream_ref.memcpy_dtoh(&scratch.norm_out.slice(last_off..last_off + 8), &mut d);
             let vals: Vec<f32> = d.iter().map(|x| x.to_f32()).collect();
-            tracing::info!(?vals, "L0_NORM_OUT last pos [0:8]");
+            tracing::debug!(?vals, "L0_NORM_OUT last pos [0:8]");
         }
 
         let q_dim = config.n_heads * hd;
-        let kv_dim = config.n_kv_heads * hd;
+        let kv_dim = kv_heads * hd;
 
         if seq_len == 1 {
             kernels.gemv.quantize_input(&scratch.norm_out, config.dim)?;
         }
 
-        gemm_q(kernels, &scratch.norm_out, &layer.attn_q, &mut scratch.q,
-            seq_len, q_dim, config.dim)?;
+        gemm_q(
+            kernels,
+            &scratch.norm_out,
+            &layer.attn_q,
+            &mut scratch.q,
+            seq_len,
+            q_dim,
+            config.dim,
+        )?;
         check_nan!(scratch.q, seq_len * q_dim, "after_Q_proj");
         if deep_dbg {
             let last_off = ((seq_len - 1) * q_dim) as usize;
             let mut d = vec![half::f16::ZERO; 8];
-            let _ = stream_ref.memcpy_dtoh(&scratch.q.slice(last_off..last_off+8), &mut d);
+            let _ = stream_ref.memcpy_dtoh(&scratch.q.slice(last_off..last_off + 8), &mut d);
             let vals: Vec<f32> = d.iter().map(|x| x.to_f32()).collect();
-            tracing::info!(?vals, "L0_Q_PROJ last pos [0:8]");
+            tracing::debug!(?vals, "L0_Q_PROJ last pos [0:8]");
         }
-        gemm_q(kernels, &scratch.norm_out, &layer.attn_k, &mut scratch.k,
-            seq_len, kv_dim, config.dim)?;
+        gemm_q(
+            kernels,
+            &scratch.norm_out,
+            &layer.attn_k,
+            &mut scratch.k,
+            seq_len,
+            kv_dim,
+            config.dim,
+        )?;
         check_nan!(scratch.k, seq_len * kv_dim, "after_K_proj");
-        gemm_q(kernels, &scratch.norm_out, &layer.attn_v, &mut scratch.v,
-            seq_len, kv_dim, config.dim)?;
+        gemm_q(
+            kernels,
+            &scratch.norm_out,
+            &layer.attn_v,
+            &mut scratch.v,
+            seq_len,
+            kv_dim,
+            config.dim,
+        )?;
         check_nan!(scratch.v, seq_len * kv_dim, "after_V_proj");
 
         if let Some(ref q_norm) = layer.attn_q_norm {
@@ -94,8 +129,12 @@ pub fn forward(
             let dst_ptr = &mut scratch.q as *mut CudaSlice<half::f16>;
             unsafe {
                 kernels.ops.rms_norm(
-                    &*src_ptr, q_norm, &mut *dst_ptr,
-                    seq_len * config.n_heads, hd, config.rms_norm_eps,
+                    &*src_ptr,
+                    q_norm,
+                    &mut *dst_ptr,
+                    seq_len * config.n_heads,
+                    hd,
+                    config.rms_norm_eps,
                 )?;
             }
         }
@@ -103,10 +142,14 @@ pub fn forward(
             let src_ptr = &scratch.k as *const CudaSlice<half::f16>;
             let dst_ptr = &mut scratch.k as *mut CudaSlice<half::f16>;
             unsafe {
-                kernels.ops.rms_norm(
-                    &*src_ptr, k_norm, &mut *dst_ptr,
-                    seq_len * config.n_kv_heads, hd, config.rms_norm_eps,
-                )?;
+                    kernels.ops.rms_norm(
+                        &*src_ptr,
+                        k_norm,
+                        &mut *dst_ptr,
+                        seq_len * kv_heads,
+                        hd,
+                        config.rms_norm_eps,
+                    )?;
             }
         }
 
@@ -114,10 +157,13 @@ pub fn forward(
             let src_ptr = &scratch.v as *const CudaSlice<half::f16>;
             let dst_ptr = &mut scratch.v as *mut CudaSlice<half::f16>;
             unsafe {
-                kernels.ops.rms_norm_no_weight(
-                    &*src_ptr, &mut *dst_ptr,
-                    seq_len * config.n_kv_heads, hd, config.rms_norm_eps,
-                )?;
+                    kernels.ops.rms_norm_no_weight(
+                        &*src_ptr,
+                        &mut *dst_ptr,
+                        seq_len * kv_heads,
+                        hd,
+                        config.rms_norm_eps,
+                    )?;
             }
         }
 
@@ -128,23 +174,61 @@ pub fn forward(
         if deep_dbg {
             let last_off = ((seq_len - 1) * q_dim) as usize;
             let mut d = vec![half::f16::ZERO; 8];
-            let _ = stream_ref.memcpy_dtoh(&scratch.q.slice(last_off..last_off+8), &mut d);
+            let _ = stream_ref.memcpy_dtoh(&scratch.q.slice(last_off..last_off + 8), &mut d);
             let vals: Vec<f32> = d.iter().map(|x| x.to_f32()).collect();
-            tracing::info!(?vals, "L0_Q_NORM last pos [0:8]");
+            tracing::debug!(?vals, "L0_Q_NORM last pos [0:8]");
         }
 
-        let is_swa = config.is_swa(layer_idx);
         if !is_swa {
             if let Some(ref ff) = weights.rope_freq_factors {
-                kernels.ops.rope_neox_freqs(&mut scratch.q, ff, seq_len, config.n_heads, hd, pos, rope_theta)?;
-                kernels.ops.rope_neox_freqs(&mut scratch.k, ff, seq_len, config.n_kv_heads, hd, pos, rope_theta)?;
+                kernels.ops.rope_neox_freqs(
+                    &mut scratch.q,
+                    ff,
+                    seq_len,
+                    config.n_heads,
+                    hd,
+                    pos,
+                    rope_theta,
+                )?;
+                kernels.ops.rope_neox_freqs(
+                    &mut scratch.k,
+                    ff,
+                    seq_len,
+                    kv_heads,
+                    hd,
+                    pos,
+                    rope_theta,
+                )?;
             } else {
-                kernels.ops.rope_neox(&mut scratch.q, seq_len, config.n_heads, hd, pos, rope_theta)?;
-                kernels.ops.rope_neox(&mut scratch.k, seq_len, config.n_kv_heads, hd, pos, rope_theta)?;
+                kernels.ops.rope_neox(
+                    &mut scratch.q,
+                    seq_len,
+                    config.n_heads,
+                    hd,
+                    pos,
+                    rope_theta,
+                )?;
+                kernels.ops.rope_neox(
+                    &mut scratch.k,
+                    seq_len,
+                    kv_heads,
+                    hd,
+                    pos,
+                    rope_theta,
+                )?;
             }
         } else {
-            kernels.ops.rope_neox(&mut scratch.q, seq_len, config.n_heads, hd, pos, rope_theta)?;
-            kernels.ops.rope_neox(&mut scratch.k, seq_len, config.n_kv_heads, hd, pos, rope_theta)?;
+            kernels
+                .ops
+                .rope_neox(&mut scratch.q, seq_len, config.n_heads, hd, pos, rope_theta)?;
+            kernels.ops.rope_neox(
+                &mut scratch.k,
+                seq_len,
+                kv_heads,
+                hd,
+                pos,
+                rope_theta,
+            )?;
         }
         check_nan!(scratch.q, seq_len * q_dim, "after_RoPE_Q");
         check_nan!(scratch.k, seq_len * kv_dim, "after_RoPE_K");
@@ -152,9 +236,9 @@ pub fn forward(
         if deep_dbg {
             let last_off = ((seq_len - 1) * q_dim) as usize;
             let mut d = vec![half::f16::ZERO; 8];
-            let _ = stream_ref.memcpy_dtoh(&scratch.q.slice(last_off..last_off+8), &mut d);
+            let _ = stream_ref.memcpy_dtoh(&scratch.q.slice(last_off..last_off + 8), &mut d);
             let vals: Vec<f32> = d.iter().map(|x| x.to_f32()).collect();
-            tracing::info!(?vals, "L0_Q_ROPE last pos [0:8]");
+            tracing::debug!(?vals, "L0_Q_ROPE last pos [0:8]");
         }
 
         let kv_source = config.kv_source_layer(layer_idx);
@@ -174,9 +258,17 @@ pub fn forward(
             let k_full = kv_cache.k_full(kv_source, total_kv_len);
             let v_full = kv_cache.v_full(kv_source, total_kv_len);
             kernels.ops.mha_fused_scaled(
-                &scratch.q, &k_full, &v_full, &mut scratch.attn_mha_out,
-                hd, config.n_heads, config.n_kv_heads,
-                seq_len, total_kv_len, pos,
+                &scratch.q,
+                &k_full,
+                &v_full,
+                &mut scratch.attn_mha_out,
+                hd,
+                config.n_heads,
+                kv_heads,
+                seq_len,
+                total_kv_len,
+                pos,
+                attn_window,
                 config.attention_scale,
                 config.attn_logit_softcap.unwrap_or(0.0),
             )?;
@@ -186,53 +278,103 @@ pub fn forward(
         if seq_len == 1 {
             kernels.gemv.quantize_input(&scratch.attn_mha_out, q_dim)?;
         }
-        gemm_q(kernels, &scratch.attn_mha_out, &layer.attn_output, &mut scratch.attn_out,
-            seq_len, config.dim, q_dim)?;
+        gemm_q(
+            kernels,
+            &scratch.attn_mha_out,
+            &layer.attn_output,
+            &mut scratch.attn_out,
+            seq_len,
+            config.dim,
+            q_dim,
+        )?;
 
         check_nan!(scratch.attn_out, seq_len * config.dim, "after_output_proj");
 
         if let Some(ref pan) = layer.post_attention_norm {
             kernels.ops.post_norm_add(
-                hidden, &scratch.attn_out, pan, &mut scratch.norm_out,
-                seq_len, config.dim, config.rms_norm_eps,
+                hidden,
+                &scratch.attn_out,
+                pan,
+                &mut scratch.norm_out,
+                seq_len,
+                config.dim,
+                config.rms_norm_eps,
             )?;
         } else {
-            kernels.ops.add_inplace_f32_f16(hidden, &scratch.attn_out, seq_len * config.dim)?;
+            kernels
+                .ops
+                .add_inplace_f32_f16(hidden, &scratch.attn_out, seq_len * config.dim)?;
         }
 
         kernels.ops.rms_norm_f32in(
-            hidden, &layer.ffn_norm, &mut scratch.norm_out,
-            seq_len, config.dim, config.rms_norm_eps,
+            hidden,
+            &layer.ffn_norm,
+            &mut scratch.norm_out,
+            seq_len,
+            config.dim,
+            config.rms_norm_eps,
         )?;
 
         if seq_len == 1 {
             kernels.gemv.quantize_input(&scratch.norm_out, config.dim)?;
         }
-        gemm_q(kernels, &scratch.norm_out, &layer.ffn_gate, &mut scratch.ffn_gate_out,
-            seq_len, config.ff_dim, config.dim)?;
-        gemm_q(kernels, &scratch.norm_out, &layer.ffn_up, &mut scratch.ffn_up_out,
-            seq_len, config.ff_dim, config.dim)?;
+        gemm_q(
+            kernels,
+            &scratch.norm_out,
+            &layer.ffn_gate,
+            &mut scratch.ffn_gate_out,
+            seq_len,
+            config.ff_dim,
+            config.dim,
+        )?;
+        gemm_q(
+            kernels,
+            &scratch.norm_out,
+            &layer.ffn_up,
+            &mut scratch.ffn_up_out,
+            seq_len,
+            config.ff_dim,
+            config.dim,
+        )?;
 
         kernels.ops.gelu(
-            &scratch.ffn_gate_out, &scratch.ffn_up_out, &mut scratch.ffn_silu_out,
+            &scratch.ffn_gate_out,
+            &scratch.ffn_up_out,
+            &mut scratch.ffn_silu_out,
             seq_len * config.ff_dim,
         )?;
 
         if seq_len == 1 {
-            kernels.gemv.quantize_input(&scratch.ffn_silu_out, config.ff_dim)?;
+            kernels
+                .gemv
+                .quantize_input(&scratch.ffn_silu_out, config.ff_dim)?;
         }
-        gemm_q(kernels, &scratch.ffn_silu_out, &layer.ffn_down, &mut scratch.ffn_out,
-            seq_len, config.dim, config.ff_dim)?;
+        gemm_q(
+            kernels,
+            &scratch.ffn_silu_out,
+            &layer.ffn_down,
+            &mut scratch.ffn_out,
+            seq_len,
+            config.dim,
+            config.ff_dim,
+        )?;
 
         check_nan!(scratch.ffn_out, seq_len * config.dim, "after_ffn_down");
 
         if let Some(ref pfn) = layer.post_ffw_norm {
             kernels.ops.post_norm_add(
-                hidden, &scratch.ffn_out, pfn, &mut scratch.norm_out,
-                seq_len, config.dim, config.rms_norm_eps,
+                hidden,
+                &scratch.ffn_out,
+                pfn,
+                &mut scratch.norm_out,
+                seq_len,
+                config.dim,
+                config.rms_norm_eps,
             )?;
         } else {
-            kernels.ops.add_inplace_f32_f16(hidden, &scratch.ffn_out, seq_len * config.dim)?;
+            kernels
+                .ops
+                .add_inplace_f32_f16(hidden, &scratch.ffn_out, seq_len * config.dim)?;
         }
 
         if dbg_layer {
@@ -240,7 +382,12 @@ pub fn forward(
             let _ = stream_ref.memcpy_dtoh(&hidden.slice(0..8), &mut d);
             let nan = d.iter().any(|x| x.is_nan());
             let mx = d.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
-            tracing::info!(layer=layer_idx, nan, mx, "hidden after post-ffn-norm+scale");
+            tracing::debug!(
+                layer = layer_idx,
+                nan,
+                mx,
+                "hidden after post-ffn-norm+scale"
+            );
         }
 
         if seq_len > 1 {
@@ -249,32 +396,53 @@ pub fn forward(
             let _ = stream_ref.memcpy_dtoh(&hidden.slice(0..dbg.len()), &mut dbg);
             let has_nan = dbg.iter().any(|x| x.is_nan());
             let maxv = dbg.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
-            tracing::info!(layer = layer_idx, has_nan, maxv, first4 = ?&dbg[..4], "layer check");
+            tracing::debug!(layer = layer_idx, has_nan, maxv, first4 = ?&dbg[..4], "layer check");
         }
 
         if let (Some(inp_gate), Some(proj), Some(post_norm), Some(pe_data), Some(epl)) = (
-            &layer.inp_gate, &layer.proj, &layer.post_norm, pe, config.embd_per_layer,
+            &layer.inp_gate,
+            &layer.proj,
+            &layer.post_norm,
+            pe,
+            config.embd_per_layer,
         ) {
-            let pe_gate = scratch.pe_gate_out.as_mut().expect("pe_gate_out not allocated");
-            let pe_proj = scratch.pe_proj_out.as_mut().expect("pe_proj_out not allocated");
+            let pe_gate = scratch
+                .pe_gate_out
+                .as_mut()
+                .expect("pe_gate_out not allocated");
+            let pe_proj = scratch
+                .pe_proj_out
+                .as_mut()
+                .expect("pe_proj_out not allocated");
 
             let n_elems_pe = (seq_len * config.dim) as usize;
             {
                 let mut norm_view = scratch.norm_out.slice_mut(0..n_elems_pe);
-                kernels.ops.copy_f32_to_f16(hidden, &mut norm_view, seq_len * config.dim)?;
+                kernels
+                    .ops
+                    .copy_f32_to_f16(hidden, &mut norm_view, seq_len * config.dim)?;
             }
 
             if seq_len == 1 {
                 kernels.gemv.quantize_input(&scratch.norm_out, config.dim)?;
             }
-            gemm_q(kernels, &scratch.norm_out, inp_gate, pe_gate,
-                seq_len, epl, config.dim)?;
+            gemm_q(
+                kernels,
+                &scratch.norm_out,
+                inp_gate,
+                pe_gate,
+                seq_len,
+                epl,
+                config.dim,
+            )?;
 
             {
                 let src_ptr = pe_gate as *const CudaSlice<half::f16>;
                 let dst_ptr = pe_gate as *mut CudaSlice<half::f16>;
                 unsafe {
-                    kernels.ops.gelu_act(&*src_ptr, &mut *dst_ptr, seq_len * epl)?;
+                    kernels
+                        .ops
+                        .gelu_act(&*src_ptr, &mut *dst_ptr, seq_len * epl)?;
                 }
             }
 
@@ -284,8 +452,13 @@ pub fn forward(
                 let layer_off = (layer_idx as u32) * epl;
                 unsafe {
                     kernels.ops.pe_strided_mul(
-                        &*src_ptr, &pe_data.data, &mut *dst_ptr,
-                        epl, pe_data.row_width, layer_off, seq_len,
+                        &*src_ptr,
+                        &pe_data.data,
+                        &mut *dst_ptr,
+                        epl,
+                        pe_data.row_width,
+                        layer_off,
+                        seq_len,
                     )?;
                 }
             }
@@ -293,45 +466,55 @@ pub fn forward(
             if layer_idx == 0 && seq_len > 1 {
                 let last_off = ((seq_len - 1) * epl) as usize;
                 let mut d = vec![half::f16::ZERO; 8];
-                let _ = stream_ref.memcpy_dtoh(&pe_gate.slice(last_off..last_off+8), &mut d);
+                let _ = stream_ref.memcpy_dtoh(&pe_gate.slice(last_off..last_off + 8), &mut d);
                 let vals: Vec<f32> = d.iter().map(|x| x.to_f32()).collect();
-                tracing::info!(?vals, "PE_GATE_MUL L0 last pos [0:8]");
+                tracing::debug!(?vals, "PE_GATE_MUL L0 last pos [0:8]");
                 let pe_off = (9 * pe_data.row_width) as usize;
                 let mut pd = vec![half::f16::ZERO; 8];
-                let _ = stream_ref.memcpy_dtoh(&pe_data.data.slice(pe_off..pe_off+8), &mut pd);
+                let _ = stream_ref.memcpy_dtoh(&pe_data.data.slice(pe_off..pe_off + 8), &mut pd);
                 let pvals: Vec<f32> = pd.iter().map(|x| x.to_f32()).collect();
-                tracing::info!(?pvals, "PE_DATA L0 last token [0:8]");
+                tracing::debug!(?pvals, "PE_DATA L0 last token [0:8]");
             }
 
             if seq_len == 1 {
                 kernels.gemv.quantize_input(pe_gate, epl)?;
             }
-            gemm_q(kernels, pe_gate, proj, pe_proj,
-                seq_len, config.dim, epl)?;
+            gemm_q(kernels, pe_gate, proj, pe_proj, seq_len, config.dim, epl)?;
 
             kernels.ops.post_norm_add(
-                hidden, pe_proj, post_norm, &mut scratch.norm_out,
-                seq_len, config.dim, config.rms_norm_eps,
+                hidden,
+                pe_proj,
+                post_norm,
+                &mut scratch.norm_out,
+                seq_len,
+                config.dim,
+                config.rms_norm_eps,
             )?;
         }
 
         if let Some(scale) = layer.layer_output_scale {
             if (scale - 1.0).abs() > 1e-6 {
-                kernels.ops.scale_f32_inplace(hidden, seq_len * config.dim, scale)?;
+                kernels
+                    .ops
+                    .scale_f32_inplace(hidden, seq_len * config.dim, scale)?;
             }
         }
 
         if (layer_idx == 0 || layer_idx == 5 || layer_idx == 23 || layer_idx == 41) && seq_len > 1 {
             let last_off = ((seq_len - 1) * config.dim) as usize;
             let mut dbg = vec![0.0f32; 8];
-            let _ = stream_ref.memcpy_dtoh(&hidden.slice(last_off..last_off+8), &mut dbg);
-            tracing::info!(?dbg, layer = layer_idx, "LAYER_DONE last pos hidden[0:8]");
+            let _ = stream_ref.memcpy_dtoh(&hidden.slice(last_off..last_off + 8), &mut dbg);
+            tracing::debug!(?dbg, layer = layer_idx, "LAYER_DONE last pos hidden[0:8]");
         }
     }
 
     kernels.ops.rms_norm_f32in(
-        hidden, &weights.output_norm, &mut scratch.norm_out,
-        seq_len, config.dim, config.rms_norm_eps,
+        hidden,
+        &weights.output_norm,
+        &mut scratch.norm_out,
+        seq_len,
+        config.dim,
+        config.rms_norm_eps,
     )?;
 
     {
@@ -339,14 +522,20 @@ pub fn forward(
         let _ = stream_ref.memcpy_dtoh(&scratch.norm_out.slice(0..8), &mut dbg);
         let has_nan = dbg.iter().any(|x| x.to_f32().is_nan());
         let maxv = dbg.iter().map(|x| x.to_f32().abs()).fold(0.0f32, f32::max);
-        tracing::info!(has_nan, maxv, "final_norm_out check");
+        tracing::debug!(has_nan, maxv, "final_norm_out check");
     }
 
-    if seq_len == 1 {
-        kernels.gemv.quantize_input(&scratch.norm_out, config.dim)?;
-    }
-    gemm_q(kernels, &scratch.norm_out, &weights.output, &mut scratch.logits,
-        seq_len, config.vocab_size, config.dim)?;
+    project_last_logits(
+        kernels,
+        &stream_ref,
+        &scratch.norm_out,
+        &mut scratch.attn_out,
+        &weights.output,
+        &mut scratch.logits,
+        seq_len,
+        config.vocab_size,
+        config.dim,
+    )?;
 
     {
         let mut dbg0 = vec![half::f16::ZERO; 8];
@@ -354,24 +543,19 @@ pub fn forward(
         let nan0 = dbg0.iter().any(|x| x.to_f32().is_nan());
         let max0 = dbg0.iter().map(|x| x.to_f32().abs()).fold(0.0f32, f32::max);
 
-        let last_off = ((seq_len - 1) * config.vocab_size) as usize;
-        let end_off = last_off + config.vocab_size as usize;
-        let buf_len = scratch.logits.len();
-        let mut dbg_last = vec![half::f16::ZERO; 8];
-        if end_off <= buf_len {
-            let _ = stream_ref.memcpy_dtoh(&scratch.logits.slice(last_off..last_off+8), &mut dbg_last);
-        } else {
-            tracing::error!(last_off, end_off, buf_len, "LOGIT BUFFER OVERFLOW!");
-        }
-        let nan_last = dbg_last.iter().any(|x| x.to_f32().is_nan());
-        let max_last = dbg_last.iter().map(|x| x.to_f32().abs()).fold(0.0f32, f32::max);
-
-        tracing::info!(nan0, max0, nan_last, max_last, seq_len, vocab=config.vocab_size, last_off, "logits check");
+        tracing::debug!(
+            nan0,
+            max0,
+            seq_len,
+            vocab = config.vocab_size,
+            "logits check"
+        );
     }
 
     if let Some(cap) = config.logit_softcap {
-        let n_logits = seq_len * config.vocab_size;
-        kernels.ops.logit_softcap_inplace(&mut scratch.logits, n_logits, cap)?;
+        kernels
+            .ops
+            .logit_softcap_inplace(&mut scratch.logits, config.vocab_size, cap)?;
     }
 
     kv_cache.advance(seq_len);

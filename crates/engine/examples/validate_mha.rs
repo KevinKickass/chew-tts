@@ -9,9 +9,15 @@ use std::sync::Arc;
 /// V: [kv_len, n_kv_heads, head_dim]   f32 (will be f16 on GPU)
 /// out: [seq_len, n_heads, head_dim]    f32
 fn mha_cpu(
-    q: &[f32], k: &[f32], v: &[f32],
-    seq_len: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize,
-    kv_len: usize, pos_offset: usize,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    seq_len: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    kv_len: usize,
+    pos_offset: usize,
 ) -> Vec<f32> {
     let scale = 1.0 / (head_dim as f32).sqrt();
     let heads_per_kv = n_heads / n_kv_heads;
@@ -83,7 +89,17 @@ fn main() {
     let k_data: Vec<f32> = vec![1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0];
     let v_data: Vec<f32> = vec![0.5, 0.5, 0.5, 0.5, 0.25, 0.25, 0.25, 0.25];
 
-    let cpu_out = mha_cpu(&q_data, &k_data, &v_data, seq_len, n_heads, n_kv_heads, head_dim, kv_len, pos as usize);
+    let cpu_out = mha_cpu(
+        &q_data,
+        &k_data,
+        &v_data,
+        seq_len,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        kv_len,
+        pos as usize,
+    );
 
     // Q and out are now f16, K and V are f16 (KV cache format)
     let q_f16: Vec<half::f16> = q_data.iter().map(|&v| half::f16::from_f32(v)).collect();
@@ -101,9 +117,19 @@ fn main() {
 
     let k_view = k_gpu.slice(0..k_data.len());
     let v_view = v_gpu.slice(0..v_data.len());
-    ops.mha_fused(&q_gpu, &k_view, &v_view, &mut out_gpu,
-        head_dim as u32, n_heads as u32, n_kv_heads as u32,
-        seq_len as u32, kv_len as u32, pos).unwrap();
+    ops.mha_fused(
+        &q_gpu,
+        &k_view,
+        &v_view,
+        &mut out_gpu,
+        head_dim as u32,
+        n_heads as u32,
+        n_kv_heads as u32,
+        seq_len as u32,
+        kv_len as u32,
+        pos,
+    )
+    .unwrap();
 
     let mut gpu_out_f16 = vec![half::f16::ZERO; q_data.len()];
     stream.memcpy_dtoh(&out_gpu, &mut gpu_out_f16).unwrap();
@@ -112,7 +138,11 @@ fn main() {
     println!("Test 1: simple (seq=1, heads=2, kv_heads=2, hd=4, kv=1, pos=0)");
     println!("  CPU: {:?}", cpu_out);
     println!("  GPU: {:?}", gpu_out);
-    let max_err = cpu_out.iter().zip(&gpu_out).map(|(c, g)| (c - g).abs()).fold(0.0f32, f32::max);
+    let max_err = cpu_out
+        .iter()
+        .zip(&gpu_out)
+        .map(|(c, g)| (c - g).abs())
+        .fold(0.0f32, f32::max);
     println!("  Max error: {:.6}", max_err);
     println!("  {}", if max_err < 0.01 { "PASS" } else { "FAIL" });
 
@@ -128,9 +158,21 @@ fn main() {
 
     let q_data2: Vec<f32> = (0..total_q).map(|i| (i as f32 * 0.1).sin()).collect();
     let k_data2: Vec<f32> = (0..total_kv).map(|i| (i as f32 * 0.15).cos()).collect();
-    let v_data2: Vec<f32> = (0..total_kv).map(|i| (i as f32 * 0.2 + 0.5).sin()).collect();
+    let v_data2: Vec<f32> = (0..total_kv)
+        .map(|i| (i as f32 * 0.2 + 0.5).sin())
+        .collect();
 
-    let cpu_out2 = mha_cpu(&q_data2, &k_data2, &v_data2, seq_len, n_heads, n_kv_heads, head_dim, kv_len, pos as usize);
+    let cpu_out2 = mha_cpu(
+        &q_data2,
+        &k_data2,
+        &v_data2,
+        seq_len,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        kv_len,
+        pos as usize,
+    );
 
     let q_f16: Vec<half::f16> = q_data2.iter().map(|&v| half::f16::from_f32(v)).collect();
     let k_f16: Vec<half::f16> = k_data2.iter().map(|&v| half::f16::from_f32(v)).collect();
@@ -147,15 +189,29 @@ fn main() {
 
     let k_view2 = k_gpu2.slice(0..total_kv);
     let v_view2 = v_gpu2.slice(0..total_kv);
-    ops.mha_fused(&q_gpu2, &k_view2, &v_view2, &mut out_gpu2,
-        head_dim as u32, n_heads as u32, n_kv_heads as u32,
-        seq_len as u32, kv_len as u32, pos).unwrap();
+    ops.mha_fused(
+        &q_gpu2,
+        &k_view2,
+        &v_view2,
+        &mut out_gpu2,
+        head_dim as u32,
+        n_heads as u32,
+        n_kv_heads as u32,
+        seq_len as u32,
+        kv_len as u32,
+        pos,
+    )
+    .unwrap();
 
     let mut gpu_out2_f16 = vec![half::f16::ZERO; total_q];
     stream.memcpy_dtoh(&out_gpu2, &mut gpu_out2_f16).unwrap();
     let gpu_out2: Vec<f32> = gpu_out2_f16.iter().map(|v| v.to_f32()).collect();
 
-    let max_err2 = cpu_out2.iter().zip(&gpu_out2).map(|(c, g)| (c - g).abs()).fold(0.0f32, f32::max);
+    let max_err2 = cpu_out2
+        .iter()
+        .zip(&gpu_out2)
+        .map(|(c, g)| (c - g).abs())
+        .fold(0.0f32, f32::max);
     println!("\nTest 2: causal mask (seq=3, kv=3, heads=2, hd=4, pos=0)");
     println!("  CPU first8: {:?}", &cpu_out2[..8]);
     println!("  GPU first8: {:?}", &gpu_out2[..8]);
@@ -175,9 +231,21 @@ fn main() {
 
     let q_data3: Vec<f32> = (0..total_q).map(|i| (i as f32 * 0.1).sin()).collect();
     let k_data3: Vec<f32> = (0..total_kv).map(|i| (i as f32 * 0.15).cos()).collect();
-    let v_data3: Vec<f32> = (0..total_kv).map(|i| (i as f32 * 0.2 + 0.5).sin()).collect();
+    let v_data3: Vec<f32> = (0..total_kv)
+        .map(|i| (i as f32 * 0.2 + 0.5).sin())
+        .collect();
 
-    let cpu_out3 = mha_cpu(&q_data3, &k_data3, &v_data3, seq_len, n_heads, n_kv_heads, head_dim, kv_len, pos as usize);
+    let cpu_out3 = mha_cpu(
+        &q_data3,
+        &k_data3,
+        &v_data3,
+        seq_len,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        kv_len,
+        pos as usize,
+    );
 
     let q_f16: Vec<half::f16> = q_data3.iter().map(|&v| half::f16::from_f32(v)).collect();
     let k_f16: Vec<half::f16> = k_data3.iter().map(|&v| half::f16::from_f32(v)).collect();
@@ -194,15 +262,29 @@ fn main() {
 
     let k_view3 = k_gpu3.slice(0..total_kv);
     let v_view3 = v_gpu3.slice(0..total_kv);
-    ops.mha_fused(&q_gpu3, &k_view3, &v_view3, &mut out_gpu3,
-        head_dim as u32, n_heads as u32, n_kv_heads as u32,
-        seq_len as u32, kv_len as u32, pos).unwrap();
+    ops.mha_fused(
+        &q_gpu3,
+        &k_view3,
+        &v_view3,
+        &mut out_gpu3,
+        head_dim as u32,
+        n_heads as u32,
+        n_kv_heads as u32,
+        seq_len as u32,
+        kv_len as u32,
+        pos,
+    )
+    .unwrap();
 
     let mut gpu_out3_f16 = vec![half::f16::ZERO; total_out];
     stream.memcpy_dtoh(&out_gpu3, &mut gpu_out3_f16).unwrap();
     let gpu_out3: Vec<f32> = gpu_out3_f16.iter().map(|v| v.to_f32()).collect();
 
-    let max_err3 = cpu_out3.iter().zip(&gpu_out3).map(|(c, g)| (c - g).abs()).fold(0.0f32, f32::max);
+    let max_err3 = cpu_out3
+        .iter()
+        .zip(&gpu_out3)
+        .map(|(c, g)| (c - g).abs())
+        .fold(0.0f32, f32::max);
     println!("\nTest 3: GQA (seq=2, heads=4, kv_heads=2, hd=8, kv=2, pos=0)");
     println!("  CPU first8: {:?}", &cpu_out3[..8]);
     println!("  GPU first8: {:?}", &gpu_out3[..8]);
@@ -220,11 +302,27 @@ fn main() {
     let total_kv = kv_len * n_kv_heads * head_dim;
     let total_out = seq_len * n_heads * head_dim;
 
-    let q_data4: Vec<f32> = (0..total_q).map(|i| (i as f32 * 0.001).sin() * 0.1).collect();
-    let k_data4: Vec<f32> = (0..total_kv).map(|i| (i as f32 * 0.0015).cos() * 0.1).collect();
-    let v_data4: Vec<f32> = (0..total_kv).map(|i| (i as f32 * 0.002 + 0.5).sin() * 0.1).collect();
+    let q_data4: Vec<f32> = (0..total_q)
+        .map(|i| (i as f32 * 0.001).sin() * 0.1)
+        .collect();
+    let k_data4: Vec<f32> = (0..total_kv)
+        .map(|i| (i as f32 * 0.0015).cos() * 0.1)
+        .collect();
+    let v_data4: Vec<f32> = (0..total_kv)
+        .map(|i| (i as f32 * 0.002 + 0.5).sin() * 0.1)
+        .collect();
 
-    let cpu_out4 = mha_cpu(&q_data4, &k_data4, &v_data4, seq_len, n_heads, n_kv_heads, head_dim, kv_len, pos as usize);
+    let cpu_out4 = mha_cpu(
+        &q_data4,
+        &k_data4,
+        &v_data4,
+        seq_len,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        kv_len,
+        pos as usize,
+    );
 
     let q_f16: Vec<half::f16> = q_data4.iter().map(|&v| half::f16::from_f32(v)).collect();
     let k_f16: Vec<half::f16> = k_data4.iter().map(|&v| half::f16::from_f32(v)).collect();
@@ -241,22 +339,39 @@ fn main() {
 
     let k_view4 = k_gpu4.slice(0..total_kv);
     let v_view4 = v_gpu4.slice(0..total_kv);
-    ops.mha_fused(&q_gpu4, &k_view4, &v_view4, &mut out_gpu4,
-        head_dim as u32, n_heads as u32, n_kv_heads as u32,
-        seq_len as u32, kv_len as u32, pos).unwrap();
+    ops.mha_fused(
+        &q_gpu4,
+        &k_view4,
+        &v_view4,
+        &mut out_gpu4,
+        head_dim as u32,
+        n_heads as u32,
+        n_kv_heads as u32,
+        seq_len as u32,
+        kv_len as u32,
+        pos,
+    )
+    .unwrap();
 
     let mut gpu_out4_f16 = vec![half::f16::ZERO; total_out];
     stream.memcpy_dtoh(&out_gpu4, &mut gpu_out4_f16).unwrap();
     let gpu_out4: Vec<f32> = gpu_out4_f16.iter().map(|v| v.to_f32()).collect();
 
-    let max_err4 = cpu_out4.iter().zip(&gpu_out4).map(|(c, g)| (c - g).abs()).fold(0.0f32, f32::max);
+    let max_err4 = cpu_out4
+        .iter()
+        .zip(&gpu_out4)
+        .map(|(c, g)| (c - g).abs())
+        .fold(0.0f32, f32::max);
     // Also check if there's a systematic pattern to errors
     let mut errs_by_pos: Vec<(usize, f32)> = Vec::new();
     for s in 0..seq_len {
         let start = s * n_heads * head_dim;
         let end = start + n_heads * head_dim;
-        let pos_err = cpu_out4[start..end].iter().zip(&gpu_out4[start..end])
-            .map(|(c, g)| (c - g).abs()).fold(0.0f32, f32::max);
+        let pos_err = cpu_out4[start..end]
+            .iter()
+            .zip(&gpu_out4[start..end])
+            .map(|(c, g)| (c - g).abs())
+            .fold(0.0f32, f32::max);
         errs_by_pos.push((s, pos_err));
     }
     println!("\nTest 4: realistic (seq=17, heads=32, kv_heads=8, hd=128)");

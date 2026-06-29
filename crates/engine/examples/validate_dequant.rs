@@ -1,5 +1,5 @@
 //! Validate Q4_K and Q6_K dequantization against CPU reference.
-use chew_gguf::{GgufFile, GgmlType};
+use chew_gguf::{GgmlType, GgufFile};
 use chew_kernel::DequantKernels;
 use cudarc::driver::CudaContext;
 use std::sync::Arc;
@@ -75,7 +75,10 @@ fn validate(name: &str, cpu: &[f32], gpu: &[f32], n: usize) {
         let err = (cpu[i] - gpu[i]).abs();
         if err > 0.002 {
             if mismatches < 10 {
-                println!("  MISMATCH [{:3}]: cpu={:.8} gpu={:.8} err={:.8}", i, cpu[i], gpu[i], err);
+                println!(
+                    "  MISMATCH [{:3}]: cpu={:.8} gpu={:.8} err={:.8}",
+                    i, cpu[i], gpu[i], err
+                );
             }
             mismatches += 1;
         }
@@ -94,7 +97,9 @@ fn validate(name: &str, cpu: &[f32], gpu: &[f32], n: usize) {
 }
 
 fn main() {
-    let path = std::env::args().nth(1).expect("usage: validate_dequant <model.gguf>");
+    let path = std::env::args()
+        .nth(1)
+        .expect("usage: validate_dequant <model.gguf>");
     let gguf = GgufFile::open(&path).expect("failed to open GGUF");
 
     cudarc::driver::result::init().unwrap();
@@ -103,7 +108,9 @@ fn main() {
     let dequant = DequantKernels::load(&stream).expect("failed to load dequant kernels");
 
     // === Test Q4_K ===
-    let tensor = gguf.tensors.iter()
+    let tensor = gguf
+        .tensors
+        .iter()
         .find(|t| t.ggml_type == GgmlType::Q4_K)
         .expect("no Q4_K tensor");
     let raw = gguf.tensor_data(tensor).unwrap();
@@ -124,7 +131,9 @@ fn main() {
     validate("Q4_K", &cpu, &gpu, 256);
 
     // === Test Q6_K ===
-    let tensor6 = gguf.tensors.iter()
+    let tensor6 = gguf
+        .tensors
+        .iter()
         .find(|t| t.ggml_type == GgmlType::Q6_K)
         .expect("no Q6_K tensor");
     let raw6 = gguf.tensor_data(tensor6).unwrap();
@@ -134,7 +143,9 @@ fn main() {
     let mut qg6 = stream.alloc_zeros::<u8>(210).unwrap();
     stream.memcpy_htod(block6, &mut qg6).unwrap();
     let mut og6 = stream.alloc_zeros::<half::f16>(256).unwrap();
-    dequant.dequant(&qg6, &mut og6, 256, GgmlType::Q6_K).unwrap();
+    dequant
+        .dequant(&qg6, &mut og6, 256, GgmlType::Q6_K)
+        .unwrap();
     let mut gh6 = vec![half::f16::ZERO; 256];
     stream.memcpy_dtoh(&og6, &mut gh6).unwrap();
     let gpu6: Vec<f32> = gh6.iter().map(|h| h.to_f32()).collect();
@@ -153,7 +164,9 @@ fn main() {
         let mut qg2 = stream.alloc_zeros::<u8>(420).unwrap();
         stream.memcpy_htod(blocks2, &mut qg2).unwrap();
         let mut og2 = stream.alloc_zeros::<half::f16>(512).unwrap();
-        dequant.dequant(&qg2, &mut og2, 512, GgmlType::Q6_K).unwrap();
+        dequant
+            .dequant(&qg2, &mut og2, 512, GgmlType::Q6_K)
+            .unwrap();
         let mut gh2 = vec![half::f16::ZERO; 512];
         stream.memcpy_dtoh(&og2, &mut gh2).unwrap();
         let gpu_2b: Vec<f32> = gh2.iter().map(|h| h.to_f32()).collect();

@@ -1,0 +1,11 @@
+[package]
+name = "chew-next"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+chew-cuda.workspace = true
+chew-runtime.workspace = true
+chew-model-llama.workspace = true
+chew-model-gemma4.workspace = true

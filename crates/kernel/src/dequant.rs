@@ -1,5 +1,8 @@
 use crate::loader::{self, KernelError};
-use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, CudaStream, CudaView, CudaViewMut, LaunchConfig, PushKernelArg};
+use cudarc::driver::{
+    CudaFunction, CudaModule, CudaSlice, CudaStream, CudaView, CudaViewMut, LaunchConfig,
+    PushKernelArg,
+};
 use std::sync::Arc;
 
 const DEQUANT_CU: &str = include_str!("cuda/dequant.cu");
@@ -10,6 +13,7 @@ pub struct DequantKernels {
     _module: Arc<CudaModule>,
     q8_0: CudaFunction,
     q4_0: CudaFunction,
+    q5_0: CudaFunction,
     q5_1: CudaFunction,
     q4_k: CudaFunction,
     q5_k: CudaFunction,
@@ -33,6 +37,7 @@ impl DequantKernels {
             stream: Arc::clone(stream),
             q8_0: loader::get_fn(&module, "dequant_q8_0")?,
             q4_0: loader::get_fn(&module, "dequant_q4_0")?,
+            q5_0: loader::get_fn(&module, "dequant_q5_0")?,
             q5_1: loader::get_fn(&module, "dequant_q5_1")?,
             q4_k: loader::get_fn(&module, "dequant_q4_k")?,
             q5_k: loader::get_fn(&module, "dequant_q5_k")?,
@@ -132,6 +137,7 @@ impl DequantKernels {
         let kernel = match quant_type {
             chew_gguf::GgmlType::Q8_0 => &self.q8_0,
             chew_gguf::GgmlType::Q4_0 => &self.q4_0,
+            chew_gguf::GgmlType::Q5_0 => &self.q5_0,
             chew_gguf::GgmlType::Q5_1 => &self.q5_1,
             chew_gguf::GgmlType::Q4_K => &self.q4_k,
             chew_gguf::GgmlType::Q5_K => &self.q5_k,
@@ -148,7 +154,7 @@ impl DequantKernels {
             other => {
                 return Err(KernelError::Launch(format!(
                     "no GPU dequant kernel for {other}"
-                )))
+                )));
             }
         };
 

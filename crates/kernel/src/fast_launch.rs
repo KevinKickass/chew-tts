@@ -5,8 +5,8 @@
 //!
 //! Requires the cudarc fork with public `cu_function`, `cu_stream`, `cu_device_ptr`, `ptr` fields.
 
-use cudarc::driver::{LaunchConfig, CudaFunction, CudaSlice, CudaStream, CudaView, CudaViewMut};
 use cudarc::driver::sys;
+use cudarc::driver::{CudaFunction, CudaSlice, CudaStream, CudaView, CudaViewMut, LaunchConfig};
 use std::ffi::c_void;
 use std::sync::Arc;
 
@@ -25,7 +25,9 @@ unsafe impl Sync for FastStream {}
 
 impl FastStream {
     pub fn new(stream: &Arc<CudaStream>) -> Self {
-        Self { raw: stream.cu_stream }
+        Self {
+            raw: stream.cu_stream,
+        }
     }
 
     /// Launch a kernel with pre-built args. ZERO heap allocation.
@@ -39,13 +41,19 @@ impl FastStream {
         unsafe {
             sys::cuLaunchKernel(
                 func.cu_function,
-                cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2,
-                cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2,
+                cfg.grid_dim.0,
+                cfg.grid_dim.1,
+                cfg.grid_dim.2,
+                cfg.block_dim.0,
+                cfg.block_dim.1,
+                cfg.block_dim.2,
                 cfg.shared_mem_bytes,
                 self.raw,
                 args.as_mut_ptr(),
                 std::ptr::null_mut(),
-            ).result().map_err(|e| KernelError::Launch(e.to_string()))
+            )
+            .result()
+            .map_err(|e| KernelError::Launch(e.to_string()))
         }
     }
 
@@ -62,8 +70,12 @@ impl FastStream {
     ) {
         sys::cuLaunchKernel(
             func.cu_function,
-            grid.0, grid.1, grid.2,
-            block.0, block.1, block.2,
+            grid.0,
+            grid.1,
+            grid.2,
+            block.0,
+            block.1,
+            block.2,
             smem,
             self.raw,
             args.as_mut_ptr(),

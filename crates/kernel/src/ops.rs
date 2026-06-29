@@ -1,6 +1,11 @@
-use crate::fast_launch::{FastStream, slice_ptr, slice_ptr_mut, view_ptr, view_mut_ptr, scalar_ptr};
+use crate::fast_launch::{
+    FastStream, scalar_ptr, slice_ptr, slice_ptr_mut, view_mut_ptr, view_ptr,
+};
 use crate::loader::{self, KernelError};
-use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, CudaStream, CudaView, CudaViewMut, LaunchConfig, PushKernelArg};
+use cudarc::driver::{
+    CudaFunction, CudaModule, CudaSlice, CudaStream, CudaView, CudaViewMut, LaunchConfig,
+    PushKernelArg,
+};
 use std::ffi::c_void;
 use std::sync::Arc;
 
@@ -13,6 +18,7 @@ pub struct OpsKernels {
     _module: Arc<CudaModule>,
     rms_norm: CudaFunction,
     rms_norm_f32in: CudaFunction,
+    layer_norm_f32in: CudaFunction,
     rope: CudaFunction,
     silu: CudaFunction,
     silu_q8: CudaFunction,
@@ -20,7 +26,11 @@ pub struct OpsKernels {
     embed_tokens_f32: CudaFunction,
     add_f16: CudaFunction,
     add_f32_f16: CudaFunction,
+    add_bias_f16: CudaFunction,
+    add_bias_f16_inplace: CudaFunction,
     copy_f32_to_f16: CudaFunction,
+    copy_f16_to_f32: CudaFunction,
+    add_inplace_f32: CudaFunction,
     copy_f16: CudaFunction,
     fused_add_rmsnorm: CudaFunction,
     rms_norm_f32in_q8: CudaFunction,
@@ -31,6 +41,8 @@ pub struct OpsKernels {
     sample_top_k: CudaFunction,
     mha_fused: CudaFunction,
     mha_naive: CudaFunction,
+    mha_naive_full: CudaFunction,
+    mha_naive_masked: CudaFunction,
     // CUDA Graph-compatible variants
     rope_graph: CudaFunction,
     copy_f16_with_offset: CudaFunction,
@@ -70,6 +82,7 @@ impl OpsKernels {
             fast: FastStream::new(stream),
             rms_norm: loader::get_fn(&module, "rms_norm")?,
             rms_norm_f32in: loader::get_fn(&module, "rms_norm_f32in")?,
+            layer_norm_f32in: loader::get_fn(&module, "layer_norm_f32in")?,
             rope: loader::get_fn(&module, "rope")?,
             silu: loader::get_fn(&module, "silu")?,
             silu_q8: loader::get_fn(&module, "silu_q8")?,
@@ -77,7 +90,11 @@ impl OpsKernels {
             embed_tokens_f32: loader::get_fn(&module, "embed_tokens_f32")?,
             add_f16: loader::get_fn(&module, "add_f16")?,
             add_f32_f16: loader::get_fn(&module, "add_f32_f16")?,
+            add_bias_f16: loader::get_fn(&module, "add_bias_f16")?,
+            add_bias_f16_inplace: loader::get_fn(&module, "add_bias_f16_inplace")?,
             copy_f32_to_f16: loader::get_fn(&module, "copy_f32_to_f16")?,
+            copy_f16_to_f32: loader::get_fn(&module, "copy_f16_to_f32")?,
+            add_inplace_f32: loader::get_fn(&module, "add_inplace_f32")?,
             copy_f16: loader::get_fn(&module, "copy_f16")?,
             fused_add_rmsnorm: loader::get_fn(&module, "fused_add_rmsnorm")?,
             rms_norm_f32in_q8: loader::get_fn(&module, "rms_norm_f32in_q8")?,
@@ -88,6 +105,8 @@ impl OpsKernels {
             sample_top_k: loader::get_fn(&module, "sample_top_k")?,
             mha_fused: loader::get_fn(&module, "mha_fused")?,
             mha_naive: loader::get_fn(&module, "mha_naive")?,
+            mha_naive_full: loader::get_fn(&module, "mha_naive_full")?,
+            mha_naive_masked: loader::get_fn(&module, "mha_naive_masked")?,
             rope_graph: loader::get_fn(&module, "rope_graph")?,
             copy_f16_with_offset: loader::get_fn(&module, "copy_f16_with_offset")?,
             mha_fused_graph: loader::get_fn(&module, "mha_fused_graph")?,
@@ -177,10 +196,61 @@ impl OpsKernels {
         let dim_i = dim as i32;
 
         let mut args: [*mut c_void; 5] = [
-            slice_ptr(x), slice_ptr(weight), slice_ptr_mut(out),
-            scalar_ptr(&dim_i), scalar_ptr(&eps),
+            slice_ptr(x),
+            slice_ptr(weight),
+            slice_ptr_mut(out),
+            scalar_ptr(&dim_i),
+            scalar_ptr(&eps),
         ];
-        unsafe { self.fast.fire(&self.rms_norm_f32in, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
+        unsafe {
+            self.fast.fire(
+                &self.rms_norm_f32in,
+                (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2),
+                (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2),
+                cfg.shared_mem_bytes,
+                &mut args,
+            );
+        }
+
+        Ok(())
+    }
+
+    /// LayerNorm: f32 input -> f16 output with learned scale and bias.
+    pub fn layer_norm_f32in(
+        &self,
+        x: &CudaSlice<f32>,
+        weight: &CudaSlice<half::f16>,
+        bias: &CudaSlice<half::f16>,
+        out: &mut CudaSlice<half::f16>,
+        n_rows: u32,
+        dim: u32,
+        eps: f32,
+    ) -> Result<(), KernelError> {
+        let threads = 256u32.min(dim);
+        let cfg = LaunchConfig {
+            grid_dim: (n_rows, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: threads * 8,
+        };
+
+        let dim_i = dim as i32;
+        let mut args: [*mut c_void; 6] = [
+            slice_ptr(x),
+            slice_ptr(weight),
+            slice_ptr(bias),
+            slice_ptr_mut(out),
+            scalar_ptr(&dim_i),
+            scalar_ptr(&eps),
+        ];
+        unsafe {
+            self.fast.fire(
+                &self.layer_norm_f32in,
+                (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2),
+                (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2),
+                cfg.shared_mem_bytes,
+                &mut args,
+            );
+        }
 
         Ok(())
     }
@@ -202,10 +272,20 @@ impl OpsKernels {
         };
         let dim_i = dim as i32;
         let mut args: [*mut c_void; 4] = [
-            slice_ptr(x), slice_ptr_mut(out),
-            scalar_ptr(&dim_i), scalar_ptr(&eps),
+            slice_ptr(x),
+            slice_ptr_mut(out),
+            scalar_ptr(&dim_i),
+            scalar_ptr(&eps),
         ];
-        unsafe { self.fast.fire(&self.rms_norm_f32in_no_weight, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
+        unsafe {
+            self.fast.fire(
+                &self.rms_norm_f32in_no_weight,
+                (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2),
+                (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2),
+                cfg.shared_mem_bytes,
+                &mut args,
+            );
+        }
         Ok(())
     }
 
@@ -231,10 +311,21 @@ impl OpsKernels {
         let p = pos as i32;
 
         let mut args: [*mut c_void; 5] = [
-            slice_ptr_mut(x), scalar_ptr(&hd), scalar_ptr(&nh),
-            scalar_ptr(&p), scalar_ptr(&theta_base),
+            slice_ptr_mut(x),
+            scalar_ptr(&hd),
+            scalar_ptr(&nh),
+            scalar_ptr(&p),
+            scalar_ptr(&theta_base),
         ];
-        unsafe { self.fast.fire(&self.rope, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
+        unsafe {
+            self.fast.fire(
+                &self.rope,
+                (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2),
+                (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2),
+                cfg.shared_mem_bytes,
+                &mut args,
+            );
+        }
 
         Ok(())
     }
@@ -258,10 +349,20 @@ impl OpsKernels {
         let n_i = n as i32;
 
         let mut args: [*mut c_void; 4] = [
-            slice_ptr(gate), slice_ptr(up), slice_ptr_mut(out),
+            slice_ptr(gate),
+            slice_ptr(up),
+            slice_ptr_mut(out),
             scalar_ptr(&n_i),
         ];
-        unsafe { self.fast.fire(&self.silu, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
+        unsafe {
+            self.fast.fire(
+                &self.silu,
+                (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2),
+                (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2),
+                cfg.shared_mem_bytes,
+                &mut args,
+            );
+        }
         Ok(())
     }
 
@@ -284,10 +385,21 @@ impl OpsKernels {
         };
         let n_i = n as i32;
         let mut args: [*mut c_void; 5] = [
-            slice_ptr(gate), slice_ptr(up), slice_ptr_mut(out),
-            slice_ptr_mut(x_q8), scalar_ptr(&n_i),
+            slice_ptr(gate),
+            slice_ptr(up),
+            slice_ptr_mut(out),
+            slice_ptr_mut(x_q8),
+            scalar_ptr(&n_i),
         ];
-        unsafe { self.fast.fire(&self.silu_q8, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
+        unsafe {
+            self.fast.fire(
+                &self.silu_q8,
+                (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2),
+                (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2),
+                cfg.shared_mem_bytes,
+                &mut args,
+            );
+        }
 
         Ok(())
     }
@@ -417,6 +529,74 @@ impl OpsKernels {
         Ok(())
     }
 
+    /// Row-wise bias add on an f16 matrix.
+    pub fn add_bias_f16(
+        &self,
+        x: &CudaSlice<half::f16>,
+        bias: &CudaSlice<half::f16>,
+        out: &mut CudaSlice<half::f16>,
+        n_rows: u32,
+        dim: u32,
+    ) -> Result<(), KernelError> {
+        let threads = 256u32;
+        let blocks_x = dim.div_ceil(threads);
+        let cfg = LaunchConfig {
+            grid_dim: (n_rows, blocks_x, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        let dim_i = dim as i32;
+        let mut args: [*mut c_void; 4] = [
+            slice_ptr(x),
+            slice_ptr(bias),
+            slice_ptr_mut(out),
+            scalar_ptr(&dim_i),
+        ];
+        unsafe {
+            self.fast.fire(
+                &self.add_bias_f16,
+                (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2),
+                (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2),
+                cfg.shared_mem_bytes,
+                &mut args,
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Row-wise bias add in-place on an f16 matrix.
+    pub fn add_bias_f16_inplace(
+        &self,
+        x: &mut CudaSlice<half::f16>,
+        bias: &CudaSlice<half::f16>,
+        n_rows: u32,
+        dim: u32,
+    ) -> Result<(), KernelError> {
+        let threads = 256u32;
+        let blocks_x = dim.div_ceil(threads);
+        let cfg = LaunchConfig {
+            grid_dim: (n_rows, blocks_x, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        let dim_i = dim as i32;
+        let mut args: [*mut c_void; 3] = [slice_ptr_mut(x), slice_ptr(bias), scalar_ptr(&dim_i)];
+        unsafe {
+            self.fast.fire(
+                &self.add_bias_f16_inplace,
+                (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2),
+                (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2),
+                cfg.shared_mem_bytes,
+                &mut args,
+            );
+        }
+
+        Ok(())
+    }
+
     /// Fused add + RMSNorm: hidden += delta, norm_out = rmsnorm(hidden) * weight
     /// Saves one kernel launch vs separate add + norm.
     pub fn fused_add_rmsnorm(
@@ -437,10 +617,22 @@ impl OpsKernels {
         };
         let dim_i = dim as i32;
         let mut args: [*mut c_void; 6] = [
-            slice_ptr_mut(hidden), slice_ptr(delta), slice_ptr(weight),
-            slice_ptr_mut(norm_out), scalar_ptr(&dim_i), scalar_ptr(&eps),
+            slice_ptr_mut(hidden),
+            slice_ptr(delta),
+            slice_ptr(weight),
+            slice_ptr_mut(norm_out),
+            scalar_ptr(&dim_i),
+            scalar_ptr(&eps),
         ];
-        unsafe { self.fast.fire(&self.fused_add_rmsnorm, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
+        unsafe {
+            self.fast.fire(
+                &self.fused_add_rmsnorm,
+                (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2),
+                (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2),
+                cfg.shared_mem_bytes,
+                &mut args,
+            );
+        }
         Ok(())
     }
 
@@ -464,10 +656,22 @@ impl OpsKernels {
         };
         let dim_i = dim as i32;
         let mut args: [*mut c_void; 6] = [
-            slice_ptr(x), slice_ptr(weight), slice_ptr_mut(out),
-            slice_ptr_mut(x_q8), scalar_ptr(&dim_i), scalar_ptr(&eps),
+            slice_ptr(x),
+            slice_ptr(weight),
+            slice_ptr_mut(out),
+            slice_ptr_mut(x_q8),
+            scalar_ptr(&dim_i),
+            scalar_ptr(&eps),
         ];
-        unsafe { self.fast.fire(&self.rms_norm_f32in_q8, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
+        unsafe {
+            self.fast.fire(
+                &self.rms_norm_f32in_q8,
+                (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2),
+                (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2),
+                cfg.shared_mem_bytes,
+                &mut args,
+            );
+        }
         Ok(())
     }
 
@@ -492,11 +696,23 @@ impl OpsKernels {
         };
         let dim_i = dim as i32;
         let mut args: [*mut c_void; 7] = [
-            slice_ptr_mut(hidden), slice_ptr(delta), slice_ptr(weight),
-            slice_ptr_mut(norm_out), slice_ptr_mut(x_q8),
-            scalar_ptr(&dim_i), scalar_ptr(&eps),
+            slice_ptr_mut(hidden),
+            slice_ptr(delta),
+            slice_ptr(weight),
+            slice_ptr_mut(norm_out),
+            slice_ptr_mut(x_q8),
+            scalar_ptr(&dim_i),
+            scalar_ptr(&eps),
         ];
-        unsafe { self.fast.fire(&self.fused_add_rmsnorm_q8, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
+        unsafe {
+            self.fast.fire(
+                &self.fused_add_rmsnorm_q8,
+                (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2),
+                (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2),
+                cfg.shared_mem_bytes,
+                &mut args,
+            );
+        }
         Ok(())
     }
 
@@ -515,10 +731,17 @@ impl OpsKernels {
             shared_mem_bytes: 0,
         };
         let n_i = n as i32;
-        let mut args: [*mut c_void; 3] = [
-            slice_ptr_mut(hidden), slice_ptr(delta), scalar_ptr(&n_i),
-        ];
-        unsafe { self.fast.fire(&self.add_inplace_f32_f16, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
+        let mut args: [*mut c_void; 3] =
+            [slice_ptr_mut(hidden), slice_ptr(delta), scalar_ptr(&n_i)];
+        unsafe {
+            self.fast.fire(
+                &self.add_inplace_f32_f16,
+                (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2),
+                (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2),
+                cfg.shared_mem_bytes,
+                &mut args,
+            );
+        }
         Ok(())
     }
 
@@ -552,6 +775,64 @@ impl OpsKernels {
         Ok(())
     }
 
+    /// Copy f16 -> f32.
+    pub fn copy_f16_to_f32(
+        &self,
+        src: &CudaSlice<half::f16>,
+        dst: &mut CudaSlice<f32>,
+        n: u32,
+    ) -> Result<(), KernelError> {
+        let threads = 256u32;
+        let blocks = (n + threads - 1) / threads;
+        let cfg = LaunchConfig {
+            grid_dim: (blocks, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        let n_i = n as i32;
+        let mut args: [*mut c_void; 3] = [slice_ptr(src), slice_ptr_mut(dst), scalar_ptr(&n_i)];
+        unsafe {
+            self.fast.fire(
+                &self.copy_f16_to_f32,
+                (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2),
+                (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2),
+                cfg.shared_mem_bytes,
+                &mut args,
+            );
+        }
+
+        Ok(())
+    }
+
+    /// In-place add: x += delta for f32 tensors.
+    pub fn add_inplace_f32(
+        &self,
+        x: &mut CudaSlice<f32>,
+        delta: &CudaSlice<f32>,
+        n: u32,
+    ) -> Result<(), KernelError> {
+        let threads = 256u32;
+        let blocks = (n + threads - 1) / threads;
+        let cfg = LaunchConfig {
+            grid_dim: (blocks, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let n_i = n as i32;
+        let mut args: [*mut c_void; 3] = [slice_ptr(delta), slice_ptr_mut(x), scalar_ptr(&n_i)];
+        unsafe {
+            self.fast.fire(
+                &self.add_inplace_f32,
+                (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2),
+                (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2),
+                cfg.shared_mem_bytes,
+                &mut args,
+            );
+        }
+        Ok(())
+    }
+
     /// Copy f16 → f16 (for KV cache writes from f16 projections).
     pub fn copy_f16(
         &self,
@@ -569,10 +850,16 @@ impl OpsKernels {
 
         let n_i = n as i32;
 
-        let mut args: [*mut c_void; 3] = [
-            slice_ptr(src), view_mut_ptr(dst), scalar_ptr(&n_i),
-        ];
-        unsafe { self.fast.fire(&self.copy_f16, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
+        let mut args: [*mut c_void; 3] = [slice_ptr(src), view_mut_ptr(dst), scalar_ptr(&n_i)];
+        unsafe {
+            self.fast.fire(
+                &self.copy_f16,
+                (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2),
+                (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2),
+                cfg.shared_mem_bytes,
+                &mut args,
+            );
+        }
 
         Ok(())
     }
@@ -640,10 +927,16 @@ impl OpsKernels {
             shared_mem_bytes: 0,
         };
         let n_i = n as i32;
-        let mut args: [*mut c_void; 3] = [
-            slice_ptr(x), slice_ptr_mut(out), scalar_ptr(&n_i),
-        ];
-        unsafe { self.fast.fire(&self.argmax_f16, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
+        let mut args: [*mut c_void; 3] = [slice_ptr(x), slice_ptr_mut(out), scalar_ptr(&n_i)];
+        unsafe {
+            self.fast.fire(
+                &self.argmax_f16,
+                (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2),
+                (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2),
+                cfg.shared_mem_bytes,
+                &mut args,
+            );
+        }
         Ok(())
     }
 
@@ -702,10 +995,21 @@ impl OpsKernels {
         let hd = head_dim as i32;
         let nh = n_heads as i32;
         let mut args: [*mut c_void; 5] = [
-            slice_ptr_mut(x), slice_ptr(decode_params),
-            scalar_ptr(&hd), scalar_ptr(&nh), scalar_ptr(&theta_base),
+            slice_ptr_mut(x),
+            slice_ptr(decode_params),
+            scalar_ptr(&hd),
+            scalar_ptr(&nh),
+            scalar_ptr(&theta_base),
         ];
-        unsafe { self.fast.fire(&self.rope_graph, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
+        unsafe {
+            self.fast.fire(
+                &self.rope_graph,
+                (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2),
+                (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2),
+                cfg.shared_mem_bytes,
+                &mut args,
+            );
+        }
         Ok(())
     }
 
@@ -728,10 +1032,20 @@ impl OpsKernels {
         };
         let n_i = n as i32;
         let mut args: [*mut c_void; 4] = [
-            slice_ptr(src), slice_ptr_mut(dst_base), slice_ptr(decode_params),
+            slice_ptr(src),
+            slice_ptr_mut(dst_base),
+            slice_ptr(decode_params),
             scalar_ptr(&n_i),
         ];
-        unsafe { self.fast.fire(&self.copy_f16_with_offset, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
+        unsafe {
+            self.fast.fire(
+                &self.copy_f16_with_offset,
+                (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2),
+                (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2),
+                cfg.shared_mem_bytes,
+                &mut args,
+            );
+        }
         Ok(())
     }
 
@@ -749,7 +1063,7 @@ impl OpsKernels {
         n_heads: u32,
         n_kv_heads: u32,
         seq_len: u32,
-        _max_kv_len: u32,  // unused now — smem is fixed
+        _max_kv_len: u32, // unused now — smem is fixed
     ) -> Result<(), KernelError> {
         // Flash Attention graph: 2D block (32, 4), same as mha_fused
         let smem = (8 + 4 * head_dim) * 4;
@@ -759,12 +1073,26 @@ impl OpsKernels {
         let sl = seq_len as i32;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let mut args: [*mut c_void; 10] = [
-            slice_ptr(q), slice_ptr(k_base), slice_ptr(v_base), slice_ptr_mut(out),
+            slice_ptr(q),
+            slice_ptr(k_base),
+            slice_ptr(v_base),
+            slice_ptr_mut(out),
             slice_ptr(decode_params),
-            scalar_ptr(&hd), scalar_ptr(&nh), scalar_ptr(&nkv),
-            scalar_ptr(&sl), scalar_ptr(&scale),
+            scalar_ptr(&hd),
+            scalar_ptr(&nh),
+            scalar_ptr(&nkv),
+            scalar_ptr(&sl),
+            scalar_ptr(&scale),
         ];
-        unsafe { self.fast.fire(&self.mha_fused_graph, (n_heads, seq_len, 1), (32, 4, 1), smem, &mut args); }
+        unsafe {
+            self.fast.fire(
+                &self.mha_fused_graph,
+                (n_heads, seq_len, 1),
+                (32, 4, 1),
+                smem,
+                &mut args,
+            );
+        }
         Ok(())
     }
 
@@ -789,10 +1117,20 @@ impl OpsKernels {
         };
         let n_i = n as i32;
         let mut args: [*mut c_void; 4] = [
-            slice_ptr(gate), slice_ptr(up), slice_ptr_mut(out),
+            slice_ptr(gate),
+            slice_ptr(up),
+            slice_ptr_mut(out),
             scalar_ptr(&n_i),
         ];
-        unsafe { self.fast.fire(&self.gelu, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
+        unsafe {
+            self.fast.fire(
+                &self.gelu,
+                (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2),
+                (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2),
+                cfg.shared_mem_bytes,
+                &mut args,
+            );
+        }
         Ok(())
     }
 
@@ -815,10 +1153,20 @@ impl OpsKernels {
         let expert_ff_i = expert_ff as i32;
         let batch_i = batch as i32;
         let mut args: [*mut c_void; 4] = [
-            slice_ptr(fused), slice_ptr_mut(out),
-            scalar_ptr(&expert_ff_i), scalar_ptr(&batch_i),
+            slice_ptr(fused),
+            slice_ptr_mut(out),
+            scalar_ptr(&expert_ff_i),
+            scalar_ptr(&batch_i),
         ];
-        unsafe { self.fast.fire(&self.gelu_split_batch, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
+        unsafe {
+            self.fast.fire(
+                &self.gelu_split_batch,
+                (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2),
+                (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2),
+                cfg.shared_mem_bytes,
+                &mut args,
+            );
+        }
         Ok(())
     }
 
@@ -839,10 +1187,20 @@ impl OpsKernels {
         };
         let dim_i = dim as i32;
         let mut args: [*mut c_void; 4] = [
-            slice_ptr(x), slice_ptr_mut(out),
-            scalar_ptr(&dim_i), scalar_ptr(&eps),
+            slice_ptr(x),
+            slice_ptr_mut(out),
+            scalar_ptr(&dim_i),
+            scalar_ptr(&eps),
         ];
-        unsafe { self.fast.fire(&self.rms_norm_no_weight, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
+        unsafe {
+            self.fast.fire(
+                &self.rms_norm_no_weight,
+                (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2),
+                (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2),
+                cfg.shared_mem_bytes,
+                &mut args,
+            );
+        }
         Ok(())
     }
 
@@ -863,10 +1221,20 @@ impl OpsKernels {
         };
         let n_i = n as i32;
         let mut args: [*mut c_void; 4] = [
-            slice_ptr(x), slice_ptr_mut(out),
-            scalar_ptr(&n_i), scalar_ptr(&scale),
+            slice_ptr(x),
+            slice_ptr_mut(out),
+            scalar_ptr(&n_i),
+            scalar_ptr(&scale),
         ];
-        unsafe { self.fast.fire(&self.scale_f16, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
+        unsafe {
+            self.fast.fire(
+                &self.scale_f16,
+                (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2),
+                (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2),
+                cfg.shared_mem_bytes,
+                &mut args,
+            );
+        }
         Ok(())
     }
 
@@ -889,10 +1257,21 @@ impl OpsKernels {
         let dim_i = dim as i32;
         let batch_i = batch as i32;
         let mut args: [*mut c_void; 5] = [
-            slice_ptr(rows), slice_ptr(weights), slice_ptr_mut(out),
-            scalar_ptr(&dim_i), scalar_ptr(&batch_i),
+            slice_ptr(rows),
+            slice_ptr(weights),
+            slice_ptr_mut(out),
+            scalar_ptr(&dim_i),
+            scalar_ptr(&batch_i),
         ];
-        unsafe { self.fast.fire(&self.weighted_sum_rows_f16, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
+        unsafe {
+            self.fast.fire(
+                &self.weighted_sum_rows_f16,
+                (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2),
+                (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2),
+                cfg.shared_mem_bytes,
+                &mut args,
+            );
+        }
         Ok(())
     }
 
@@ -911,10 +1290,16 @@ impl OpsKernels {
             shared_mem_bytes: 0,
         };
         let n_i = n as i32;
-        let mut args: [*mut c_void; 3] = [
-            slice_ptr_mut(x), scalar_ptr(&n_i), scalar_ptr(&scale),
-        ];
-        unsafe { self.fast.fire(&self.scale_f32_inplace, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
+        let mut args: [*mut c_void; 3] = [slice_ptr_mut(x), scalar_ptr(&n_i), scalar_ptr(&scale)];
+        unsafe {
+            self.fast.fire(
+                &self.scale_f32_inplace,
+                (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2),
+                (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2),
+                cfg.shared_mem_bytes,
+                &mut args,
+            );
+        }
         Ok(())
     }
 
@@ -935,10 +1320,20 @@ impl OpsKernels {
         };
         let n_i = n as i32;
         let mut args: [*mut c_void; 4] = [
-            slice_ptr(x), slice_ptr_mut(out),
-            scalar_ptr(&n_i), scalar_ptr(&cap),
+            slice_ptr(x),
+            slice_ptr_mut(out),
+            scalar_ptr(&n_i),
+            scalar_ptr(&cap),
         ];
-        unsafe { self.fast.fire(&self.logit_softcap, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
+        unsafe {
+            self.fast.fire(
+                &self.logit_softcap,
+                (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2),
+                (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2),
+                cfg.shared_mem_bytes,
+                &mut args,
+            );
+        }
         Ok(())
     }
 
@@ -957,11 +1352,16 @@ impl OpsKernels {
             shared_mem_bytes: 0,
         };
         let n_i = n as i32;
-        let mut args: [*mut c_void; 3] = [
-            slice_ptr_mut(x),
-            scalar_ptr(&n_i), scalar_ptr(&cap),
-        ];
-        unsafe { self.fast.fire(&self.logit_softcap_inplace, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
+        let mut args: [*mut c_void; 3] = [slice_ptr_mut(x), scalar_ptr(&n_i), scalar_ptr(&cap)];
+        unsafe {
+            self.fast.fire(
+                &self.logit_softcap_inplace,
+                (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2),
+                (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2),
+                cfg.shared_mem_bytes,
+                &mut args,
+            );
+        }
         Ok(())
     }
 
@@ -985,10 +1385,21 @@ impl OpsKernels {
         let nh = n_heads as i32;
         let p = pos as i32;
         let mut args: [*mut c_void; 5] = [
-            slice_ptr_mut(x), scalar_ptr(&hd), scalar_ptr(&nh),
-            scalar_ptr(&p), scalar_ptr(&theta_base),
+            slice_ptr_mut(x),
+            scalar_ptr(&hd),
+            scalar_ptr(&nh),
+            scalar_ptr(&p),
+            scalar_ptr(&theta_base),
         ];
-        unsafe { self.fast.fire(&self.rope_neox, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
+        unsafe {
+            self.fast.fire(
+                &self.rope_neox,
+                (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2),
+                (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2),
+                cfg.shared_mem_bytes,
+                &mut args,
+            );
+        }
         Ok(())
     }
 
@@ -1013,11 +1424,22 @@ impl OpsKernels {
         let nh = n_heads as i32;
         let p = pos as i32;
         let mut args: [*mut c_void; 6] = [
-            slice_ptr_mut(x), slice_ptr(freq_factors),
-            scalar_ptr(&hd), scalar_ptr(&nh),
-            scalar_ptr(&p), scalar_ptr(&theta_base),
+            slice_ptr_mut(x),
+            slice_ptr(freq_factors),
+            scalar_ptr(&hd),
+            scalar_ptr(&nh),
+            scalar_ptr(&p),
+            scalar_ptr(&theta_base),
         ];
-        unsafe { self.fast.fire(&self.rope_neox_freqs, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
+        unsafe {
+            self.fast.fire(
+                &self.rope_neox_freqs,
+                (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2),
+                (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2),
+                cfg.shared_mem_bytes,
+                &mut args,
+            );
+        }
         Ok(())
     }
 
@@ -1039,10 +1461,21 @@ impl OpsKernels {
         let hd = head_dim as i32;
         let nh = n_heads as i32;
         let mut args: [*mut c_void; 5] = [
-            slice_ptr_mut(x), slice_ptr(decode_params),
-            scalar_ptr(&hd), scalar_ptr(&nh), scalar_ptr(&theta_base),
+            slice_ptr_mut(x),
+            slice_ptr(decode_params),
+            scalar_ptr(&hd),
+            scalar_ptr(&nh),
+            scalar_ptr(&theta_base),
         ];
-        unsafe { self.fast.fire(&self.rope_neox_graph, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
+        unsafe {
+            self.fast.fire(
+                &self.rope_neox_graph,
+                (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2),
+                (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2),
+                cfg.shared_mem_bytes,
+                &mut args,
+            );
+        }
         Ok(())
     }
 
@@ -1066,10 +1499,22 @@ impl OpsKernels {
         };
         let dim_i = dim as i32;
         let mut args: [*mut c_void; 6] = [
-            slice_ptr_mut(hidden), slice_ptr(delta), slice_ptr(weight),
-            slice_ptr_mut(norm_out), scalar_ptr(&dim_i), scalar_ptr(&eps),
+            slice_ptr_mut(hidden),
+            slice_ptr(delta),
+            slice_ptr(weight),
+            slice_ptr_mut(norm_out),
+            scalar_ptr(&dim_i),
+            scalar_ptr(&eps),
         ];
-        unsafe { self.fast.fire(&self.post_norm_add, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
+        unsafe {
+            self.fast.fire(
+                &self.post_norm_add,
+                (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2),
+                (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2),
+                cfg.shared_mem_bytes,
+                &mut args,
+            );
+        }
         Ok(())
     }
 
@@ -1090,10 +1535,20 @@ impl OpsKernels {
         };
         let n_i = n as i32;
         let mut args: [*mut c_void; 4] = [
-            slice_ptr(a), slice_ptr(b), slice_ptr_mut(out),
+            slice_ptr(a),
+            slice_ptr(b),
+            slice_ptr_mut(out),
             scalar_ptr(&n_i),
         ];
-        unsafe { self.fast.fire(&self.mul_f16, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
+        unsafe {
+            self.fast.fire(
+                &self.mul_f16,
+                (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2),
+                (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2),
+                cfg.shared_mem_bytes,
+                &mut args,
+            );
+        }
         Ok(())
     }
 
@@ -1117,10 +1572,21 @@ impl OpsKernels {
         let n_i = n as i32;
         let stride_i = stride as i32;
         let mut args: [*mut c_void; 5] = [
-            slice_ptr(a), slice_ptr(b), slice_ptr_mut(out),
-            scalar_ptr(&n_i), scalar_ptr(&stride_i),
+            slice_ptr(a),
+            slice_ptr(b),
+            slice_ptr_mut(out),
+            scalar_ptr(&n_i),
+            scalar_ptr(&stride_i),
         ];
-        unsafe { self.fast.fire(&self.mul_f16_broadcast, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
+        unsafe {
+            self.fast.fire(
+                &self.mul_f16_broadcast,
+                (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2),
+                (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2),
+                cfg.shared_mem_bytes,
+                &mut args,
+            );
+        }
         Ok(())
     }
 
@@ -1140,11 +1606,16 @@ impl OpsKernels {
             shared_mem_bytes: 0,
         };
         let n_i = n as i32;
-        let mut args: [*mut c_void; 3] = [
-            slice_ptr(x), slice_ptr_mut(out),
-            scalar_ptr(&n_i),
-        ];
-        unsafe { self.fast.fire(&self.gelu_act, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
+        let mut args: [*mut c_void; 3] = [slice_ptr(x), slice_ptr_mut(out), scalar_ptr(&n_i)];
+        unsafe {
+            self.fast.fire(
+                &self.gelu_act,
+                (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2),
+                (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2),
+                cfg.shared_mem_bytes,
+                &mut args,
+            );
+        }
         Ok(())
     }
 
@@ -1174,10 +1645,21 @@ impl OpsKernels {
         let rb = row_bytes as i32;
         let nt = n_tokens as i32;
         let mut args: [*mut c_void; 5] = [
-            slice_ptr(src), slice_ptr(token_ids), slice_ptr_mut(dst),
-            scalar_ptr(&rb), scalar_ptr(&nt),
+            slice_ptr(src),
+            slice_ptr(token_ids),
+            slice_ptr_mut(dst),
+            scalar_ptr(&rb),
+            scalar_ptr(&nt),
         ];
-        unsafe { self.fast.fire(&self.gather_rows_quant, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
+        unsafe {
+            self.fast.fire(
+                &self.gather_rows_quant,
+                (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2),
+                (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2),
+                cfg.shared_mem_bytes,
+                &mut args,
+            );
+        }
         Ok(())
     }
 
@@ -1210,11 +1692,23 @@ impl OpsKernels {
         let lo_i = layer_off as i32;
         let nt_i = n_tokens as i32;
         let mut args: [*mut c_void; 7] = [
-            slice_ptr(a), slice_ptr(embd), slice_ptr_mut(out),
-            scalar_ptr(&epl_i), scalar_ptr(&rw_i),
-            scalar_ptr(&lo_i), scalar_ptr(&nt_i),
+            slice_ptr(a),
+            slice_ptr(embd),
+            slice_ptr_mut(out),
+            scalar_ptr(&epl_i),
+            scalar_ptr(&rw_i),
+            scalar_ptr(&lo_i),
+            scalar_ptr(&nt_i),
         ];
-        unsafe { self.fast.fire(&self.pe_strided_mul, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
+        unsafe {
+            self.fast.fire(
+                &self.pe_strided_mul,
+                (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2),
+                (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2),
+                cfg.shared_mem_bytes,
+                &mut args,
+            );
+        }
         Ok(())
     }
 
@@ -1249,13 +1743,28 @@ impl OpsKernels {
         let kvs = kv_stride as i32;
         let kvo = kv_offset as i32;
         let mut args: [*mut c_void; 12] = [
-            slice_ptr_mut(q), slice_ptr_mut(k), slice_ptr(v),
-            slice_ptr_mut(k_cache_base), slice_ptr_mut(v_cache_base),
-            scalar_ptr(&hd), scalar_ptr(&nh), scalar_ptr(&nkv),
-            scalar_ptr(&p), scalar_ptr(&theta_base),
-            scalar_ptr(&kvs), scalar_ptr(&kvo),
+            slice_ptr_mut(q),
+            slice_ptr_mut(k),
+            slice_ptr(v),
+            slice_ptr_mut(k_cache_base),
+            slice_ptr_mut(v_cache_base),
+            scalar_ptr(&hd),
+            scalar_ptr(&nh),
+            scalar_ptr(&nkv),
+            scalar_ptr(&p),
+            scalar_ptr(&theta_base),
+            scalar_ptr(&kvs),
+            scalar_ptr(&kvo),
         ];
-        unsafe { self.fast.fire(&self.rope_kv_write, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
+        unsafe {
+            self.fast.fire(
+                &self.rope_kv_write,
+                (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2),
+                (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2),
+                cfg.shared_mem_bytes,
+                &mut args,
+            );
+        }
         Ok(())
     }
 
@@ -1273,8 +1782,21 @@ impl OpsKernels {
         kv_len: u32,
         pos_offset: u32,
     ) -> Result<(), KernelError> {
-        self.mha_fused_scaled(q, k, v, out, head_dim, n_heads, n_kv_heads,
-            seq_len, kv_len, pos_offset, 1.0 / (head_dim as f32).sqrt(), 0.0)
+        self.mha_fused_scaled(
+            q,
+            k,
+            v,
+            out,
+            head_dim,
+            n_heads,
+            n_kv_heads,
+            seq_len,
+            kv_len,
+            pos_offset,
+            0,
+            1.0 / (head_dim as f32).sqrt(),
+            0.0,
+        )
     }
 
     /// MHA with custom attention scale (Gemma 4 uses scale=1.0).
@@ -1290,6 +1812,7 @@ impl OpsKernels {
         seq_len: u32,
         kv_len: u32,
         pos_offset: u32,
+        window: u32,
         scale: f32,
         softcap: f32,
     ) -> Result<(), KernelError> {
@@ -1307,14 +1830,32 @@ impl OpsKernels {
         let sl = seq_len as i32;
         let kvl = kv_len as i32;
         let po = pos_offset as i32;
+        let win = window as i32;
 
-        let mut args: [*mut c_void; 12] = [
-            slice_ptr(q), view_ptr(k), view_ptr(v), slice_ptr_mut(out),
-            scalar_ptr(&hd), scalar_ptr(&nh), scalar_ptr(&nkv),
-            scalar_ptr(&sl), scalar_ptr(&kvl), scalar_ptr(&po),
-            scalar_ptr(&scale), scalar_ptr(&softcap),
+        let mut args: [*mut c_void; 13] = [
+            slice_ptr(q),
+            view_ptr(k),
+            view_ptr(v),
+            slice_ptr_mut(out),
+            scalar_ptr(&hd),
+            scalar_ptr(&nh),
+            scalar_ptr(&nkv),
+            scalar_ptr(&sl),
+            scalar_ptr(&kvl),
+            scalar_ptr(&po),
+            scalar_ptr(&win),
+            scalar_ptr(&scale),
+            scalar_ptr(&softcap),
         ];
-        unsafe { self.fast.fire(&self.mha_fused, (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2), (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2), cfg.shared_mem_bytes, &mut args); }
+        unsafe {
+            self.fast.fire(
+                &self.mha_fused,
+                (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2),
+                (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2),
+                cfg.shared_mem_bytes,
+                &mut args,
+            );
+        }
 
         Ok(())
     }
@@ -1331,6 +1872,7 @@ impl OpsKernels {
         seq_len: u32,
         kv_len: u32,
         pos_offset: u32,
+        window: u32,
         scale: f32,
         softcap: f32,
     ) -> Result<(), KernelError> {
@@ -1341,13 +1883,132 @@ impl OpsKernels {
         let sl = seq_len as i32;
         let kvl = kv_len as i32;
         let po = pos_offset as i32;
-        let mut args: [*mut c_void; 12] = [
-            slice_ptr(q), view_ptr(k), view_ptr(v), slice_ptr_mut(out),
-            scalar_ptr(&hd), scalar_ptr(&nh), scalar_ptr(&nkv),
-            scalar_ptr(&sl), scalar_ptr(&kvl), scalar_ptr(&po),
-            scalar_ptr(&scale), scalar_ptr(&softcap),
+        let win = window as i32;
+        let mut args: [*mut c_void; 13] = [
+            slice_ptr(q),
+            view_ptr(k),
+            view_ptr(v),
+            slice_ptr_mut(out),
+            scalar_ptr(&hd),
+            scalar_ptr(&nh),
+            scalar_ptr(&nkv),
+            scalar_ptr(&sl),
+            scalar_ptr(&kvl),
+            scalar_ptr(&po),
+            scalar_ptr(&win),
+            scalar_ptr(&scale),
+            scalar_ptr(&softcap),
         ];
-        unsafe { self.fast.fire(&self.mha_naive, (n_heads, seq_len, 1), (1, 1, 1), smem, &mut args); }
+        unsafe {
+            self.fast.fire(
+                &self.mha_naive,
+                (n_heads, seq_len, 1),
+                (1, 1, 1),
+                smem,
+                &mut args,
+            );
+        }
+        Ok(())
+    }
+
+    /// Correctness-first full-attention fallback for bidirectional encoders.
+    pub fn mha_naive_full(
+        &self,
+        q: &CudaSlice<half::f16>,
+        k: &CudaView<'_, half::f16>,
+        v: &CudaView<'_, half::f16>,
+        out: &mut CudaSlice<half::f16>,
+        head_dim: u32,
+        n_heads: u32,
+        n_kv_heads: u32,
+        seq_len: u32,
+        kv_len: u32,
+        scale: f32,
+        softcap: f32,
+    ) -> Result<(), KernelError> {
+        let smem = (2 * kv_len as usize * std::mem::size_of::<f32>()) as u32;
+        let hd = head_dim as i32;
+        let nh = n_heads as i32;
+        let nkv = n_kv_heads as i32;
+        let sl = seq_len as i32;
+        let kvl = kv_len as i32;
+        let po = 0i32;
+        let mut args: [*mut c_void; 12] = [
+            slice_ptr(q),
+            view_ptr(k),
+            view_ptr(v),
+            slice_ptr_mut(out),
+            scalar_ptr(&hd),
+            scalar_ptr(&nh),
+            scalar_ptr(&nkv),
+            scalar_ptr(&sl),
+            scalar_ptr(&kvl),
+            scalar_ptr(&po),
+            scalar_ptr(&scale),
+            scalar_ptr(&softcap),
+        ];
+        unsafe {
+            self.fast.fire(
+                &self.mha_naive_full,
+                (n_heads, seq_len, 1),
+                (1, 1, 1),
+                smem,
+                &mut args,
+            );
+        }
+        Ok(())
+    }
+
+    /// Naive MHA with an explicit additive attention mask.
+    /// mask: [seq_len, kv_len] f16, 0.0 = allowed, large-negative = blocked.
+    /// window/causality are NOT applied — the mask fully determines attendance.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mha_naive_masked(
+        &self,
+        q: &CudaSlice<half::f16>,
+        k: &CudaView<'_, half::f16>,
+        v: &CudaView<'_, half::f16>,
+        mask: &CudaView<'_, half::f16>,
+        out: &mut CudaSlice<half::f16>,
+        head_dim: u32,
+        n_heads: u32,
+        n_kv_heads: u32,
+        seq_len: u32,
+        kv_len: u32,
+        scale: f32,
+        softcap: f32,
+    ) -> Result<(), KernelError> {
+        let smem = (2 * kv_len as usize * std::mem::size_of::<f32>()) as u32;
+        let hd = head_dim as i32;
+        let nh = n_heads as i32;
+        let nkv = n_kv_heads as i32;
+        let sl = seq_len as i32;
+        let kvl = kv_len as i32;
+        let po = 0i32;
+        let mut args: [*mut c_void; 13] = [
+            slice_ptr(q),
+            view_ptr(k),
+            view_ptr(v),
+            view_ptr(mask),
+            slice_ptr_mut(out),
+            scalar_ptr(&hd),
+            scalar_ptr(&nh),
+            scalar_ptr(&nkv),
+            scalar_ptr(&sl),
+            scalar_ptr(&kvl),
+            scalar_ptr(&po),
+            scalar_ptr(&scale),
+            scalar_ptr(&softcap),
+        ];
+        unsafe {
+            self.fast.fire(
+                &self.mha_naive_masked,
+                (n_heads, seq_len, 1),
+                (1, 1, 1),
+                smem,
+                &mut args,
+            );
+        }
         Ok(())
     }
 
@@ -1376,10 +2037,22 @@ impl OpsKernels {
         let ne = n_experts as i32;
         let tk = top_k as i32;
         let mut args: [*mut c_void; 6] = [
-            slice_ptr(logits), slice_ptr_mut(out_ids), slice_ptr_mut(out_weights),
-            scalar_ptr(&ne), scalar_ptr(&tk), scalar_ptr(&softcap),
+            slice_ptr(logits),
+            slice_ptr_mut(out_ids),
+            slice_ptr_mut(out_weights),
+            scalar_ptr(&ne),
+            scalar_ptr(&tk),
+            scalar_ptr(&softcap),
         ];
-        unsafe { self.fast.fire(&self.softmax_topk, (1, 1, 1), (block_size, 1, 1), cfg.shared_mem_bytes, &mut args); }
+        unsafe {
+            self.fast.fire(
+                &self.softmax_topk,
+                (1, 1, 1),
+                (block_size, 1, 1),
+                cfg.shared_mem_bytes,
+                &mut args,
+            );
+        }
         Ok(())
     }
 
@@ -1408,24 +2081,57 @@ impl OpsKernels {
         let ne = n_experts as i32;
         let tk = top_k as i32;
         let mut args: [*mut c_void; 11] = [
-            slice_ptr(hidden), slice_ptr(gate_scale), slice_ptr(gate_weights),
-            slice_ptr_mut(out_ids), slice_ptr_mut(out_weights),
-            scalar_ptr(&dim_i), scalar_ptr(&ne), scalar_ptr(&tk),
-            scalar_ptr(&eps), scalar_ptr(&inv_sqrt_dim), scalar_ptr(&softcap),
+            slice_ptr(hidden),
+            slice_ptr(gate_scale),
+            slice_ptr(gate_weights),
+            slice_ptr_mut(out_ids),
+            slice_ptr_mut(out_weights),
+            scalar_ptr(&dim_i),
+            scalar_ptr(&ne),
+            scalar_ptr(&tk),
+            scalar_ptr(&eps),
+            scalar_ptr(&inv_sqrt_dim),
+            scalar_ptr(&softcap),
         ];
-        unsafe { self.fast.fire(&self.fused_moe_router, (1, 1, 1), (block_size, 1, 1), smem, &mut args); }
+        unsafe {
+            self.fast.fire(
+                &self.fused_moe_router,
+                (1, 1, 1),
+                (block_size, 1, 1),
+                smem,
+                &mut args,
+            );
+        }
         Ok(())
     }
 
     // --- C dispatch accessors: expose CudaFunction handles for the C layer ---
 
-    pub fn rms_norm_f32in_q8_fn(&self) -> &CudaFunction { &self.rms_norm_f32in_q8 }
-    pub fn fused_add_rmsnorm_q8_fn(&self) -> &CudaFunction { &self.fused_add_rmsnorm_q8 }
-    pub fn rope_fn(&self) -> &CudaFunction { &self.rope }
-    pub fn copy_f16_fn(&self) -> &CudaFunction { &self.copy_f16 }
-    pub fn mha_fused_fn(&self) -> &CudaFunction { &self.mha_fused }
-    pub fn silu_fn(&self) -> &CudaFunction { &self.silu }
-    pub fn add_inplace_f32_f16_fn(&self) -> &CudaFunction { &self.add_inplace_f32_f16 }
-    pub fn rms_norm_f32in_fn(&self) -> &CudaFunction { &self.rms_norm_f32in }
-    pub fn argmax_f16_fn(&self) -> &CudaFunction { &self.argmax_f16 }
+    pub fn rms_norm_f32in_q8_fn(&self) -> &CudaFunction {
+        &self.rms_norm_f32in_q8
+    }
+    pub fn fused_add_rmsnorm_q8_fn(&self) -> &CudaFunction {
+        &self.fused_add_rmsnorm_q8
+    }
+    pub fn rope_fn(&self) -> &CudaFunction {
+        &self.rope
+    }
+    pub fn copy_f16_fn(&self) -> &CudaFunction {
+        &self.copy_f16
+    }
+    pub fn mha_fused_fn(&self) -> &CudaFunction {
+        &self.mha_fused
+    }
+    pub fn silu_fn(&self) -> &CudaFunction {
+        &self.silu
+    }
+    pub fn add_inplace_f32_f16_fn(&self) -> &CudaFunction {
+        &self.add_inplace_f32_f16
+    }
+    pub fn rms_norm_f32in_fn(&self) -> &CudaFunction {
+        &self.rms_norm_f32in
+    }
+    pub fn argmax_f16_fn(&self) -> &CudaFunction {
+        &self.argmax_f16
+    }
 }

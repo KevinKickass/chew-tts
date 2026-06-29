@@ -1348,13 +1348,14 @@ impl CudaContext {
         len: usize,
     ) -> Result<PinnedHostSlice<T>, DriverError> {
         self.bind_to_thread()?;
-        let ptr = result::malloc_host(
-            len * std::mem::size_of::<T>(),
-            sys::CU_MEMHOSTALLOC_WRITECOMBINED,
-        )?;
+        let nbytes = len * std::mem::size_of::<T>();
+        // CUDA may return a null pointer for zero-byte host allocations.
+        // Keep API semantics (`len` unchanged) but allocate a tiny backing buffer.
+        let alloc_bytes = nbytes.max(1);
+        let ptr = result::malloc_host(alloc_bytes, sys::CU_MEMHOSTALLOC_WRITECOMBINED)?;
         let ptr = ptr as *mut T;
         assert!(!ptr.is_null());
-        assert!(len * std::mem::size_of::<T>() < isize::MAX as usize);
+        assert!(alloc_bytes < isize::MAX as usize);
         assert!(ptr.is_aligned());
         let event = self.new_event(Some(sys::CUevent_flags::CU_EVENT_BLOCKING_SYNC))?;
         Ok(PinnedHostSlice { ptr, len, event })

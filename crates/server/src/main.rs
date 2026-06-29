@@ -5,19 +5,70 @@ use axum::{
     response::{Html, IntoResponse},
     routing::{get, post},
 };
-use minijinja::Environment;
 use chew_engine::{ChewEngine, sample::SampleParams};
 use chew_gguf::GgufFile;
 use chew_vram::VramAllocator;
+use minijinja::Environment;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
+use std::time::Instant;
 use tokenizers::Tokenizer;
 use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
 use tracing::{error, info};
 
 const UI_HTML: &str = include_str!("ui.html");
+const JELLY_MONSTER_ASCII: &str = r#"
+                            %@%:
+                            +@:------:-=@
+                           @:-------------:@
+                          @:-:--------------=+
+                         @::------------------==@
+                         :-:---------------------=#@                 +@@@@@@@@=
+                        #-:---------------------------::------:-----------------:+@#
+                       @--:---------------------------------------------------------=@
+                       =--:-----------------------------::----:::--------------------=*
+                      #---------------------------------------------------------------=+
+                      *----------------------------------------------------------------=@
+                     :-----------------------------------------------------------------==
+                   #:---------------------:%%------------------------------------------==#
+                @--------------------@%:-----------------------------------------------=-:
+             @:-------------:---------------------------------------------------------=-+
+            @:--------=@@@@@@-----------------=======-----------------------------------@
+           @---------=        -#-------------:+.     @:--------------------------------*
+           @--:------@   #@-    @----------==          @----------------------------===@
+           @--:------@   @@@    @----------*  @@@       @--------------------------=--@
+            +---------:         @----------:            @------------------------====@
+            @--------+:@@      @-=-:------#--          -:-----------------------====@
+            @---------:%--::::--@--:-------:#::-@@%*@%--------------------------=-=@
+            @--------------+@%=---:------------*@@@@---------------------------===@
+           *---------------------:---------------------------------:@----------==@
+          @:----------------------------------------------------------:@-------==@
+         %:----------------------------------=---------*@@   *****@@-----------==@
+       @:--:--------------------------=====-------=@@%****   *******@:---=:-----=+@
+      @--::-------------:----------------------#@%   ******%%********@:::-@------=@%
+     @:-:--------------:--::%@%**   +****   %*******@****************%:---@------==+@
+    @:-:-----------------@********=  *****% %***************+********@:-:-%:::--:-==-@#
+   @---------------------**************+******************+**********@---=::::------=--@
+   %---------------------=******************************************@---=@-----------===#@
+   @----:------------------#%********************************@@%***@----%--------------==-@
+    @--------------------------@#*********##********@#********   @:----=:--------------====@
+     %@--------=-------------------=@%*****   *******  %******@@-------:----------------===%*
+                =@*--------------------:::*@@@@%%#***%*@@@@@*---------------------------===+@
+                    %------------------------------------------------------------------====@:
+                     @---------------------------------------------------------------:=====@
+                      :-------------------------------------------------------------======@
+                      @----------------------------------------------------------======-@%
+                       *----------------------------------====--====================--@@
+                       @=-----------------------------========-=========---------=%@@
+                        @==-----------------------=====-=-=@@@            *@@@@.
+                         @==-------------------========@@
+                          @======--------====-=====-@@
+                           @#-===================%@
+                             @@==============-+@
+                                @@========-@@
+"#;
 
 struct AppState {
     engine: Mutex<ChewEngine>,
@@ -25,6 +76,7 @@ struct AppState {
     model_name: String,
     model_arch: String,
     chat_template: Option<String>,
+    tokenizer_add_bos: bool,
     bos_token_id: Option<u32>,
     bos_token: Option<String>,
     eos_token_id: u32,
@@ -34,8 +86,7 @@ struct AppState {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -58,16 +109,19 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|i| args.get(i + 1))
         .and_then(|s| s.parse().ok());
 
+    println!("{JELLY_MONSTER_ASCII}");
     info!("chew v0.1 — GPU inference engine");
-    info!(model = %model_path, port, "starting");
+    info!(model = %model_path, port, max_context, "starting");
 
     // Extract tokenizer from GGUF metadata
     let gguf = GgufFile::open(&model_path)?;
-    let tokenizer = chew_gguf::extract_tokenizer(&gguf.header)
-        .ok_or_else(|| anyhow::anyhow!("GGUF has no tokenizer metadata (tokenizer.ggml.tokens missing)"))?;
+    let tokenizer = chew_gguf::extract_tokenizer(&gguf.header).ok_or_else(|| {
+        anyhow::anyhow!("GGUF has no tokenizer metadata (tokenizer.ggml.tokens missing)")
+    })?;
 
     let bos_token_id = gguf.header.bos_token_id();
     let bos_token = bos_token_id.and_then(|id| tokenizer.id_to_token(id));
+    let tokenizer_add_bos = gguf.header.add_bos_token().unwrap_or(false);
     let eos_token_id = gguf
         .header
         .preferred_eos_token_id()
@@ -85,7 +139,11 @@ async fn main() -> anyhow::Result<()> {
     let engine = ChewEngine::load(&model_path, &alloc, 0, max_context)?;
 
     let model_arch = engine.config().arch.clone();
-    let model_name = gguf.header.model_name().unwrap_or(model_arch.as_str()).to_string();
+    let model_name = gguf
+        .header
+        .model_name()
+        .unwrap_or(model_arch.as_str())
+        .to_string();
     info!(arch = %model_name, "model loaded, starting server");
     let state = Arc::new(AppState {
         engine: Mutex::new(engine),
@@ -93,6 +151,7 @@ async fn main() -> anyhow::Result<()> {
         model_name,
         model_arch,
         chat_template: gguf.header.chat_template().map(str::to_string),
+        tokenizer_add_bos,
         bos_token_id,
         bos_token,
         eos_token_id,
@@ -133,11 +192,33 @@ struct ChatRequest {
     temperature: f32,
     #[serde(default = "default_top_p")]
     top_p: f32,
+    #[serde(default = "default_top_k")]
+    top_k: u32,
+    #[serde(default = "default_repeat_penalty")]
+    repeat_penalty: f32,
+    #[serde(default = "default_repeat_window")]
+    repeat_window: usize,
 }
 
-fn default_max_tokens() -> u32 { 512 }
-fn default_temperature() -> f32 { 0.7 }
-fn default_top_p() -> f32 { 0.9 }
+fn default_max_tokens() -> u32 {
+    2048
+}
+fn default_temperature() -> f32 {
+    0.7
+}
+fn default_top_p() -> f32 {
+    0.9
+}
+fn default_top_k() -> u32 {
+    40
+}
+fn default_repeat_penalty() -> f32 {
+    // Default fast path: allows pure GPU top-k sampling.
+    1.0
+}
+fn default_repeat_window() -> usize {
+    64
+}
 
 #[derive(Deserialize, Serialize, Clone)]
 struct ChatMessage {
@@ -208,7 +289,9 @@ fn build_prompt_fallback(messages: &[ChatMessage], arch: &str) -> String {
     match arch {
         "gemma4" => build_prompt_gemma4(messages),
         "gemma3" | "gemma2" => build_prompt_gemma_legacy(messages),
-        _ => build_prompt_llama(messages),
+        "llama" => build_prompt_llama(messages),
+        "mamba" => build_prompt_mamba_base(messages),
+        _ => build_prompt_generic_chat(messages),
     }
 }
 
@@ -241,7 +324,7 @@ fn build_prompt_gemma4(messages: &[ChatMessage]) -> String {
         };
         prompt.push_str(&format!("<|turn>{}\n{}<turn|>\n", role, msg.content));
     }
-    prompt.push_str("<|turn>model\n<|channel>thought\n<channel|>");
+    prompt.push_str("<|turn>model\n<|channel>final\n<channel|>");
     prompt
 }
 
@@ -263,6 +346,63 @@ fn strip_model_control_tokens(mut text: String) -> String {
     text.trim().to_string()
 }
 
+fn strip_trailing_eos_markers(mut text: String) -> String {
+    const EOS_MARKERS: &[&str] = &["<|endoftext|>", "<|eot_id|>", "</s>", "<eos>"];
+    text = text.trim().to_string();
+    loop {
+        let mut stripped = false;
+        for marker in EOS_MARKERS {
+            if text.ends_with(marker) {
+                let keep = text.len().saturating_sub(marker.len());
+                text.truncate(keep);
+                text = text.trim_end().to_string();
+                stripped = true;
+            }
+        }
+        if !stripped {
+            break;
+        }
+    }
+    text
+}
+
+fn decode_hex_byte_markers(text: &str) -> String {
+    let mut out = Vec::with_capacity(text.len());
+    let mut i = 0usize;
+
+    while i < text.len() {
+        if let Some((byte, next_i)) = parse_hex_byte_marker(text, i) {
+            out.push(byte);
+            i = next_i;
+            continue;
+        }
+
+        let ch = text[i..].chars().next().expect("valid utf-8 boundary");
+        let mut buf = [0u8; 4];
+        out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+        i += ch.len_utf8();
+    }
+
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn parse_hex_byte_marker(text: &str, start: usize) -> Option<(u8, usize)> {
+    let rest = text.get(start..)?;
+    let bytes = rest.as_bytes();
+    if bytes.len() < 6
+        || bytes[0] != b'<'
+        || bytes[1] != b'0'
+        || bytes[2] != b'x'
+        || bytes[5] != b'>'
+    {
+        return None;
+    }
+
+    let hi = (bytes[3] as char).to_digit(16)?;
+    let lo = (bytes[4] as char).to_digit(16)?;
+    Some((((hi << 4) | lo) as u8, start + 6))
+}
+
 const GEMMA4_SPECIAL_TOKENS: &[&str] = &[
     "<|tool_response>",
     "<tool_response|>",
@@ -282,6 +422,13 @@ fn encode_prompt(
     model_arch: &str,
     prompt: &str,
 ) -> Result<Vec<u32>, String> {
+    if model_arch == "bert" {
+        return tokenizer
+            .encode(prompt, true)
+            .map(|e| e.get_ids().to_vec())
+            .map_err(|e| e.to_string());
+    }
+
     if model_arch != "gemma4" {
         return tokenizer
             .encode(prompt, false)
@@ -317,8 +464,7 @@ fn encode_prompt(
             .unwrap_or(rest.len());
         let chunk = &rest[..next_special];
         if !chunk.is_empty() {
-            let escaped = chunk.replace(' ', "▁");
-            let enc = tokenizer.encode(escaped, false).map_err(|e| e.to_string())?;
+            let enc = tokenizer.encode(chunk, false).map_err(|e| e.to_string())?;
             ids.extend_from_slice(enc.get_ids());
         }
         i += next_special;
@@ -327,51 +473,72 @@ fn encode_prompt(
     Ok(ids)
 }
 
-fn extract_chat_response(text: &str) -> String {
+fn extract_chat_response(text: &str, starts_in_thought: bool) -> String {
     const CHANNEL_OPEN: &str = "<|channel>";
     const CHANNEL_CLOSE: &str = "<channel|>";
     const TURN_CLOSE: &str = "<turn|>";
 
+    let text = text.split(TURN_CLOSE).next().unwrap_or(text);
+
     let mut final_text = String::new();
     let mut visible_text = String::new();
-    let mut active_channel: Option<String> = None;
-    let mut body_start = 0usize;
+    let mut active_channel: Option<String> = if starts_in_thought {
+        Some("thought".to_string())
+    } else {
+        None
+    };
     let mut i = 0usize;
 
-    while let Some(rel_open) = text[i..].find(CHANNEL_OPEN) {
-        let open = i + rel_open;
-        if active_channel.is_some() {
-            let chunk = &text[body_start..open];
-            if active_channel.as_deref() == Some("final") {
-                final_text.push_str(chunk);
-            } else if active_channel.as_deref() != Some("thought") {
-                visible_text.push_str(chunk);
-            }
-        } else {
-            visible_text.push_str(&text[i..open]);
-        }
+    while i < text.len() {
+        let rest = &text[i..];
+        let next_open = rest.find(CHANNEL_OPEN);
+        let next_close = rest.find(CHANNEL_CLOSE);
 
-        let name_start = open + CHANNEL_OPEN.len();
-        let Some(rel_close) = text[name_start..].find(CHANNEL_CLOSE) else {
-            i = open;
-            break;
-        };
-        let close = name_start + rel_close;
-        active_channel = Some(text[name_start..close].trim().to_string());
-        body_start = close + CHANNEL_CLOSE.len();
-        i = body_start;
+        match (next_open, next_close) {
+            // <|channel>NAME<channel|> — switch to named channel
+            (Some(op), Some(cp)) if op <= cp => {
+                collect_channel_chunk(
+                    &mut final_text,
+                    &mut visible_text,
+                    &active_channel,
+                    &rest[..op],
+                );
+                let name_start = op + CHANNEL_OPEN.len();
+                active_channel = Some(rest[name_start..cp].trim().to_string());
+                i += cp + CHANNEL_CLOSE.len();
+            }
+            // Standalone <channel|> — close current channel
+            (_, Some(cp)) => {
+                collect_channel_chunk(
+                    &mut final_text,
+                    &mut visible_text,
+                    &active_channel,
+                    &rest[..cp],
+                );
+                active_channel = None;
+                i += cp + CHANNEL_CLOSE.len();
+            }
+            // Orphan <|channel> without matching close
+            (Some(op), None) => {
+                collect_channel_chunk(
+                    &mut final_text,
+                    &mut visible_text,
+                    &active_channel,
+                    &rest[..op],
+                );
+                break;
+            }
+            (None, None) => break,
+        }
     }
 
-    let tail = &text[i..];
-    if let Some(channel) = active_channel.as_deref() {
-        let tail = tail.split(TURN_CLOSE).next().unwrap_or("");
-        if channel == "final" {
-            final_text.push_str(tail);
-        } else if channel != "thought" {
-            visible_text.push_str(tail);
-        }
-    } else {
-        visible_text.push_str(tail);
+    if i < text.len() {
+        collect_channel_chunk(
+            &mut final_text,
+            &mut visible_text,
+            &active_channel,
+            &text[i..],
+        );
     }
 
     let chosen = if final_text.trim().is_empty() {
@@ -382,6 +549,19 @@ fn extract_chat_response(text: &str) -> String {
     strip_model_control_tokens(chosen)
 }
 
+fn collect_channel_chunk(
+    final_text: &mut String,
+    visible_text: &mut String,
+    channel: &Option<String>,
+    chunk: &str,
+) {
+    match channel.as_deref() {
+        Some("final") => final_text.push_str(chunk),
+        Some("thought") => {}
+        _ => visible_text.push_str(chunk),
+    }
+}
+
 /// Build a Gemma 2/3 chat prompt (legacy <start_of_turn> format).
 fn build_prompt_gemma_legacy(messages: &[ChatMessage]) -> String {
     let mut prompt = String::new();
@@ -390,7 +570,10 @@ fn build_prompt_gemma_legacy(messages: &[ChatMessage]) -> String {
             "system" => "user",
             r => r,
         };
-        prompt.push_str(&format!("<start_of_turn>{}\n{}<end_of_turn>\n", role, msg.content));
+        prompt.push_str(&format!(
+            "<start_of_turn>{}\n{}<end_of_turn>\n",
+            role, msg.content
+        ));
     }
     prompt.push_str("<start_of_turn>model\n");
     prompt
@@ -409,16 +592,52 @@ fn build_prompt_llama(messages: &[ChatMessage]) -> String {
     prompt
 }
 
+/// Build a generic role-tagged chat prompt for architectures without a dedicated template.
+fn build_prompt_generic_chat(messages: &[ChatMessage]) -> String {
+    let mut prompt = String::new();
+    for msg in messages {
+        let role = match msg.role.as_str() {
+            "system" => "System",
+            "assistant" => "Assistant",
+            _ => "User",
+        };
+        prompt.push_str(role);
+        prompt.push_str(": ");
+        prompt.push_str(msg.content.trim());
+        prompt.push('\n');
+    }
+    prompt.push_str("Assistant: ");
+    prompt
+}
+
+/// Build a plain continuation prompt for base Mamba checkpoints (no chat template).
+/// This avoids role wrappers that can bias GPT2-style Mamba models into immediate EOT.
+fn build_prompt_mamba_base(messages: &[ChatMessage]) -> String {
+    let mut prompt = String::new();
+    for msg in messages {
+        if !msg.content.is_empty() {
+            prompt.push_str(msg.content.trim());
+            prompt.push('\n');
+        }
+    }
+    prompt
+}
+
+fn should_prepend_bos(model_arch: &str, tokenizer_add_bos: bool) -> bool {
+    // Align with llama.cpp: metadata drives BOS policy. Gemma4 is a known
+    // metadata edge-case where some GGUFs incorrectly set add_bos=false.
+    if model_arch == "gemma4" && !tokenizer_add_bos {
+        return true;
+    }
+    tokenizer_add_bos
+}
+
 async fn chat_completions(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ChatRequest>,
 ) -> Result<Json<ChatResponse>, AppError> {
     let prompt = match state.chat_template.as_deref() {
-        Some(template) => render_chat_template(
-            template,
-            &req.messages,
-            state.bos_token.as_deref(),
-        )
+        Some(template) => render_chat_template(template, &req.messages, state.bos_token.as_deref())
             .unwrap_or_else(|_| build_prompt_fallback(&req.messages, &state.model_arch)),
         None => build_prompt_fallback(&req.messages, &state.model_arch),
     };
@@ -426,44 +645,64 @@ async fn chat_completions(
     let mut input_tokens = encode_prompt(&state.tokenizer, &state.model_arch, prompt.as_str())
         .map_err(|e| AppError(format!("tokenize: {e}")))?;
     if let Some(bos) = state.bos_token_id {
-        // Match llama.cpp behavior for Gemma4: the model can auto-add BOS even if
-        // the rendered prompt already starts with an explicit <bos> token.
-        if state.model_arch == "gemma4" {
-            input_tokens.insert(0, bos);
-        } else if input_tokens.first().copied() != Some(bos) {
+        if should_prepend_bos(&state.model_arch, state.tokenizer_add_bos)
+            && input_tokens.first().copied() != Some(bos)
+        {
             input_tokens.insert(0, bos);
         }
     }
     let prompt_len = input_tokens.len() as u32;
 
-    info!(prompt = %prompt, prompt_tokens = prompt_len, max_tokens = req.max_tokens, "generating");
+    info!(
+        prompt_tokens = prompt_len,
+        max_tokens = req.max_tokens,
+        "generating"
+    );
 
     let params = SampleParams {
         temperature: req.temperature,
+        top_k: req.top_k,
         top_p: req.top_p,
+        repeat_penalty: req.repeat_penalty,
+        repeat_window: req.repeat_window,
         ..Default::default()
     };
 
+    let gen_t0 = Instant::now();
     let generated = {
         let mut engine = state.engine.lock().await;
         engine
             .generate(&input_tokens, req.max_tokens, &params, state.eos_token_id)
             .map_err(|e| AppError(format!("generate: {e}")))?
     };
+    let gen_elapsed = gen_t0.elapsed();
 
     let completion_len = generated.len() as u32;
+    let elapsed_s = gen_elapsed.as_secs_f64().max(1e-9);
+    let completion_tps = completion_len as f64 / elapsed_s;
+    let total_tps = (prompt_len + completion_len) as f64 / elapsed_s;
+    info!(
+        prompt_tokens = prompt_len,
+        completion_tokens = completion_len,
+        elapsed_ms = format!("{:.2}", gen_elapsed.as_secs_f64() * 1000.0),
+        completion_tok_s = format!("{:.2}", completion_tps),
+        total_tok_s = format!("{:.2}", total_tps),
+        "generation perf"
+    );
 
     let raw_response_text = state
         .tokenizer
         .decode(&generated, false)
         .map_err(|e| AppError(format!("detokenize: {e}")))?;
     let raw_response_text = if state.model_arch == "gemma4" {
-        raw_response_text.replace('▁', " ")
+        decode_hex_byte_markers(&raw_response_text.replace('▁', " "))
     } else {
         raw_response_text
     };
     info!(raw_response_text = %raw_response_text, "decoded raw response");
-    let response_text = extract_chat_response(&raw_response_text);
+    let starts_in_thought = prompt.contains("<|channel>thought");
+    let response_text =
+        strip_trailing_eos_markers(extract_chat_response(&raw_response_text, starts_in_thought));
 
     info!(completion_tokens = completion_len, ?generated, "done");
 
@@ -529,7 +768,11 @@ struct ModelEntry {
 }
 
 fn l2_normalize(v: &mut [f32]) {
-    let norm = v.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>().sqrt() as f32;
+    let norm = v
+        .iter()
+        .map(|x| (*x as f64) * (*x as f64))
+        .sum::<f64>()
+        .sqrt() as f32;
     if norm > 0.0 {
         for x in v {
             *x /= norm;
@@ -577,9 +820,11 @@ async fn embeddings(
     for (index, text) in texts.iter().enumerate() {
         let mut tokens = encode_prompt(&state.tokenizer, &state.model_arch, text)
             .map_err(|e| AppError(format!("tokenize: {e}")))?;
-        if let Some(bos) = state.bos_token_id {
-            if tokens.first().copied() != Some(bos) {
-                tokens.insert(0, bos);
+        if should_prepend_bos(&state.model_arch, state.tokenizer_add_bos) {
+            if let Some(bos) = state.bos_token_id {
+                if tokens.first().copied() != Some(bos) {
+                    tokens.insert(0, bos);
+                }
             }
         }
         total_tokens += tokens.len() as u32;
@@ -628,4 +873,96 @@ fn uuid_simple() -> String {
         .unwrap()
         .as_nanos();
     format!("{t:x}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ChatMessage, build_prompt_fallback, decode_hex_byte_markers, extract_chat_response,
+        should_prepend_bos, strip_trailing_eos_markers,
+    };
+
+    #[test]
+    fn mamba_fallback_uses_generic_prompt() {
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: "hi".into(),
+        }];
+        let prompt = build_prompt_fallback(&messages, "mamba");
+        assert_eq!(prompt, "hi\n");
+        assert!(!prompt.contains("<|begin_of_text|>"));
+    }
+
+    #[test]
+    fn unknown_arch_fallback_uses_generic_prompt() {
+        let messages = vec![ChatMessage {
+            role: "system".into(),
+            content: "rules".into(),
+        }];
+        let prompt = build_prompt_fallback(&messages, "unknown-arch");
+        assert!(prompt.starts_with("System: rules\n"));
+        assert!(prompt.ends_with("Assistant: "));
+        assert!(!prompt.contains("<|start_header_id|>"));
+    }
+
+    #[test]
+    fn llama_fallback_keeps_llama_template() {
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: "hi".into(),
+        }];
+        let prompt = build_prompt_fallback(&messages, "llama");
+        assert!(prompt.starts_with("<|begin_of_text|>"));
+        assert!(prompt.contains("<|start_header_id|>user<|end_header_id|>"));
+        assert!(prompt.contains("<|start_header_id|>assistant<|end_header_id|>"));
+    }
+
+    #[test]
+    fn gemma4_fallback_starts_in_final_channel() {
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: "hi".into(),
+        }];
+        let prompt = build_prompt_fallback(&messages, "gemma4");
+        assert!(prompt.ends_with("<|turn>model\n<|channel>final\n<channel|>"));
+    }
+
+    #[test]
+    fn bos_prepend_policy_respects_metadata_with_gemma4_workaround() {
+        assert!(!should_prepend_bos("mamba", false));
+        assert!(should_prepend_bos("mamba", true));
+        assert!(!should_prepend_bos("bert", false));
+        assert!(should_prepend_bos("bert", true));
+        assert!(!should_prepend_bos("llama", false));
+        assert!(should_prepend_bos("llama", true));
+        assert!(should_prepend_bos("gemma4", false));
+        assert!(should_prepend_bos("gemma4", true));
+    }
+
+    #[test]
+    fn strips_trailing_eos_markers() {
+        assert_eq!(
+            strip_trailing_eos_markers("Paris<|endoftext|>".into()),
+            "Paris"
+        );
+        assert_eq!(strip_trailing_eos_markers("hello </s> ".into()), "hello");
+        assert_eq!(
+            strip_trailing_eos_markers("plain text".into()),
+            "plain text"
+        );
+    }
+
+    #[test]
+    fn extract_chat_response_handles_close_only_after_thought() {
+        let raw = "Plan:\n1. Think\n<channel|>Visible answer<turn|>";
+        assert_eq!(extract_chat_response(raw, true), "Visible answer");
+    }
+
+    #[test]
+    fn decodes_hex_byte_markers() {
+        assert_eq!(
+            decode_hex_byte_markers("Hello<0x20>world<0x0A>"),
+            "Hello world\n"
+        );
+    }
 }

@@ -59,6 +59,13 @@ impl MetadataValue {
             _ => None,
         }
     }
+
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            MetadataValue::Bool(v) => Some(*v),
+            _ => None,
+        }
+    }
 }
 
 /// Tensor quantization type — determines how weights are stored and dequantized.
@@ -143,12 +150,20 @@ impl GgmlType {
             Self::Q4_0 | Self::Q4_1 | Self::Q5_0 | Self::Q5_1 | Self::Q8_0 | Self::Q8_1 => 32,
             Self::IQ4_NL => 32,
             // All K-quants and IQ types: QK_K = 256
-            Self::Q2_K | Self::Q3_K | Self::Q4_K | Self::Q5_K
-            | Self::Q6_K | Self::Q8_K
-            | Self::IQ2_XXS | Self::IQ2_XS | Self::IQ2_S
-            | Self::IQ3_XXS | Self::IQ3_S
+            Self::Q2_K
+            | Self::Q3_K
+            | Self::Q4_K
+            | Self::Q5_K
+            | Self::Q6_K
+            | Self::Q8_K
+            | Self::IQ2_XXS
+            | Self::IQ2_XS
+            | Self::IQ2_S
+            | Self::IQ3_XXS
+            | Self::IQ3_S
             | Self::IQ4_XS
-            | Self::IQ1_S | Self::IQ1_M => 256,
+            | Self::IQ1_S
+            | Self::IQ1_M => 256,
         }
     }
 
@@ -163,26 +178,26 @@ impl GgmlType {
             Self::I16 => 2,
             Self::I32 => 4,
             Self::I64 => 8,
-            Self::Q4_0 => 2 + 16,             // f16 scale + 32 * 4bit / 8
-            Self::Q4_1 => 2 + 2 + 16,         // f16 scale + f16 min + 16 bytes
-            Self::Q5_0 => 2 + 4 + 16,         // f16 scale + 32bit hmask + 16 bytes
-            Self::Q5_1 => 2 + 2 + 4 + 16,     // f16 scale + f16 min + hmask + 16 bytes
-            Self::Q8_0 => 2 + 32,             // f16 scale + 32 bytes
-            Self::Q8_1 => 4 + 4 + 32,         // f32 scale + f32 sum + 32 bytes
-            Self::Q2_K => 2 + 2 + 16 + 64,   // f16 d + f16 dmin + 16 scales + 64 qs
-            Self::Q3_K => 2 + 32 + 64 + 12,  // f16 d + 32 hmask + 64 qs + 12 scales
-            Self::Q4_K => 2 + 2 + 12 + 128,  // f16 d + f16 dmin + 12 scales + 128 qs
+            Self::Q4_0 => 2 + 16,                // f16 scale + 32 * 4bit / 8
+            Self::Q4_1 => 2 + 2 + 16,            // f16 scale + f16 min + 16 bytes
+            Self::Q5_0 => 2 + 4 + 16,            // f16 scale + 32bit hmask + 16 bytes
+            Self::Q5_1 => 2 + 2 + 4 + 16,        // f16 scale + f16 min + hmask + 16 bytes
+            Self::Q8_0 => 2 + 32,                // f16 scale + 32 bytes
+            Self::Q8_1 => 4 + 4 + 32,            // f32 scale + f32 sum + 32 bytes
+            Self::Q2_K => 2 + 2 + 16 + 64,       // f16 d + f16 dmin + 16 scales + 64 qs
+            Self::Q3_K => 2 + 32 + 64 + 12,      // f16 d + 32 hmask + 64 qs + 12 scales
+            Self::Q4_K => 2 + 2 + 12 + 128,      // f16 d + f16 dmin + 12 scales + 128 qs
             Self::Q5_K => 2 + 2 + 12 + 32 + 128, // + 32 qh
-            Self::Q6_K => 2 + 128 + 64 + 16, // f16 d + 128 ql + 64 qh + 16 scales
-            Self::Q8_K => 4 + 256,            // f32 d + 256 qs
-            Self::IQ1_S => 2 + 32 + 16,      // f16 d + 32 qs + 16 qh (8 * u16)
-            Self::IQ1_M => 2 + 32 + 16 + 8,  // f16 d + 32 qs + 16 qh + 8 scales
-            Self::IQ2_XXS => 2 + 64,          // f16 d + 32 * u16 qs
-            Self::IQ2_XS => 2 + 64 + 8,      // f16 d + 64 qs + 8 scales
-            Self::IQ2_S => 2 + 64 + 8 + 32,  // f16 d + 64 qs + 8 qh + 32 scales  -- approx
-            Self::IQ3_XXS => 2 + 96 + 16,    // f16 d + 3*32 qs + 16 signs
-            Self::IQ3_S => 2 + 96 + 32 + 8,  // f16 d + 96 qs + 32 qh + 8 scales
-            Self::IQ4_NL => 2 + 16,           // f16 d + 16 qs (32 4-bit)
+            Self::Q6_K => 2 + 128 + 64 + 16,     // f16 d + 128 ql + 64 qh + 16 scales
+            Self::Q8_K => 4 + 256,               // f32 d + 256 qs
+            Self::IQ1_S => 2 + 32 + 16,          // f16 d + 32 qs + 16 qh (8 * u16)
+            Self::IQ1_M => 2 + 32 + 16 + 8,      // f16 d + 32 qs + 16 qh + 8 scales
+            Self::IQ2_XXS => 2 + 64,             // f16 d + 32 * u16 qs
+            Self::IQ2_XS => 2 + 64 + 8,          // f16 d + 64 qs + 8 scales
+            Self::IQ2_S => 2 + 64 + 8 + 32,      // f16 d + 64 qs + 8 qh + 32 scales  -- approx
+            Self::IQ3_XXS => 2 + 96 + 16,        // f16 d + 3*32 qs + 16 signs
+            Self::IQ3_S => 2 + 96 + 32 + 8,      // f16 d + 96 qs + 32 qh + 8 scales
+            Self::IQ4_NL => 2 + 16,              // f16 d + 16 qs (32 4-bit)
             Self::IQ4_XS => 2 + 2 + 128 + 16, // f16 d + u16 scales_h + 128 qs + 16 scales_l -- approx
         }
     }
@@ -250,9 +265,7 @@ impl GgufHeader {
     }
 
     pub fn model_name(&self) -> Option<&str> {
-        self.metadata
-            .get("general.name")
-            .and_then(|v| v.as_str())
+        self.metadata.get("general.name").and_then(|v| v.as_str())
     }
 
     pub fn chat_template(&self) -> Option<&str> {
@@ -271,6 +284,18 @@ impl GgufHeader {
 
     pub fn eos_token_id(&self) -> Option<u32> {
         self.token_id("tokenizer.ggml.eos_token_id")
+    }
+
+    pub fn add_bos_token(&self) -> Option<bool> {
+        self.metadata
+            .get("tokenizer.ggml.add_bos_token")
+            .and_then(|v| v.as_bool())
+    }
+
+    pub fn add_eos_token(&self) -> Option<bool> {
+        self.metadata
+            .get("tokenizer.ggml.add_eos_token")
+            .and_then(|v| v.as_bool())
     }
 
     pub fn preferred_eos_token_id(&self) -> Option<u32> {
@@ -360,9 +385,7 @@ impl GgufHeader {
     /// Generic get for any key as u32 array.
     pub fn get_u32_array(&self, key: &str) -> Result<Vec<u32>, GgufError> {
         match self.metadata.get(key) {
-            Some(MetadataValue::Array(arr)) => {
-                Ok(arr.iter().filter_map(|v| v.as_u32()).collect())
-            }
+            Some(MetadataValue::Array(arr)) => Ok(arr.iter().filter_map(|v| v.as_u32()).collect()),
             _ => Err(GgufError::TensorNotFound(key.into())),
         }
     }
@@ -370,9 +393,10 @@ impl GgufHeader {
     /// Generic get for any key as bool array.
     pub fn get_bool_array(&self, key: &str) -> Result<Vec<bool>, GgufError> {
         match self.metadata.get(key) {
-            Some(MetadataValue::Array(arr)) => {
-                Ok(arr.iter().map(|v| matches!(v, MetadataValue::Bool(true))).collect())
-            }
+            Some(MetadataValue::Array(arr)) => Ok(arr
+                .iter()
+                .map(|v| matches!(v, MetadataValue::Bool(true)))
+                .collect()),
             _ => Err(GgufError::TensorNotFound(key.into())),
         }
     }
@@ -390,6 +414,8 @@ pub enum GgufError {
     UnknownMetadataType(u32),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("{0}")]
+    UnsupportedArchitecture(String),
     #[error("tensor not found: {0}")]
     TensorNotFound(String),
     #[error("file too small for tensor data (need {needed}, file has {file_size})")]

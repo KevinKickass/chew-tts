@@ -1,0 +1,20 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/chew",
+    "crates/chew-cuda",
+    "crates/chew-runtime",
+    "crates/chew-model-llama",
+    "crates/chew-model-gemma4",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+chew-cuda = { path = "crates/chew-cuda" }
+chew-runtime = { path = "crates/chew-runtime" }
+chew-model-llama = { path = "crates/chew-model-llama" }
+chew-model-gemma4 = { path = "crates/chew-model-gemma4" }

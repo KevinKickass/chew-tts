@@ -59,7 +59,9 @@ impl VramAllocator {
         let mut streams = Vec::with_capacity(count);
         for i in 0..count {
             let ctx = CudaContext::new(i).map_err(|e| VramError::CudaInit(e.to_string()))?;
-            let stream = ctx.new_stream().map_err(|e| VramError::CudaInit(e.to_string()))?;
+            let stream = ctx
+                .new_stream()
+                .map_err(|e| VramError::CudaInit(e.to_string()))?;
 
             let (free, total) = ctx
                 .mem_get_info()
@@ -109,7 +111,11 @@ impl VramAllocator {
             .alloc_zeros::<u8>(size as usize)
             .map_err(|e| VramError::Alloc(e.to_string()))?;
 
-        debug!(gpu = gpu_idx, size_mb = size / (1024 * 1024), "VRAM allocated");
+        debug!(
+            gpu = gpu_idx,
+            size_mb = size / (1024 * 1024),
+            "VRAM allocated"
+        );
 
         Ok(GpuBuffer {
             ptr,

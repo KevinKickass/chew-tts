@@ -22,8 +22,8 @@ pub struct Gemm {
 impl Gemm {
     /// Create GEMM handle with a capped dequant scratch buffer.
     pub fn new(stream: &Arc<CudaStream>, max_weight_elements: usize) -> Result<Self, KernelError> {
-        let blas = CudaBlas::new(Arc::clone(stream))
-            .map_err(|e| KernelError::Cublas(e.to_string()))?;
+        let blas =
+            CudaBlas::new(Arc::clone(stream)).map_err(|e| KernelError::Cublas(e.to_string()))?;
 
         let scratch_elements = max_weight_elements.min(MAX_SCRATCH_ELEMENTS);
         let dequant_scratch = stream
@@ -66,7 +66,10 @@ impl Gemm {
         } else {
             // Chunked: split along the N (output) dimension
             let chunk_n_max = (self.scratch_elements / k as usize) as u32;
-            assert!(chunk_n_max > 0, "scratch too small for even 1 row of weight matrix");
+            assert!(
+                chunk_n_max > 0,
+                "scratch too small for even 1 row of weight matrix"
+            );
 
             let bs = b_type.block_size() as u32;
             let bb = b_type.block_bytes() as u64;
@@ -77,7 +80,10 @@ impl Gemm {
             } else {
                 chunk_n_max
             };
-            assert!(chunk_n_aligned > 0, "chunk_n too small after block alignment");
+            assert!(
+                chunk_n_aligned > 0,
+                "chunk_n too small after block alignment"
+            );
 
             let mut n_done: u32 = 0;
             while n_done < n {
@@ -95,19 +101,19 @@ impl Gemm {
                 let row_bytes = blocks_per_row * bb;
                 let byte_offset = n_done as u64 * row_bytes;
                 let chunk_byte_len = chunk as u64 * row_bytes;
-                let b_chunk = b_quant.slice(byte_offset as usize..(byte_offset + chunk_byte_len) as usize);
+                let b_chunk =
+                    b_quant.slice(byte_offset as usize..(byte_offset + chunk_byte_len) as usize);
 
                 // Dequant this chunk into scratch (using view variant)
-                dequant.dequant_view(&b_chunk, &mut self.dequant_scratch, chunk_elements, b_type)?;
+                dequant.dequant_view(
+                    &b_chunk,
+                    &mut self.dequant_scratch,
+                    chunk_elements,
+                    b_type,
+                )?;
 
                 // GEMM: C[:, n_done..n_done+chunk] = A @ chunk^T
-                self.gemm_chunked(
-                    a,
-                    &self.dequant_scratch,
-                    c,
-                    m, n, k,
-                    chunk, n_done,
-                )?;
+                self.gemm_chunked(a, &self.dequant_scratch, c, m, n, k, chunk, n_done)?;
 
                 n_done += chunk;
             }
@@ -135,7 +141,10 @@ impl Gemm {
             self.matmul_f16(a, &self.dequant_scratch, c, m, n, k)?;
         } else {
             let chunk_n_max = (self.scratch_elements / k as usize) as u32;
-            assert!(chunk_n_max > 0, "scratch too small for even 1 row of weight matrix");
+            assert!(
+                chunk_n_max > 0,
+                "scratch too small for even 1 row of weight matrix"
+            );
 
             let bs = b_type.block_size() as u32;
             let bb = b_type.block_bytes() as u64;
@@ -144,7 +153,10 @@ impl Gemm {
             } else {
                 chunk_n_max
             };
-            assert!(chunk_n_aligned > 0, "chunk_n too small after block alignment");
+            assert!(
+                chunk_n_aligned > 0,
+                "chunk_n too small after block alignment"
+            );
 
             let mut n_done: u32 = 0;
             while n_done < n {
@@ -160,16 +172,16 @@ impl Gemm {
                 let row_bytes = blocks_per_row * bb;
                 let byte_offset = n_done as u64 * row_bytes;
                 let chunk_byte_len = chunk as u64 * row_bytes;
-                let b_chunk = b_quant.slice(byte_offset as usize..(byte_offset + chunk_byte_len) as usize);
+                let b_chunk =
+                    b_quant.slice(byte_offset as usize..(byte_offset + chunk_byte_len) as usize);
 
-                dequant.dequant_view(&b_chunk, &mut self.dequant_scratch, chunk_elements, b_type)?;
-                self.gemm_chunked(
-                    a,
-                    &self.dequant_scratch,
-                    c,
-                    m, n, k,
-                    chunk, n_done,
+                dequant.dequant_view(
+                    &b_chunk,
+                    &mut self.dequant_scratch,
+                    chunk_elements,
+                    b_type,
                 )?;
+                self.gemm_chunked(a, &self.dequant_scratch, c, m, n, k, chunk, n_done)?;
 
                 n_done += chunk;
             }
@@ -226,6 +238,59 @@ impl Gemm {
         )
     }
 
+    /// Batched version for several quantized B matrices with identical shape/type,
+    /// but with configurable A stride between batch items.
+    ///
+    /// This enables MoE-style batched down projections where each expert has its own
+    /// activation row in A (instead of reusing the same A for every batch item).
+    pub fn matmul_dequant_strided_batched_a_strided(
+        &mut self,
+        a: &CudaSlice<half::f16>,
+        b_quants: &[CudaView<'_, u8>],
+        b_type: chew_gguf::GgmlType,
+        b_elements_per_problem: u32,
+        c: &mut CudaSlice<half::f16>,
+        m: u32,
+        n: u32,
+        k: u32,
+        stride_a: i64,
+        dequant: &DequantKernels,
+    ) -> Result<(), KernelError> {
+        let batch_size = b_quants.len() as u32;
+        if batch_size == 0 {
+            return Ok(());
+        }
+
+        let total_elements = (batch_size * n * k) as usize;
+        if total_elements > self.scratch_elements {
+            return Err(KernelError::Cublas(format!(
+                "batched dequant scratch too small: need {} elements, have {}",
+                total_elements, self.scratch_elements
+            )));
+        }
+
+        let per_problem = (n * k) as usize;
+        for (i, bq) in b_quants.iter().enumerate() {
+            let start = i * per_problem;
+            let end = start + per_problem;
+            let mut dst = self.dequant_scratch.slice_mut(start..end);
+            dequant.dequant_to_view(bq, &mut dst, b_elements_per_problem, b_type)?;
+        }
+
+        self.matmul_f16_strided_batched_with_strides(
+            a,
+            &self.dequant_scratch,
+            c,
+            m,
+            n,
+            k,
+            batch_size,
+            stride_a,
+            (n * k) as i64,
+            (m * n) as i64,
+        )
+    }
+
     /// GEMM for a chunk: writes to C[:, n_offset..n_offset+chunk_n]
     fn gemm_chunked(
         &self,
@@ -233,7 +298,7 @@ impl Gemm {
         b_chunk: &CudaSlice<half::f16>,
         c: &mut CudaSlice<half::f16>,
         m: u32,
-        n: u32,   // total N (for ldc stride)
+        n: u32, // total N (for ldc stride)
         k: u32,
         chunk_n: u32,
         n_offset: u32,
@@ -256,7 +321,7 @@ impl Gemm {
             lda: k as i32,
             ldb: k as i32,
             beta,
-            ldc: n as i32,  // stride is full N, not chunk_n
+            ldc: n as i32, // stride is full N, not chunk_n
         };
 
         // Offset into C: col-major C^T has offset = n_offset elements
@@ -310,6 +375,52 @@ impl Gemm {
         Ok(())
     }
 
+    /// C = A @ B (both f16, B NOT transposed).
+    ///
+    /// A: [m, k] row-major
+    /// B: [k, n] row-major
+    /// C: [m, n] row-major
+    ///
+    /// Unlike `matmul_f16` (which computes A @ B^T), this contracts A's columns
+    /// with B's rows directly — used for the DiffusionGemma SC re-embedding
+    /// `soft[C, n_embd] = probs[C, vocab] @ token_embd[vocab, n_embd]`, reusing
+    /// the already-resident token_embd with no transpose buffer.
+    pub fn matmul_f16_nt(
+        &self,
+        a: &CudaSlice<half::f16>,
+        b: &CudaSlice<half::f16>,
+        c: &mut CudaSlice<half::f16>,
+        m: u32,
+        n: u32,
+        k: u32,
+    ) -> Result<(), KernelError> {
+        let alpha = half::f16::from_f32(1.0);
+        let beta = half::f16::from_f32(0.0);
+
+        // row-major C[m,n] = A[m,k] @ B[k,n]. In cuBLAS col-major terms the result
+        // is C^T[n,m] = (B as col-major [n,k], op=N) @ (A as col-major [k,m], op=N).
+        let cfg = GemmConfig {
+            transa: cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N,
+            transb: cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N,
+            m: n as i32,
+            n: m as i32,
+            k: k as i32,
+            alpha,
+            lda: n as i32,
+            ldb: k as i32,
+            beta,
+            ldc: n as i32,
+        };
+
+        unsafe {
+            self.blas
+                .gemm(cfg, b, a, c)
+                .map_err(|e| KernelError::Cublas(e.to_string()))?;
+        }
+
+        Ok(())
+    }
+
     /// Strided batched f16 GEMM.
     ///
     /// A batch: [batch, m, k] row-major
@@ -326,7 +437,13 @@ impl Gemm {
         batch_size: u32,
     ) -> Result<(), KernelError> {
         self.matmul_f16_strided_batched_with_strides(
-            a, b, c, m, n, k, batch_size,
+            a,
+            b,
+            c,
+            m,
+            n,
+            k,
+            batch_size,
             (m * k) as i64,
             (n * k) as i64,
             (m * n) as i64,
