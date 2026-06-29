@@ -454,6 +454,10 @@ impl ChewEngine {
                     &self.scratch.norm_out.slice(0..cl * dimu),
                     &mut canvas_norm_out,
                 )?;
+                if std::env::var("CHEW_PROFILE").is_ok() {
+                    stream.synchronize().map_err(EngineError::Driver)?;
+                }
+                let t_proj = std::time::Instant::now();
                 crate::forward::project_all_logits(
                     &mut self.kernels,
                     &canvas_norm_out,
@@ -463,6 +467,10 @@ impl ChewEngine {
                     vocab,
                     dim,
                 )?;
+                if std::env::var("CHEW_PROFILE").is_ok() {
+                    stream.synchronize().map_err(EngineError::Driver)?;
+                    eprintln!("  project_all_logits: {}ms", t_proj.elapsed().as_millis());
+                }
             }
             if let Some(cap) = softcap {
                 self.kernels

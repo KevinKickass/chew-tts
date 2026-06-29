@@ -2010,7 +2010,7 @@ impl OpsKernels {
             self.fast.fire(
                 &self.mha_naive_masked,
                 (n_heads, seq_len, 1),
-                (1, 1, 1),
+                (128, 1, 1),
                 smem,
                 &mut args,
             );

@@ -1087,27 +1087,25 @@ __global__ void mha_naive_masked(const __half* __restrict__ q,
                                  int pos_offset,
                                  float scale,
                                  float softcap) {
-    if (threadIdx.x != 0 || threadIdx.y != 0) {
-        return;
-    }
-
     const int head = blockIdx.x;
     const int q_pos = blockIdx.y;
     (void)pos_offset;
     const int kv_head = head / (n_heads / n_kv_heads);
     const int kv_stride = n_kv_heads * head_dim;
     const int D = head_dim;
+    const int tid = threadIdx.x;
+    const int nt = blockDim.x;
 
     const __half * Q_ptr = q + q_pos * n_heads * D + head * D;
     __half * out_ptr = out + q_pos * n_heads * D + head * D;
     const __half * mask_row = mask + (long)q_pos * kv_len;
 
     extern __shared__ float smem[];
-    float * scores = smem;
-    float * probs  = smem + kv_len;
+    float * scores = smem;          // [kv_len], reused as probs in place
+    __shared__ float red[256];      // block reduction
 
-    float max_score = -3.402823466e+38F;
-    for (int kp = 0; kp < kv_len; kp++) {
+    // scores: each thread handles a strided set of key positions
+    for (int kp = tid; kp < kv_len; kp += nt) {
         const __half * K_ptr = k + kp * kv_stride + kv_head * D;
         float score = 0.0f;
         for (int d = 0; d < D; d++) {
@@ -1117,24 +1115,45 @@ __global__ void mha_naive_masked(const __half* __restrict__ q,
         if (softcap > 0.0f) score = tanhf(score / softcap) * softcap;
         score += __half2float(mask_row[kp]);
         scores[kp] = score;
-        max_score = fmaxf(max_score, score);
     }
+    __syncthreads();
 
-    float sum = 0.0f;
-    for (int kp = 0; kp < kv_len; kp++) {
+    // max-reduction over scores
+    float lmax = -3.402823466e+38F;
+    for (int kp = tid; kp < kv_len; kp += nt) lmax = fmaxf(lmax, scores[kp]);
+    red[tid] = lmax;
+    __syncthreads();
+    for (int o = nt / 2; o > 0; o >>= 1) {
+        if (tid < o) red[tid] = fmaxf(red[tid], red[tid + o]);
+        __syncthreads();
+    }
+    float max_score = red[0];
+    __syncthreads();
+
+    // exp + sum-reduction (write probs back into scores)
+    float lsum = 0.0f;
+    for (int kp = tid; kp < kv_len; kp += nt) {
         float p = expf(scores[kp] - max_score);
-        probs[kp] = p;
-        sum += p;
+        scores[kp] = p;
+        lsum += p;
     }
+    red[tid] = lsum;
+    __syncthreads();
+    for (int o = nt / 2; o > 0; o >>= 1) {
+        if (tid < o) red[tid] += red[tid + o];
+        __syncthreads();
+    }
+    float inv_sum = (red[0] > 0.0f) ? 1.0f / red[0] : 0.0f;
+    __syncthreads();
 
-    float inv_sum = (sum > 0.0f) ? 1.0f / sum : 0.0f;
-    for (int d = 0; d < D; d++) {
+    // @V: each thread handles a strided set of output dims
+    for (int d = tid; d < D; d += nt) {
         float acc = 0.0f;
         for (int kp = 0; kp < kv_len; kp++) {
             const __half * V_ptr = v + kp * kv_stride + kv_head * D;
-            acc += (probs[kp] * inv_sum) * __half2float(V_ptr[d]);
+            acc += scores[kp] * __half2float(V_ptr[d]);
         }
-        out_ptr[d] = __float2half(acc);
+        out_ptr[d] = __float2half(acc * inv_sum);
     }
 }
 
