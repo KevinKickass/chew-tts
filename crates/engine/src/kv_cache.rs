@@ -84,6 +84,13 @@ impl KvCache {
         self.pos = 0;
     }
 
+    /// Set the write position to an absolute value. Used for prefix-KV diffusion:
+    /// prefill the prompt once (pos advances to P), then reset to P before each
+    /// denoising step so the canvas K/V are rewritten while the prompt K/V stay.
+    pub fn set_pos(&mut self, p: u32) {
+        self.pos = p;
+    }
+
     /// Resolve a layer index to its KV cache index.
     /// For Gemma 4: shared layers map to the last KV-owning layer.
     fn kv_idx(&self, layer: usize) -> usize {

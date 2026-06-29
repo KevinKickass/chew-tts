@@ -6,7 +6,9 @@ use chew_gguf::GgufFile;
 use chew_vram::VramAllocator;
 
 fn main() {
-    tracing_subscriber::fmt().with_env_filter("warn").init();
+    tracing_subscriber::fmt()
+        .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "warn".into()))
+        .init();
     let path = std::env::args()
         .nth(1)
         .expect("usage: diffusion_generate <model.gguf> [prompt]");

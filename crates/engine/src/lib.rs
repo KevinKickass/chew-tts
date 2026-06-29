@@ -300,20 +300,22 @@ impl ChewEngine {
         let vocabu = vocab as usize;
         let cl = canvas_len;
 
+        let _ = n_tokens;
         let stream = Arc::clone(&self.stream);
-        let attn = dg::DiffusionAttn::build(p as u32, n_tokens, n_swa, &stream)?;
+        // Prefix-KV: prompt is prefilled once into the KV cache; each step only
+        // re-decodes the canvas (C positions) against cached prompt K/V.
+        let attn = dg::DiffusionAttn::build_decode(p as u32, cl as u32, n_swa, &stream)?;
         let mut sc_bufs = dg::ScBuffers::alloc(canvas_len as u32, dim, n_ff, vocab, &stream)?;
 
-        let mut full_tokens_gpu = stream.alloc_zeros::<i32>(n_tokens as usize)?;
-        let mut hidden = stream.alloc_zeros::<f32>(n_tokens as usize * dimu)?;
+        let mut canvas_tokens_gpu = stream.alloc_zeros::<i32>(cl)?;
+        let mut hidden = stream.alloc_zeros::<f32>(cl * dimu)?;
         let mut canvas_emb = stream.alloc_zeros::<f32>(cl * dimu)?;
         let mut canvas_normed = stream.alloc_zeros::<half::f16>(cl * dimu)?;
         let mut canvas_norm_f32 = stream.alloc_zeros::<f32>(cl * dimu)?;
         let mut canvas_norm_out = stream.alloc_zeros::<half::f16>(cl * dimu)?;
         // Single logit buffer reused as both "previous step's logits" (read by
         // SC at the start of a step) and this step's fresh logits (written by
-        // the projection after SC has run). They never overlap in time, so one
-        // 134 MB buffer suffices — critical on the ~0.5 GB free after load.
+        // the projection after SC has run). They never overlap in time.
         let mut canvas_logits = stream.alloc_zeros::<half::f16>(cl * vocabu)?;
 
         // Diagnostics: CHEW_NO_SC disables self-conditioning; CHEW_DIFF_STEPS
@@ -324,10 +326,44 @@ impl ChewEngine {
         let fixed_canvas: Option<i32> = std::env::var("CHEW_DIFF_FIXED")
             .ok()
             .and_then(|v| v.parse().ok());
-        let mut full_tokens: Vec<i32> = Vec::with_capacity(n_tokens as usize);
-        full_tokens.extend(prompt_tokens.iter().map(|&t| t as i32));
-        for _ in 0..cl {
-            full_tokens.push(fixed_canvas.unwrap_or_else(|| rng.next_token(vocab) as i32));
+        let mut canvas_tokens: Vec<i32> = (0..cl)
+            .map(|_| fixed_canvas.unwrap_or_else(|| rng.next_token(vocab) as i32))
+            .collect();
+
+        // ── Prefill the prompt once: writes prompt K/V to [0..P), advances to P ──
+        {
+            let moe = match &mut self.weights {
+                WeightStorage::Moe(m) => m,
+                _ => unreachable!(),
+            };
+            let prompt_i32: Vec<i32> = prompt_tokens.iter().map(|&t| t as i32).collect();
+            let mut prompt_tokens_gpu = stream.alloc_zeros::<i32>(p)?;
+            let mut prompt_hidden = stream.alloc_zeros::<f32>(p * dimu)?;
+            stream.memcpy_htod(prompt_i32.as_slice(), &mut prompt_tokens_gpu)?;
+            self.kernels.ops.embed_tokens_f32(
+                &moe.token_embd,
+                &prompt_tokens_gpu,
+                &mut prompt_hidden,
+                p as u32,
+                dim,
+            )?;
+            self.kernels
+                .ops
+                .scale_f32_inplace(&mut prompt_hidden, p as u32 * dim, (dim as f32).sqrt())?;
+            self.kv_cache.reset();
+            // diffusion=None -> causal prompt prefill; advances kv_cache to P.
+            arch::gemma4_moe::forward_moe_streaming(
+                &mut prompt_hidden,
+                moe,
+                &self.config,
+                &mut self.kernels,
+                &mut self.kv_cache,
+                &mut self.scratch,
+                p as u32,
+                None,
+                &stream,
+                None,
+            )?;
         }
 
         let mut logits_host_f16 = vec![half::f16::ZERO; cl * vocabu];
@@ -336,8 +372,6 @@ impl ChewEngine {
         let mut held = 0u32;
         let mut prev_argmax: Option<Vec<u32>> = None;
 
-        let canvas_off = p * dimu;
-        let canvas_end = n_tokens as usize * dimu;
         let s = std::env::var("CHEW_DIFF_STEPS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -349,23 +383,24 @@ impl ChewEngine {
             let sc_use = if step_idx == 0 || no_sc { 0.0 } else { 1.0 };
 
             let t_gpu = std::time::Instant::now();
-            stream.memcpy_htod(full_tokens.as_slice(), &mut full_tokens_gpu)?;
+            stream.memcpy_htod(canvas_tokens.as_slice(), &mut canvas_tokens_gpu)?;
             {
                 let moe = match &mut self.weights {
                     WeightStorage::Moe(m) => m,
                     _ => unreachable!(),
                 };
+                // Embed canvas tokens only (prompt is in the KV cache).
                 self.kernels.ops.embed_tokens_f32(
                     &moe.token_embd,
-                    &full_tokens_gpu,
+                    &canvas_tokens_gpu,
                     &mut hidden,
-                    n_tokens,
+                    cl as u32,
                     dim,
                 )?;
                 self.kernels
                     .ops
-                    .scale_f32_inplace(&mut hidden, n_tokens * dim, (dim as f32).sqrt())?;
-                stream.memcpy_dtod(&hidden.slice(canvas_off..canvas_end), &mut canvas_emb)?;
+                    .scale_f32_inplace(&mut hidden, cl as u32 * dim, (dim as f32).sqrt())?;
+                stream.memcpy_dtod(&hidden.slice(0..cl * dimu), &mut canvas_emb)?;
                 let sc = moe
                     .sc
                     .as_ref()
@@ -389,8 +424,10 @@ impl ChewEngine {
                 self.kernels
                     .ops
                     .copy_f16_to_f32(&canvas_normed, &mut canvas_norm_f32, (cl * dimu) as u32)?;
-                stream.memcpy_dtod(&canvas_norm_f32, &mut hidden.slice_mut(canvas_off..canvas_end))?;
-                self.kv_cache.reset();
+                stream.memcpy_dtod(&canvas_norm_f32, &mut hidden.slice_mut(0..cl * dimu))?;
+                // Reset write position to P: prompt K/V stays, canvas K/V is
+                // rewritten at [P..P+C] this step.
+                self.kv_cache.set_pos(p as u32);
                 arch::gemma4_moe::forward_moe_streaming(
                     &mut hidden,
                     moe,
@@ -398,14 +435,14 @@ impl ChewEngine {
                     &mut self.kernels,
                     &mut self.kv_cache,
                     &mut self.scratch,
-                    n_tokens,
+                    cl as u32,
                     None,
                     &stream,
                     Some(&attn),
                 )?;
-                // Project the canvas region's final-normed hidden to logits.
+                // Project the canvas's final-normed hidden to logits.
                 stream.memcpy_dtod(
-                    &self.scratch.norm_out.slice(canvas_off..canvas_end),
+                    &self.scratch.norm_out.slice(0..cl * dimu),
                     &mut canvas_norm_out,
                 )?;
                 crate::forward::project_all_logits(
@@ -443,7 +480,7 @@ impl ChewEngine {
             );
             argmax_out.copy_from_slice(&step.argmax);
             for i in 0..cl {
-                full_tokens[p + i] = step.next_canvas[i] as i32;
+                canvas_tokens[i] = step.next_canvas[i] as i32;
             }
             let stable = prev_argmax.as_ref() == Some(&step.argmax);
             held = if stable { held + 1 } else { 0 };

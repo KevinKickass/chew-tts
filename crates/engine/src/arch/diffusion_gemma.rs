@@ -76,13 +76,43 @@ pub fn build_attention_mask(p: u32, n_tokens: u32, n_swa: u32, swa: bool) -> Vec
 
 /// Device-resident attention masks for one diffusion forward pass, built once
 /// (the layout `[prompt | canvas]` and lengths are constant across steps).
+///
+/// UNIFIED mode (`build`): square `[n_tokens, n_tokens]`, recomputes the prompt
+/// every step. DECODE mode (`build_decode`): rectangular `[C, P+C]`, used with
+/// prefix-KV — the prompt is prefilled once and only the canvas is re-decoded.
 pub struct DiffusionAttn {
-    /// global-layer mask [n_tokens, n_tokens] f16
+    /// global-layer mask f16
     pub global_mask: CudaSlice<half::f16>,
-    /// SWA-layer mask [n_tokens, n_tokens] f16
+    /// SWA-layer mask f16
     pub swa_mask: CudaSlice<half::f16>,
     /// total tokens = prompt_len + canvas_len
     pub n_tokens: u32,
+}
+
+/// Build the DECODE-phase mask `[C, P+C]` (f16, 0 = allowed, MASK_BLOCK =
+/// blocked) for one layer type, with prefix-KV: canvas query q (absolute
+/// position P+q) attends cached prompt keys [0,P) + fresh canvas keys [P,P+C).
+/// global: all prompt; SWA: last (n_swa-1) prompt. Canvas always bidirectional.
+pub fn build_decode_mask(p: u32, c: u32, n_swa: u32, swa: bool) -> Vec<half::f16> {
+    let allow = half::f16::from_f32(0.0);
+    let block = half::f16::from_f32(MASK_BLOCK);
+    let (p, c, n_swa) = (p as i64, c as i64, n_swa as i64);
+    let n_kv = p + c;
+    let canvas_prompt_lo = p - n_swa + 1;
+    let mut m = vec![block; (c * n_kv) as usize];
+    for q in 0..c {
+        for k in 0..n_kv {
+            let a = if k < p {
+                !swa || k >= canvas_prompt_lo
+            } else {
+                true
+            };
+            if a {
+                m[(q * n_kv + k) as usize] = allow;
+            }
+        }
+    }
+    m
 }
 
 impl DiffusionAttn {
@@ -103,6 +133,26 @@ impl DiffusionAttn {
             global_mask,
             swa_mask,
             n_tokens,
+        })
+    }
+
+    /// Build the DECODE-phase masks `[C, P+C]` for prefix-KV diffusion.
+    pub fn build_decode(
+        p: u32,
+        c: u32,
+        n_swa: u32,
+        stream: &Arc<CudaStream>,
+    ) -> Result<Self, cudarc::driver::DriverError> {
+        let g = build_decode_mask(p, c, n_swa, false);
+        let s = build_decode_mask(p, c, n_swa, true);
+        let mut global_mask = stream.alloc_zeros::<half::f16>(g.len())?;
+        let mut swa_mask = stream.alloc_zeros::<half::f16>(s.len())?;
+        stream.memcpy_htod(&g, &mut global_mask)?;
+        stream.memcpy_htod(&s, &mut swa_mask)?;
+        Ok(Self {
+            global_mask,
+            swa_mask,
+            n_tokens: p + c,
         })
     }
 }

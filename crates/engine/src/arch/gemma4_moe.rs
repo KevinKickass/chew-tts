@@ -1654,7 +1654,7 @@ pub fn forward_moe_streaming(
     } else {
         None
     };
-    let profile = std::env::var("CHEW_PROFILE").is_ok() && seq_len == 1;
+    let profile = std::env::var("CHEW_PROFILE").is_ok();
     let debug_decode = std::env::var("CHEW_DEBUG_DECODE").is_ok();
     let sync_after_logits =
         profile || debug_decode || std::env::var("CHEW_SYNC_AFTER_LOGITS").is_ok();
@@ -2213,8 +2213,9 @@ pub fn forward_moe_streaming(
                 } else {
                     &diff.global_mask
                 };
-                let nt = diff.n_tokens as usize;
-                let mask_view = mask.slice(0..nt * nt);
+                // Mask is [seq_len, total_kv_len]: square [n_tokens²] in UNIFIED
+                // mode, rectangular [C, P+C] in DECODE (prefix-KV) mode.
+                let mask_view = mask.slice(0..(seq_len * total_kv_len) as usize);
                 timed!(
                     t_full_mha,
                     kernels.ops.mha_naive_masked(
