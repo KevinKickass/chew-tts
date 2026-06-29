@@ -1138,6 +1138,37 @@ __global__ void mha_naive_masked(const __half* __restrict__ q,
     }
 }
 
+// --- Gather rows by index: dst[i,:] = src[idx[i],:] (f16) ---
+// Grid: (n_rows,), Block: (256,)
+__global__ void gather_rows_f16(const __half* __restrict__ src,
+                                const int* __restrict__ idx,
+                                __half* __restrict__ dst,
+                                int dim) {
+    int row = blockIdx.x;
+    int s = idx[row] * dim;
+    int d = row * dim;
+    for (int j = threadIdx.x; j < dim; j += blockDim.x) {
+        dst[d + j] = src[s + j];
+    }
+}
+
+// --- Scatter-add rows with per-row weight: dst[idx[i],:] += w[i] * src[i,:] ---
+// dst is f32 accumulator. Grid: (n_rows,), Block: (256,). idx within one call
+// must be disjoint (one expert's tokens are unique) -> no atomics needed.
+__global__ void scatter_add_rows_f16(const __half* __restrict__ src,
+                                     const int* __restrict__ idx,
+                                     const float* __restrict__ w,
+                                     float* __restrict__ dst,
+                                     int dim) {
+    int row = blockIdx.x;
+    int dbase = idx[row] * dim;
+    int sbase = row * dim;
+    float wt = w[row];
+    for (int j = threadIdx.x; j < dim; j += blockDim.x) {
+        dst[dbase + j] += wt * __half2float(src[sbase + j]);
+    }
+}
+
 // --- Argmax over f16 vector ---
 // Finds the index of the maximum value. One block, 256 threads.
 // Grid: (1,), Block: (256,)

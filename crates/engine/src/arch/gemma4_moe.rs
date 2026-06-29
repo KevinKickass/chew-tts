@@ -2475,53 +2475,92 @@ pub fn forward_moe_streaming(
                 ))
             )?
         } else if prefill_gpu_router {
-            // GPU router for prefill: run per token to avoid large CPU routing cost.
+            // Batched GPU router: one matmul + softmax_topk over ALL tokens,
+            // then a single D2H — replaces the per-token loop (256 blocking
+            // round-trips that dominated the diffusion step).
             let gate_weights = unsafe { &*router_gates_ptr.add(layer_idx) };
-            let out_ids = unsafe { &mut *router_ids_ptr };
-            let out_weights = unsafe { &mut *router_weights_ptr };
             let inv_sqrt_dim = 1.0f32 / (config.dim as f32).sqrt();
-            let softcap = config.router_logit_softcap.unwrap_or(0.0);
             let top_k = prefill_top_k;
             let d = config.dim as usize;
-            let hidden_tmp = router_hidden_tmp
-                .as_mut()
-                .expect("prefill GPU router temp buffer not allocated");
-            let mut selected_all = Vec::with_capacity(seq_len as usize);
-            let mut ids_host = vec![0i32; top_k];
-            let mut weights_host = vec![0.0f32; top_k];
-            for tok in 0..seq_len as usize {
-                let src = hidden.slice(tok * d..(tok + 1) * d);
-                let mut dst = hidden_tmp.slice_mut(..d);
-                timed!(t_add, stream.memcpy_dtod(&src, &mut dst))
-                    .map_err(|e| KernelError::Launch(e.to_string()))?;
-                timed!(
-                    t_router,
-                    kernels.ops.fused_moe_router(
-                        hidden_tmp,
-                        &layer.moe_gate_scale,
-                        gate_weights,
-                        out_ids,
-                        out_weights,
-                        config.dim,
-                        config.n_experts,
-                        prefill_top_k_u32,
-                        config.rms_norm_eps,
-                        inv_sqrt_dim,
-                        softcap,
-                    )
-                )?;
+            let sl = seq_len as usize;
+            let n_exp = config.n_experts;
+            let mut rn = stream
+                .alloc_zeros::<half::f16>(sl * d)
+                .map_err(|e| KernelError::Launch(e.to_string()))?;
+            let mut rn_s = stream
+                .alloc_zeros::<half::f16>(sl * d)
+                .map_err(|e| KernelError::Launch(e.to_string()))?;
+            let mut rl = stream
+                .alloc_zeros::<half::f16>(sl * n_exp as usize)
+                .map_err(|e| KernelError::Launch(e.to_string()))?;
+            // router input: rms_norm(hidden) * gate_scale * inv_sqrt_dim
+            timed!(
+                t_router,
+                kernels.ops.rms_norm_f32in(
+                    hidden,
+                    &layer.moe_gate_scale,
+                    &mut rn,
+                    seq_len,
+                    config.dim,
+                    config.rms_norm_eps,
+                )
+            )?;
+            timed!(
+                t_router,
+                kernels
+                    .ops
+                    .scale_f16(&rn, &mut rn_s, (sl * d) as u32, inv_sqrt_dim)
+            )?;
+            // logits[seq, n_exp] = rn_s[seq, dim] @ gate[n_exp, dim]^T
+            timed!(
+                t_router,
+                kernels
+                    .gemm
+                    .matmul_f16(&rn_s, gate_weights, &mut rl, seq_len, n_exp, config.dim)
+            )?;
+            // single D2H of all logits [seq, n_exp] (tiny ~32KB), then softmax +
+            // top-k + renorm on the host per token (cheap: 256 x 128).
+            let ne = n_exp as usize;
+            let mut logits_h = vec![half::f16::ZERO; sl * ne];
+            timed!(
+                t_router,
                 stream
-                    .memcpy_dtoh(&out_ids.slice(..top_k), &mut ids_host)
-                    .map_err(|e| KernelError::Launch(e.to_string()))?;
-                stream
-                    .memcpy_dtoh(&out_weights.slice(..top_k), &mut weights_host)
-                    .map_err(|e| KernelError::Launch(e.to_string()))?;
-                let selected: Vec<(usize, f32)> = ids_host
+                    .memcpy_dtoh(&rl, &mut logits_h)
+                    .map_err(|e| KernelError::Launch(e.to_string()))
+            )?;
+            let softcap = config.router_logit_softcap;
+            let mut selected_all = Vec::with_capacity(sl);
+            for tok in 0..sl {
+                let row = &logits_h[tok * ne..(tok + 1) * ne];
+                let mut logits: Vec<f32> = row
                     .iter()
-                    .zip(weights_host.iter())
-                    .map(|(&id, &w)| (id as usize, w))
+                    .map(|x| {
+                        let l = x.to_f32();
+                        match softcap {
+                            Some(c) => (l / c).tanh() * c,
+                            None => l,
+                        }
+                    })
                     .collect();
-                selected_all.push(selected);
+                let max_l = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0.0f32;
+                for l in &mut logits {
+                    *l = (*l - max_l).exp();
+                    sum += *l;
+                }
+                let mut idx: Vec<(usize, f32)> = logits
+                    .iter()
+                    .enumerate()
+                    .map(|(e, &v)| (e, v / sum))
+                    .collect();
+                idx.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                idx.truncate(top_k);
+                let ssum: f32 = idx.iter().map(|(_, w)| *w).sum();
+                selected_all.push(
+                    idx.into_iter()
+                        .map(|(e, w)| (e, w / ssum.max(f32::MIN_POSITIVE)))
+                        .collect(),
+                );
             }
             selected_all
         } else {
@@ -2803,7 +2842,134 @@ pub fn forward_moe_streaming(
                     )
                 )?;
 
+                // ── Grouped-GEMM MoE (diffusion + resident): group tokens by
+                // expert, one batched matmul per expert (m=n_e) instead of
+                // 256x8 m=1 matmuls. Fills scratch.attn_mha_out[0..seq*dim]. ──
+                let use_grouped =
+                    diffusion.is_some() && streamed_layout.is_none() && seq_len > 1;
+                if use_grouped {
+                    let sl = seq_len as usize;
+                    let dd = config.dim as usize;
+                    let ffd = expert_ff as usize;
+                    let fused = ffd * 2;
+                    let mk = |e: cudarc::driver::DriverError| KernelError::Launch(e.to_string());
+                    let mut gathered =
+                        stream.alloc_zeros::<half::f16>(sl * dd).map_err(mk)?;
+                    let mut gu = stream.alloc_zeros::<half::f16>(sl * fused).map_err(mk)?;
+                    let mut act = stream.alloc_zeros::<half::f16>(sl * ffd).map_err(mk)?;
+                    let mut dn = stream.alloc_zeros::<half::f16>(sl * dd).map_err(mk)?;
+                    let mut accum = stream.alloc_zeros::<f32>(sl * dd).map_err(mk)?;
+                    // group tokens by expert (host)
+                    let mut by_expert: Vec<Vec<(i32, f32)>> =
+                        vec![Vec::new(); n_experts as usize];
+                    for t in 0..sl {
+                        for &(eid, w) in selected_per_token[t].iter() {
+                            let mut wn = w;
+                            if let Some(&s) = layer.moe_down_scale.get(eid) {
+                                wn *= s;
+                            }
+                            by_expert[eid].push((t as i32, wn));
+                        }
+                    }
+                    for eid in 0..n_experts as usize {
+                        let toks = &by_expert[eid];
+                        if toks.is_empty() {
+                            continue;
+                        }
+                        let ne = toks.len() as u32;
+                        let idx_h: Vec<i32> = toks.iter().map(|t| t.0).collect();
+                        let w_h: Vec<f32> = toks.iter().map(|t| t.1).collect();
+                        let mut tidx = stream.alloc_zeros::<i32>(toks.len()).map_err(mk)?;
+                        let mut wbuf = stream.alloc_zeros::<f32>(toks.len()).map_err(mk)?;
+                        stream.memcpy_htod(&idx_h, &mut tidx).map_err(mk)?;
+                        stream.memcpy_htod(&w_h, &mut wbuf).map_err(mk)?;
+                        timed!(
+                            t_router,
+                            kernels.ops.gather_rows_f16(
+                                &scratch.norm_out,
+                                &tidx,
+                                &mut gathered,
+                                ne,
+                                config.dim
+                            )
+                        )?;
+                        let gu_info =
+                            expert_slice_info(&layer.moe_gate_up_exps, eid as u32, n_experts);
+                        let gu_view = layer.moe_gate_up_exps.data.slice(
+                            gu_info.byte_offset..gu_info.byte_offset + gu_info.byte_size,
+                        );
+                        let _e0 = t_expert;
+                        timed!(
+                            t_expert,
+                            kernels.gemm.matmul_dequant_view(
+                                &gathered,
+                                &gu_view,
+                                gu_info.quant_type,
+                                gu_info.n_elements,
+                                &mut gu,
+                                ne,
+                                fused as u32,
+                                config.dim,
+                                &kernels.dequant,
+                            )
+                        )?;
+                        if profile {
+                            t_expert_gate_up += t_expert - _e0;
+                        }
+                        timed!(
+                            t_expert,
+                            kernels.ops.gelu_split_batch(&gu, &mut act, expert_ff, ne)
+                        )?;
+                        let dn_info =
+                            expert_slice_info(&layer.moe_down_exps, eid as u32, n_experts);
+                        let dn_view = layer.moe_down_exps.data.slice(
+                            dn_info.byte_offset..dn_info.byte_offset + dn_info.byte_size,
+                        );
+                        let _e0 = t_expert;
+                        timed!(
+                            t_expert,
+                            kernels.gemm.matmul_dequant_view(
+                                &act,
+                                &dn_view,
+                                dn_info.quant_type,
+                                dn_info.n_elements,
+                                &mut dn,
+                                ne,
+                                config.dim,
+                                expert_ff,
+                                &kernels.dequant,
+                            )
+                        )?;
+                        if profile {
+                            t_expert_down += t_expert - _e0;
+                        }
+                        let _e0 = t_expert;
+                        timed!(
+                            t_expert,
+                            kernels.ops.scatter_add_rows_f16(
+                                &dn,
+                                &tidx,
+                                &wbuf,
+                                &mut accum,
+                                ne,
+                                config.dim
+                            )
+                        )?;
+                        if profile {
+                            t_expert_accum += t_expert - _e0;
+                        }
+                    }
+                    kernels.ops.copy_f32_to_f16(
+                        &accum,
+                        &mut scratch.attn_mha_out.slice_mut(0..sl * dd),
+                        (sl * dd) as u32,
+                    )?;
+                }
+
                 for tok in 0..seq_len as usize {
+                    if use_grouped {
+                        break;
+                    }
                     let d = config.dim as usize;
                     if seq_len > 1 && tok > 0 {
                         let src_ptr = &scratch.norm_out as *const CudaSlice<half::f16>;
@@ -3202,8 +3368,9 @@ pub fn forward_moe_streaming(
                         }
                     }
                 }
-                if seq_len > 1 {
-                    // restore token 0's MoE output to position 0
+                if seq_len > 1 && !use_grouped {
+                    // restore token 0's MoE output to position 0 (per-token path
+                    // only; grouped fills attn_mha_out directly for all tokens)
                     let d = config.dim as usize;
                     if let Some(save) = moe_pos0_save.as_ref() {
                         let dst_ptr = &mut scratch.attn_mha_out as *mut CudaSlice<half::f16>;

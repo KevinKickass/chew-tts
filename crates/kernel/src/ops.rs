@@ -43,6 +43,8 @@ pub struct OpsKernels {
     mha_naive: CudaFunction,
     mha_naive_full: CudaFunction,
     mha_naive_masked: CudaFunction,
+    gather_rows_f16: CudaFunction,
+    scatter_add_rows_f16: CudaFunction,
     // CUDA Graph-compatible variants
     rope_graph: CudaFunction,
     copy_f16_with_offset: CudaFunction,
@@ -107,6 +109,8 @@ impl OpsKernels {
             mha_naive: loader::get_fn(&module, "mha_naive")?,
             mha_naive_full: loader::get_fn(&module, "mha_naive_full")?,
             mha_naive_masked: loader::get_fn(&module, "mha_naive_masked")?,
+            gather_rows_f16: loader::get_fn(&module, "gather_rows_f16")?,
+            scatter_add_rows_f16: loader::get_fn(&module, "scatter_add_rows_f16")?,
             rope_graph: loader::get_fn(&module, "rope_graph")?,
             copy_f16_with_offset: loader::get_fn(&module, "copy_f16_with_offset")?,
             mha_fused_graph: loader::get_fn(&module, "mha_fused_graph")?,
@@ -2008,6 +2012,50 @@ impl OpsKernels {
                 smem,
                 &mut args,
             );
+        }
+        Ok(())
+    }
+
+    /// Gather rows by index: dst[i,:] = src[idx[i],:]. f16, [n_rows, dim].
+    pub fn gather_rows_f16(
+        &self,
+        src: &CudaSlice<half::f16>,
+        idx: &CudaSlice<i32>,
+        dst: &mut CudaSlice<half::f16>,
+        n_rows: u32,
+        dim: u32,
+    ) -> Result<(), KernelError> {
+        let dimi = dim as i32;
+        let mut args: [*mut c_void; 4] =
+            [slice_ptr(src), slice_ptr(idx), slice_ptr_mut(dst), scalar_ptr(&dimi)];
+        unsafe {
+            self.fast.fire(&self.gather_rows_f16, (n_rows, 1, 1), (256, 1, 1), 0, &mut args);
+        }
+        Ok(())
+    }
+
+    /// Scatter-add rows with per-row weight: dst[idx[i],:] += w[i]*src[i,:].
+    /// src f16 [n_rows, dim], dst f32 accumulator. idx must be disjoint per call.
+    pub fn scatter_add_rows_f16(
+        &self,
+        src: &CudaSlice<half::f16>,
+        idx: &CudaSlice<i32>,
+        w: &CudaSlice<f32>,
+        dst: &mut CudaSlice<f32>,
+        n_rows: u32,
+        dim: u32,
+    ) -> Result<(), KernelError> {
+        let dimi = dim as i32;
+        let mut args: [*mut c_void; 5] = [
+            slice_ptr(src),
+            slice_ptr(idx),
+            slice_ptr(w),
+            slice_ptr_mut(dst),
+            scalar_ptr(&dimi),
+        ];
+        unsafe {
+            self.fast
+                .fire(&self.scatter_add_rows_f16, (n_rows, 1, 1), (256, 1, 1), 0, &mut args);
         }
         Ok(())
     }
