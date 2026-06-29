@@ -480,8 +480,13 @@ impl Gemm {
                 ldc: n as i32,
             },
             batch_size: batch_size as i32,
-            stride_a,
-            stride_b,
+            // gemm_strided_batched(cfg, b, a, c) passes b (weights/scratch) as the
+            // 2nd arg (-> cfg.stride_a) and a (input) as the 3rd (-> cfg.stride_b).
+            // The params name stride_a for the input and stride_b for the weights,
+            // so they must be swapped here. (Previously not swapped -> wrong stride
+            // on each buffer = the long-standing CHEW_MOE_BATCHED_EXPERTS garbage.)
+            stride_a: stride_b,
+            stride_b: stride_a,
             stride_c,
         };
 
