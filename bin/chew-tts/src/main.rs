@@ -5,7 +5,7 @@ use chew_model_chatterbox::{
     ChatterboxHiFT, ChatterboxS3ConformerLayer, ChatterboxS3Encoder, ChatterboxS3Flow,
     ChatterboxT3Frontend, ChatterboxT3Layer, ChatterboxT3Transformer, ChatterboxTokenizer,
     HIDDEN_SIZE as CHATTERBOX_HIDDEN_SIZE, INTERMEDIATE_SIZE as CHATTERBOX_INTERMEDIATE_SIZE,
-    S3_HIDDEN_SIZE, inspect_model as inspect_chatterbox_model,
+    S3_HIDDEN_SIZE, convert_s3gen_checkpoint, inspect_model as inspect_chatterbox_model,
 };
 use chew_model_kokoro::{
     KokoroAdaInResBlock, KokoroAlbert, KokoroBiLstm, KokoroCheckpoint, KokoroDecoderFrontend,
@@ -134,6 +134,11 @@ enum Command {
     /// Validate Chatterbox Multilingual V3 T3, S3Gen, and voice-encoder weights.
     InspectChatterbox {
         /// Directory containing t3_mtl23ls_v3, S3Gen, and ve weights.
+        model_dir: PathBuf,
+    },
+    /// Convert the official Chatterbox s3gen.pt checkpoint to Safetensors.
+    ConvertChatterbox {
+        /// Directory containing s3gen.pt.
         model_dir: PathBuf,
     },
     /// Tokenize multilingual text with Chatterbox's local grapheme BPE.
@@ -878,6 +883,12 @@ fn main() -> anyhow::Result<()> {
                     conditioning.s3_prompt_feature_frames,
                 );
             }
+        }
+        Command::ConvertChatterbox { model_dir } => {
+            let source = model_dir.join("s3gen.pt");
+            let destination = model_dir.join("s3gen_v3.safetensors");
+            convert_s3gen_checkpoint(&source, &destination)?;
+            println!("converted {}", destination.display());
         }
         Command::TokenizeChatterbox {
             model_dir,

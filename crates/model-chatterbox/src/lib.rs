@@ -38,6 +38,82 @@ pub const STOP_TEXT_TOKEN: usize = 0;
 pub const START_SPEECH_TOKEN: usize = 6_561;
 pub const STOP_SPEECH_TOKEN: usize = 6_562;
 
+/// Convert the official S3Gen PyTorch checkpoint once into a mmap-friendly
+/// Safetensors file. This is an installation operation; inference never needs
+/// Python, PyTorch, or an ONNX runtime.
+pub fn convert_s3gen_checkpoint(source: &Path, destination: &Path) -> anyhow::Result<()> {
+    use candle_core::DType as CandleDType;
+    use safetensors::Dtype;
+    use safetensors::tensor::{TensorView, serialize_to_file};
+    use std::collections::HashMap;
+
+    ensure!(source.is_file(), "missing checkpoint {}", source.display());
+    let checkpoint = PthTensors::new(source, None)
+        .with_context(|| format!("could not read {}", source.display()))?;
+    ensure!(
+        !checkpoint.tensor_infos().is_empty(),
+        "checkpoint contains no tensors"
+    );
+    struct OwnedTensor {
+        dtype: Dtype,
+        shape: Vec<usize>,
+        bytes: Vec<u8>,
+    }
+    let mut names = checkpoint
+        .tensor_infos()
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    names.sort();
+    let mut owned = HashMap::with_capacity(names.len());
+    for name in names {
+        let tensor = checkpoint
+            .get(&name)?
+            .with_context(|| format!("checkpoint tensor {name:?} disappeared"))?;
+        let shape = tensor.dims().to_vec();
+        let (dtype, bytes) = match tensor.dtype() {
+            CandleDType::F32 => {
+                let values = tensor.flatten_all()?.to_vec1::<f32>()?;
+                let mut bytes = Vec::with_capacity(values.len() * 4);
+                for value in values {
+                    bytes.extend_from_slice(&value.to_le_bytes());
+                }
+                (Dtype::F32, bytes)
+            }
+            CandleDType::I64 => {
+                let values = tensor.flatten_all()?.to_vec1::<i64>()?;
+                let mut bytes = Vec::with_capacity(values.len() * 8);
+                for value in values {
+                    bytes.extend_from_slice(&value.to_le_bytes());
+                }
+                (Dtype::I64, bytes)
+            }
+            other => anyhow::bail!("unsupported checkpoint dtype {other:?} for {name}"),
+        };
+        owned.insert(
+            name,
+            OwnedTensor {
+                dtype,
+                shape,
+                bytes,
+            },
+        );
+    }
+    let views = owned
+        .iter()
+        .map(|(name, tensor)| {
+            Ok((
+                name.as_str(),
+                TensorView::new(tensor.dtype, tensor.shape.clone(), &tensor.bytes)?,
+            ))
+        })
+        .collect::<Result<HashMap<_, _>, safetensors::SafeTensorError>>()?;
+    let temporary = destination.with_extension("safetensors.tmp");
+    serialize_to_file(views, None, &temporary)?;
+    std::fs::rename(&temporary, destination)?;
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct ChatterboxInspection {
     pub t3_path: PathBuf,

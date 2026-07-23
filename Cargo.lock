@@ -328,6 +328,7 @@ dependencies = [
  "cudarc",
  "half",
  "rustfft",
+ "safetensors 0.6.2",
  "tokenizers",
  "unicode-normalization",
 ]
