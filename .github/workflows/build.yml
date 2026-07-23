@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -46,11 +46,25 @@ jobs:
         run: cargo build --release --locked -p chew-tts
 
       - name: Package binary
+        shell: bash
         run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="0.1.0-${GITHUB_SHA::7}"
+          fi
+          bundle="chew-tts-${version}-linux-x86_64"
           mkdir -p dist
-          cp target/release/chew-tts dist/chew-tts-linux-x86_64
-          chmod 755 dist/chew-tts-linux-x86_64
-          sha256sum dist/chew-tts-linux-x86_64 > dist/SHA256SUMS
+          mkdir -p "dist/${bundle}"
+          cp target/release/chew-tts "dist/${bundle}/chew-tts"
+          cp README.md LICENSE "dist/${bundle}/"
+          chmod 755 "dist/${bundle}/chew-tts"
+          tar -C dist -czf "dist/${bundle}.tar.gz" "${bundle}"
+          rm -rf "dist/${bundle}"
+          (
+            cd dist
+            sha256sum "${bundle}.tar.gz" > SHA256SUMS
+          )
 
       - name: Upload build
         uses: actions/upload-artifact@v4
@@ -59,3 +73,16 @@ jobs:
           path: dist/
           if-no-files-found: error
           retention-days: 14
+
+      - name: Publish GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            dist/*.tar.gz \
+            dist/SHA256SUMS \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "chew-tts ${GITHUB_REF_NAME}" \
+            --generate-notes \
+            --verify-tag
