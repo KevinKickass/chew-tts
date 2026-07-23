@@ -225,8 +225,10 @@ The command uses the model's production sampling defaults: temperature 0.9,
 top-k 50, and semantic repetition penalty 1.05. On an RTX 3080, the first
 correctness-oriented implementation occupies approximately 3.9 GiB of VRAM
 and generates 0.96 seconds of sampled audio in approximately 0.77 seconds
-(RTF 0.80). Model loading is not included in that number and is not optimized
-yet.
+(RTF 0.80). The optimized binary maps and uploads the complete model in
+approximately 4.2 seconds from a warm filesystem cache. Debug builds are not
+representative because their element-wise F16 conversion is intentionally
+unoptimized.
 
 ## Requirements
 

@@ -17,8 +17,10 @@ pub use frontend::{TalkerFrontend, VoiceDesignInputs};
 pub use predictor::CodePredictorTransformer;
 
 use chew_safetensors::{MappedSafetensors, TensorInfo};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 pub struct ModelInspection {
     pub config: Qwen3TtsConfig,
@@ -37,40 +39,78 @@ pub struct HostF32Tensor {
     pub values: Vec<f32>,
 }
 
+struct WeightSet {
+    files: Vec<MappedSafetensors>,
+    paths: Vec<PathBuf>,
+    tensors: Vec<TensorInfo>,
+    locations: HashMap<String, usize>,
+}
+
+static WEIGHT_SETS: OnceLock<Mutex<HashMap<PathBuf, Arc<WeightSet>>>> = OnceLock::new();
+
+fn weight_set(model_dir: &Path) -> Result<Arc<WeightSet>, Error> {
+    let key = fs::canonicalize(model_dir)?;
+    let cache = WEIGHT_SETS.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(weights) = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&key)
+        .cloned()
+    {
+        return Ok(weights);
+    }
+
+    let mut paths = fs::read_dir(&key)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "safetensors"))
+        .collect::<Vec<_>>();
+    paths.sort();
+    if paths.is_empty() {
+        return Err(Error::MissingWeights);
+    }
+    let mut files = Vec::with_capacity(paths.len());
+    let mut tensors = Vec::new();
+    let mut locations = HashMap::new();
+    for (file_index, path) in paths.iter().enumerate() {
+        let mapped = MappedSafetensors::open(path)?;
+        for tensor in mapped.tensor_infos()? {
+            locations.insert(tensor.name.clone(), file_index);
+            tensors.push(tensor);
+        }
+        files.push(mapped);
+    }
+    tensors.sort_by(|left, right| left.name.cmp(&right.name));
+    let weights = Arc::new(WeightSet {
+        files,
+        paths,
+        tensors,
+        locations,
+    });
+    cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(key, Arc::clone(&weights));
+    Ok(weights)
+}
+
 pub fn inspect_model(model_dir: impl AsRef<Path>) -> Result<ModelInspection, Error> {
     let model_dir = model_dir.as_ref();
     let config: Qwen3TtsConfig = serde_json::from_slice(&fs::read(model_dir.join("config.json"))?)?;
     config.validate().map_err(Error::InvalidConfig)?;
 
-    let mut weight_files = fs::read_dir(model_dir)?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "safetensors"))
-        .collect::<Vec<_>>();
-    weight_files.sort();
-    if weight_files.is_empty() {
-        return Err(Error::MissingWeights);
-    }
-
-    let mut tensors = Vec::new();
-    let mut total_weight_bytes = 0u64;
-    for path in &weight_files {
-        let mapped = MappedSafetensors::open(path)?;
-        let file_infos = mapped.tensor_infos()?;
-        total_weight_bytes += file_infos
-            .iter()
-            .map(|tensor| tensor.bytes as u64)
-            .sum::<u64>();
-        tensors.extend(file_infos);
-    }
-    tensors.sort_by(|a, b| a.name.cmp(&b.name));
-
-    validate_required_tensors(&tensors)?;
+    let weights = weight_set(model_dir)?;
+    validate_required_tensors(&weights.tensors)?;
+    let total_weight_bytes = weights
+        .tensors
+        .iter()
+        .map(|tensor| tensor.bytes as u64)
+        .sum();
 
     Ok(ModelInspection {
         config,
-        weight_files,
-        tensors,
+        weight_files: weights.paths.clone(),
+        tensors: weights.tensors.clone(),
         total_weight_bytes,
     })
 }
@@ -79,50 +119,28 @@ pub fn load_f16_tensor(
     model_dir: impl AsRef<Path>,
     tensor_name: &str,
 ) -> Result<HostF16Tensor, Error> {
-    let model_dir = model_dir.as_ref();
-    let mut weight_files = fs::read_dir(model_dir)?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "safetensors"))
-        .collect::<Vec<_>>();
-    weight_files.sort();
-    for path in weight_files {
-        let mapped = MappedSafetensors::open(path)?;
-        if mapped
-            .tensor_infos()?
-            .iter()
-            .any(|tensor| tensor.name == tensor_name)
-        {
-            let (shape, values) = mapped.tensor_f16(tensor_name)?;
-            return Ok(HostF16Tensor { shape, values });
-        }
-    }
-    Err(Error::TensorNotFound(tensor_name.to_string()))
+    let weights = weight_set(model_dir.as_ref())?;
+    let file_index = weights
+        .locations
+        .get(tensor_name)
+        .copied()
+        .ok_or_else(|| Error::TensorNotFound(tensor_name.to_string()))?;
+    let (shape, values) = weights.files[file_index].tensor_f16(tensor_name)?;
+    Ok(HostF16Tensor { shape, values })
 }
 
 pub fn load_f32_tensor(
     model_dir: impl AsRef<Path>,
     tensor_name: &str,
 ) -> Result<HostF32Tensor, Error> {
-    let model_dir = model_dir.as_ref();
-    let mut weight_files = fs::read_dir(model_dir)?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "safetensors"))
-        .collect::<Vec<_>>();
-    weight_files.sort();
-    for path in weight_files {
-        let mapped = MappedSafetensors::open(path)?;
-        if mapped
-            .tensor_infos()?
-            .iter()
-            .any(|tensor| tensor.name == tensor_name)
-        {
-            let (shape, values) = mapped.tensor_f32(tensor_name)?;
-            return Ok(HostF32Tensor { shape, values });
-        }
-    }
-    Err(Error::TensorNotFound(tensor_name.to_string()))
+    let weights = weight_set(model_dir.as_ref())?;
+    let file_index = weights
+        .locations
+        .get(tensor_name)
+        .copied()
+        .ok_or_else(|| Error::TensorNotFound(tensor_name.to_string()))?;
+    let (shape, values) = weights.files[file_index].tensor_f32(tensor_name)?;
+    Ok(HostF32Tensor { shape, values })
 }
 
 fn validate_required_tensors(tensors: &[TensorInfo]) -> Result<(), Error> {
