@@ -96,8 +96,7 @@ impl VoiceDesignEngine {
         let started = Instant::now();
         let talker = TalkerTransformer::load(model_dir, &config, &stream)?;
         let frontend = TalkerFrontend::load(model_dir, &config, &stream)?;
-        let predictor =
-            CodePredictorTransformer::load(model_dir, &config.code_predictor_config, &stream)?;
+        let predictor = CodePredictorTransformer::load(model_dir, &config, &stream)?;
         let predictor_session = predictor.start_generation_session(&stream)?;
         let semantic_session = frontend.start_semantic_sampling_session(max_frames, &stream)?;
         let codec = CodecQuantizer::load(model_dir.join("speech_tokenizer"), &stream)?;

@@ -1819,7 +1819,8 @@ fn cuda_predictor_codec_smoke(
         }
     }
     let inspection = inspect_model(model_dir)?;
-    let config = &inspection.config.talker_config.code_predictor_config;
+    let talker_config = &inspection.config.talker_config;
+    let config = &talker_config.code_predictor_config;
     let allocator = chew_vram::VramAllocator::init()?;
     if gpu >= allocator.gpu_count() {
         anyhow::bail!(
@@ -1834,7 +1835,7 @@ fn cuda_predictor_codec_smoke(
         config.intermediate_size * config.hidden_size,
         config.intermediate_size,
     )?;
-    let predictor = CodePredictorTransformer::load(model_dir, config, stream)?;
+    let predictor = CodePredictorTransformer::load(model_dir, talker_config, stream)?;
     let codec = CodecQuantizer::load(model_dir.join("speech_tokenizer"), stream)?;
     let free_loaded = allocator.free_bytes(gpu)?;
 
@@ -1944,8 +1945,7 @@ fn cuda_voice_design_smoke(
     let load_started = std::time::Instant::now();
     let talker = TalkerTransformer::load(model_dir, config, stream)?;
     let frontend = TalkerFrontend::load(model_dir, config, stream)?;
-    let predictor =
-        CodePredictorTransformer::load(model_dir, &config.code_predictor_config, stream)?;
+    let predictor = CodePredictorTransformer::load(model_dir, config, stream)?;
     let mut predictor_session = predictor.start_generation_session(stream)?;
     let mut semantic_session = frontend.start_semantic_sampling_session(max_frames, stream)?;
     let codec = CodecQuantizer::load(model_dir.join("speech_tokenizer"), stream)?;
@@ -2440,7 +2440,8 @@ fn cuda_predictor_smoke(
     reference: Option<&std::path::Path>,
 ) -> anyhow::Result<()> {
     let inspection = inspect_model(model_dir)?;
-    let config = &inspection.config.talker_config.code_predictor_config;
+    let talker_config = &inspection.config.talker_config;
+    let config = &talker_config.code_predictor_config;
     if seq_len == 0 {
         anyhow::bail!("sequence length must be non-zero");
     }
@@ -2459,7 +2460,7 @@ fn cuda_predictor_smoke(
         config.intermediate_size,
     )?;
     let load_started = std::time::Instant::now();
-    let predictor = CodePredictorTransformer::load(model_dir, config, stream)?;
+    let predictor = CodePredictorTransformer::load(model_dir, talker_config, stream)?;
     let mut predictor_session = predictor.start_generation_session(stream)?;
     let load_elapsed = load_started.elapsed();
     let free_loaded = allocator.free_bytes(gpu)?;

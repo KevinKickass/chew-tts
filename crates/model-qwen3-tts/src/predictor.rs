@@ -14,10 +14,11 @@ pub struct CodePredictorTransformer {
     final_norm: CudaSlice<f16>,
     talker_codec_embedding: CudaSlice<f16>,
     codec_embeddings: Vec<CudaSlice<f16>>,
-    projection_weight: CudaSlice<f16>,
-    projection_bias: CudaSlice<f16>,
+    projection_weight: Option<CudaSlice<f16>>,
+    projection_bias: Option<CudaSlice<f16>>,
     lm_heads: Vec<CudaSlice<f16>>,
     geometry: TalkerConfig,
+    codec_embed_dim: usize,
 }
 
 /// Reusable GPU allocations for one code-predictor worker.
@@ -41,10 +42,11 @@ pub struct CodePredictorGenerationSession {
 impl CodePredictorTransformer {
     pub fn load(
         model_dir: impl AsRef<Path>,
-        config: &CodePredictorConfig,
+        talker_config: &TalkerConfig,
         stream: &Arc<CudaStream>,
     ) -> anyhow::Result<Self> {
         let model_dir = model_dir.as_ref();
+        let config = &talker_config.code_predictor_config;
         let geometry = predictor_geometry(config);
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for layer_index in 0..config.num_hidden_layers {
@@ -79,20 +81,26 @@ impl CodePredictorTransformer {
                 .clone_htod(&tensor.values)
                 .with_context(|| format!("could not upload {name}"))
         };
-        let codec_embed_dim = 2048;
+        let codec_embed_dim = talker_config.hidden_size;
         let acoustic_groups = config.num_code_groups - 1;
         let talker_codec_embedding = load(
             "talker.model.codec_embedding.weight",
-            &[3072, codec_embed_dim],
+            &[talker_config.vocab_size, codec_embed_dim],
         )?;
-        let projection_weight = load(
-            "talker.code_predictor.small_to_mtp_projection.weight",
-            &[config.hidden_size, codec_embed_dim],
-        )?;
-        let projection_bias = load(
-            "talker.code_predictor.small_to_mtp_projection.bias",
-            &[config.hidden_size],
-        )?;
+        let (projection_weight, projection_bias) = if config.hidden_size != codec_embed_dim {
+            (
+                Some(load(
+                    "talker.code_predictor.small_to_mtp_projection.weight",
+                    &[config.hidden_size, codec_embed_dim],
+                )?),
+                Some(load(
+                    "talker.code_predictor.small_to_mtp_projection.bias",
+                    &[config.hidden_size],
+                )?),
+            )
+        } else {
+            (None, None)
+        };
         let mut codec_embeddings = Vec::with_capacity(acoustic_groups);
         let mut lm_heads = Vec::with_capacity(acoustic_groups);
         for group in 0..acoustic_groups {
@@ -114,6 +122,7 @@ impl CodePredictorTransformer {
             projection_bias,
             lm_heads,
             geometry,
+            codec_embed_dim,
         })
     }
 
@@ -125,7 +134,7 @@ impl CodePredictorTransformer {
         &self,
         stream: &Arc<CudaStream>,
     ) -> anyhow::Result<CodePredictorGenerationSession> {
-        const CODEC_EMBED_DIM: usize = 2048;
+        let codec_embed_dim = self.codec_embed_dim;
         let hidden = self.geometry.hidden_size;
         let groups = self.geometry.num_code_groups - 1;
         Ok(CodePredictorGenerationSession {
@@ -133,18 +142,18 @@ impl CodePredictorTransformer {
                 .map(|_| TalkerLayerKvCache::allocate(17, &self.geometry, stream))
                 .collect::<anyhow::Result<Vec<_>>>()?,
             scratch: TalkerLayerScratch::allocate(2, &self.geometry, stream)?,
-            talker_hidden: stream.alloc_zeros::<f16>(CODEC_EMBED_DIM)?,
+            talker_hidden: stream.alloc_zeros::<f16>(codec_embed_dim)?,
             semantic_id: stream.alloc_zeros::<i32>(1)?,
-            semantic_embed: stream.alloc_zeros::<f16>(CODEC_EMBED_DIM)?,
-            predictor_input: stream.alloc_zeros::<f16>(2 * CODEC_EMBED_DIM)?,
+            semantic_embed: stream.alloc_zeros::<f16>(codec_embed_dim)?,
+            predictor_input: stream.alloc_zeros::<f16>(2 * codec_embed_dim)?,
             projected: stream.alloc_zeros::<f16>(2 * hidden)?,
             hidden: stream.alloc_zeros::<f32>(2 * hidden)?,
             norm_token: stream.alloc_zeros::<f16>(hidden)?,
             logits: stream.alloc_zeros::<f16>(self.geometry.vocab_size)?,
             current_code: stream.alloc_zeros::<i32>(1)?,
             all_codes: stream.alloc_zeros::<i32>(groups)?,
-            code_embed: stream.alloc_zeros::<f16>(CODEC_EMBED_DIM)?,
-            embedding_sum: stream.alloc_zeros::<f32>(CODEC_EMBED_DIM)?,
+            code_embed: stream.alloc_zeros::<f16>(codec_embed_dim)?,
+            embedding_sum: stream.alloc_zeros::<f32>(codec_embed_dim)?,
         })
     }
 
@@ -272,13 +281,13 @@ impl CodePredictorTransformer {
         mut sampling: Option<(f32, usize, &mut u64)>,
         kernels: &mut GpuKernels,
     ) -> anyhow::Result<Vec<i32>> {
-        const CODEC_EMBED_DIM: usize = 2048;
+        let codec_embed_dim = self.codec_embed_dim;
         let hidden_dim = self.geometry.hidden_size;
         let vocab_size = self.geometry.vocab_size;
         let groups = self.geometry.num_code_groups - 1;
         ensure!(
-            talker_hidden.len() == CODEC_EMBED_DIM,
-            "talker hidden has {} values, expected {CODEC_EMBED_DIM}",
+            talker_hidden.len() == codec_embed_dim,
+            "talker hidden has {} values, expected {codec_embed_dim}",
             talker_hidden.len()
         );
         ensure!(
@@ -299,31 +308,32 @@ impl CodePredictorTransformer {
             &session.semantic_id,
             &mut session.semantic_embed,
             1,
-            CODEC_EMBED_DIM as u32,
+            codec_embed_dim as u32,
         )?;
 
         stream.memcpy_dtod(
             &session.talker_hidden,
-            &mut session.predictor_input.slice_mut(..CODEC_EMBED_DIM),
+            &mut session.predictor_input.slice_mut(..codec_embed_dim),
         )?;
         stream.memcpy_dtod(
             &session.semantic_embed,
-            &mut session.predictor_input.slice_mut(CODEC_EMBED_DIM..),
+            &mut session.predictor_input.slice_mut(codec_embed_dim..),
         )?;
-        kernels.gemm.matmul_f16(
-            &session.predictor_input,
-            &self.projection_weight,
-            &mut session.projected,
-            2,
-            hidden_dim as u32,
-            CODEC_EMBED_DIM as u32,
-        )?;
-        kernels.ops.add_bias_f16_inplace(
-            &mut session.projected,
-            &self.projection_bias,
-            2,
-            hidden_dim as u32,
-        )?;
+        if let (Some(weight), Some(bias)) = (&self.projection_weight, &self.projection_bias) {
+            kernels.gemm.matmul_f16(
+                &session.predictor_input,
+                weight,
+                &mut session.projected,
+                2,
+                hidden_dim as u32,
+                codec_embed_dim as u32,
+            )?;
+            kernels
+                .ops
+                .add_bias_f16_inplace(&mut session.projected, bias, 2, hidden_dim as u32)?;
+        } else {
+            stream.memcpy_dtod(&session.predictor_input, &mut session.projected)?;
+        }
 
         kernels.ops.copy_f16_to_f32(
             &session.projected,
@@ -383,21 +393,28 @@ impl CodePredictorTransformer {
                 &session.current_code,
                 &mut session.code_embed,
                 1,
-                CODEC_EMBED_DIM as u32,
+                codec_embed_dim as u32,
             )?;
-            kernels.gemv.gemv_f16(
-                &session.code_embed,
-                &self.projection_weight,
-                &mut session.projected,
-                hidden_dim as u32,
-                CODEC_EMBED_DIM as u32,
-            )?;
-            kernels.ops.add_bias_f16_inplace(
-                &mut session.projected,
-                &self.projection_bias,
-                1,
-                hidden_dim as u32,
-            )?;
+            if let (Some(weight), Some(bias)) = (&self.projection_weight, &self.projection_bias) {
+                kernels.gemv.gemv_f16(
+                    &session.code_embed,
+                    weight,
+                    &mut session.projected,
+                    hidden_dim as u32,
+                    codec_embed_dim as u32,
+                )?;
+                kernels.ops.add_bias_f16_inplace(
+                    &mut session.projected,
+                    bias,
+                    1,
+                    hidden_dim as u32,
+                )?;
+            } else {
+                stream.memcpy_dtod(
+                    &session.code_embed,
+                    &mut session.projected.slice_mut(..hidden_dim),
+                )?;
+            }
             kernels.ops.copy_f16_to_f32(
                 &session.projected,
                 &mut session.hidden,
@@ -454,7 +471,7 @@ impl CodePredictorTransformer {
         codes: &[i32],
         kernels: &mut GpuKernels,
     ) -> anyhow::Result<Vec<f32>> {
-        const CODEC_EMBED_DIM: usize = 2048;
+        let codec_embed_dim = self.codec_embed_dim;
         ensure!(
             codes.len() == self.codec_embeddings.len(),
             "expected {} acoustic codes, got {}",
@@ -470,19 +487,19 @@ impl CodePredictorTransformer {
         }
 
         let stream = Arc::clone(kernels.ops.stream());
-        let mut sum = stream.alloc_zeros::<f32>(CODEC_EMBED_DIM)?;
-        let mut embedding = stream.alloc_zeros::<f16>(CODEC_EMBED_DIM)?;
+        let mut sum = stream.alloc_zeros::<f32>(codec_embed_dim)?;
+        let mut embedding = stream.alloc_zeros::<f16>(codec_embed_dim)?;
         for (code, table) in codes.iter().zip(&self.codec_embeddings) {
             let id = stream.clone_htod(&[*code])?;
             kernels
                 .ops
-                .gather_rows_f16(table, &id, &mut embedding, 1, CODEC_EMBED_DIM as u32)?;
+                .gather_rows_f16(table, &id, &mut embedding, 1, codec_embed_dim as u32)?;
             kernels
                 .ops
-                .add_inplace_f32_f16(&mut sum, &embedding, CODEC_EMBED_DIM as u32)?;
+                .add_inplace_f32_f16(&mut sum, &embedding, codec_embed_dim as u32)?;
         }
         stream.synchronize()?;
-        let mut host = vec![0.0f32; CODEC_EMBED_DIM];
+        let mut host = vec![0.0f32; codec_embed_dim];
         stream.memcpy_dtoh(&sum, &mut host)?;
         Ok(host)
     }
@@ -493,7 +510,7 @@ impl CodePredictorTransformer {
         session: &mut CodePredictorGenerationSession,
         kernels: &mut GpuKernels,
     ) -> anyhow::Result<Vec<f32>> {
-        const CODEC_EMBED_DIM: usize = 2048;
+        let codec_embed_dim = self.codec_embed_dim;
         let stream = Arc::clone(kernels.ops.stream());
         for (group, table) in self.codec_embeddings.iter().enumerate() {
             stream.memcpy_dtod(
@@ -505,24 +522,24 @@ impl CodePredictorTransformer {
                 &session.current_code,
                 &mut session.code_embed,
                 1,
-                CODEC_EMBED_DIM as u32,
+                codec_embed_dim as u32,
             )?;
             if group == 0 {
                 kernels.ops.copy_f16_to_f32(
                     &session.code_embed,
                     &mut session.embedding_sum,
-                    CODEC_EMBED_DIM as u32,
+                    codec_embed_dim as u32,
                 )?;
             } else {
                 kernels.ops.add_inplace_f32_f16(
                     &mut session.embedding_sum,
                     &session.code_embed,
-                    CODEC_EMBED_DIM as u32,
+                    codec_embed_dim as u32,
                 )?;
             }
         }
         stream.synchronize()?;
-        let mut host = vec![0.0f32; CODEC_EMBED_DIM];
+        let mut host = vec![0.0f32; codec_embed_dim];
         stream.memcpy_dtoh(&session.embedding_sum, &mut host)?;
         Ok(host)
     }
