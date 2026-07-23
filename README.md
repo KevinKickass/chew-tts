@@ -310,6 +310,9 @@ speech-tokenizer codes. Reference extraction is completely native; an
 end-to-end ICL request producing 4.24 seconds of audio takes approximately
 1.16 seconds on an RTX 3080. Reused reference audio is cached by SHA-256; in a
 short validation request this reduced wall time from 0.59 to 0.38 seconds.
+A longer Base ICL stability run reached EOS after 291 codec frames and produced
+23.28 seconds of cleanly framed audio in 5.81 seconds wall time (RTF 0.25).
+Reference WAVs are limited to 60 seconds and decoded payloads to 32 MiB.
 
 Supported `response_format` values are `wav`, `pcm`, `mp3`, `opus`, `aac`,
 and `flac`. Compressed formats and non-default `speed` use FFmpeg.
