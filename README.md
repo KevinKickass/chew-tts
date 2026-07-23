@@ -25,6 +25,7 @@ Implemented:
 - GPU-resident execution of all 28 talker layers without host round-trips;
 - a native dense F16 decode GEMV path;
 - GPU-resident execution of the five-layer Qwen code predictor;
+- complete 15-codebook acoustic generation with GPU embeddings and argmax;
 - PyTorch parity checks for real Qwen weights, RoPE, GQA, and cached decoding.
 
 Next:
@@ -115,9 +116,10 @@ CARGO_TARGET_DIR=/tmp/chew-tts-target \
 On an RTX 3080, the initial dense F16 implementation loads the 28-layer talker
 into approximately 2.7 GiB of VRAM and executes one synthetic decode token in
 approximately 7 ms. The five-layer code predictor occupies another 172 MiB and
-executes in approximately 0.7 ms per codebook step. Talker plus 15 predictor
-steps therefore take roughly 17 ms per 80-ms audio frame, before embeddings,
-sampling, and the speech codec.
+executes in approximately 0.7 ms per codebook step. A warm, complete
+15-codebook predictor frame including projection, embeddings, heads, and GPU
+argmax takes approximately 10 ms. Talker plus predictor therefore take roughly
+17 ms per 80-ms audio frame before the speech codec.
 
 ## Requirements
 
