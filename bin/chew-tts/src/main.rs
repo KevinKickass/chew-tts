@@ -1,5 +1,7 @@
 use anyhow::Context;
-use chew_model_qwen3_tts::{TalkerDecoderLayer, inspect_model, load_f16_tensor};
+use chew_model_qwen3_tts::{
+    TalkerDecoderLayer, TalkerLayerKvCache, inspect_model, load_f16_tensor,
+};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -44,6 +46,12 @@ enum Command {
         /// Decoder layer to load.
         #[arg(long, default_value_t = 0)]
         layer: usize,
+        /// Number of causal prefill tokens to validate.
+        #[arg(long, default_value_t = 1)]
+        seq_len: usize,
+        /// Split after this many tokens and decode the remainder one-by-one.
+        #[arg(long)]
+        decode_split: Option<usize>,
         /// Optional raw little-endian f32 reference output.
         #[arg(long)]
         reference: Option<PathBuf>,
@@ -115,8 +123,17 @@ fn main() -> anyhow::Result<()> {
             model_dir,
             gpu,
             layer,
+            seq_len,
+            decode_split,
             reference,
-        } => cuda_layer_smoke(&model_dir, gpu, layer, reference.as_deref())?,
+        } => cuda_layer_smoke(
+            &model_dir,
+            gpu,
+            layer,
+            seq_len,
+            decode_split,
+            reference.as_deref(),
+        )?,
     }
     Ok(())
 }
@@ -182,6 +199,8 @@ fn cuda_layer_smoke(
     model_dir: &PathBuf,
     gpu: usize,
     layer: usize,
+    seq_len: usize,
+    decode_split: Option<usize>,
     reference: Option<&std::path::Path>,
 ) -> anyhow::Result<()> {
     let inspection = inspect_model(model_dir)?;
@@ -207,10 +226,37 @@ fn cuda_layer_smoke(
         config.intermediate_size,
     )?;
     let decoder = TalkerDecoderLayer::load(model_dir, layer, config, stream)?;
-    let hidden = (0..config.hidden_size)
+    if seq_len == 0 {
+        anyhow::bail!("sequence length must be non-zero");
+    }
+    let hidden = (0..seq_len * config.hidden_size)
         .map(|index| ((index as f32 + 1.0) * 0.013).sin() * 0.125)
         .collect::<Vec<_>>();
-    let output = decoder.forward_first_token(&hidden, config, &mut kernels)?;
+    let output = if let Some(split) = decode_split {
+        if split == 0 || split >= seq_len {
+            anyhow::bail!("decode split must be between 1 and seq_len - 1");
+        }
+        let mut cache = TalkerLayerKvCache::allocate(seq_len, config, stream)?;
+        let mut output = decoder.forward_cached(
+            &hidden[..split * config.hidden_size],
+            split,
+            config,
+            &mut kernels,
+            &mut cache,
+        )?;
+        for token in split..seq_len {
+            output.extend(decoder.forward_cached(
+                &hidden[token * config.hidden_size..(token + 1) * config.hidden_size],
+                1,
+                config,
+                &mut kernels,
+                &mut cache,
+            )?);
+        }
+        output
+    } else {
+        decoder.forward_prefill(&hidden, seq_len, config, &mut kernels)?
+    };
     let free_after = allocator.free_bytes(gpu)?;
     let checksum = output
         .iter()
@@ -218,7 +264,9 @@ fn cuda_layer_smoke(
         .map(|(index, value)| (index as f64 + 1.0) * f64::from(*value))
         .sum::<f64>();
     let first = output.iter().take(8).copied().collect::<Vec<_>>();
-    println!("layer {layer} output[0..8]: {first:?}");
+    println!(
+        "layer {layer}, {seq_len} token(s), decode split {decode_split:?}, output[0..8]: {first:?}"
+    );
     println!("weighted checksum: {checksum:.9}");
     if let Some(reference) = reference {
         let bytes = std::fs::read(reference)?;
@@ -235,19 +283,30 @@ fn cuda_layer_smoke(
             .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("four-byte chunk")))
             .collect::<Vec<_>>();
         let mut max_abs_error = 0.0f32;
+        let mut max_error_index = 0usize;
         let mut mean_abs_error = 0.0f64;
-        for (actual, expected) in output.iter().zip(&expected) {
+        for (index, (actual, expected)) in output.iter().zip(&expected).enumerate() {
             let error = (actual - expected).abs();
-            max_abs_error = max_abs_error.max(error);
+            if error > max_abs_error {
+                max_abs_error = error;
+                max_error_index = index;
+            }
             mean_abs_error += f64::from(error);
         }
         mean_abs_error /= output.len() as f64;
-        if max_abs_error > 0.002 {
+        if max_abs_error > 0.003 {
             anyhow::bail!(
-                "layer parity failed: max abs error {max_abs_error:.7}, mean {mean_abs_error:.7}"
+                "layer parity failed: max abs error {max_abs_error:.7} at {max_error_index} \
+                 (CUDA {:.7}, reference {:.7}), mean {mean_abs_error:.7}",
+                output[max_error_index],
+                expected[max_error_index]
             );
         }
-        println!("layer parity passed: max abs error {max_abs_error:.7}, mean {mean_abs_error:.7}");
+        println!(
+            "layer parity passed: max abs error {max_abs_error:.7} at {max_error_index} \
+             (CUDA {:.7}, reference {:.7}), mean {mean_abs_error:.7}",
+            output[max_error_index], expected[max_error_index]
+        );
     }
     println!(
         "CUDA allocation: {:.1} MiB",

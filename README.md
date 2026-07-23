@@ -21,11 +21,12 @@ Implemented:
 - validation of the talker and code-predictor geometry;
 - inspection of real Hugging Face model directories;
 - native F16 CUDA execution of a complete Qwen talker decoder layer;
-- PyTorch parity checks for real Qwen weights.
+- causal multi-token prefill and incremental decoding with a native KV cache;
+- PyTorch parity checks for real Qwen weights, RoPE, GQA, and cached decoding.
 
 Next:
 
-- full talker prefill, KV cache, and autoregressive decode;
+- GPU-resident execution of the complete 28-layer talker;
 - code-predictor decode and GPU-side sampling;
 - one CUDA graph for a complete 16-codebook audio frame;
 - the 12 Hz speech-tokenizer decoder;
@@ -93,12 +94,13 @@ Run one real Qwen talker decoder layer:
 CARGO_TARGET_DIR=/tmp/chew-tts-target \
   cargo run --release -p chew-tts -- \
   cuda-layer-smoke /models/Qwen3-TTS-12Hz-1.7B-VoiceDesign \
-  --gpu 0 --layer 0
+  --gpu 0 --layer 0 --seq-len 4 --decode-split 2
 ```
 
 An optional raw little-endian F32 output can be supplied with `--reference`.
 The command then fails if CUDA and the reference differ beyond the configured
-correctness tolerance.
+correctness tolerance. `--decode-split` fills the KV cache with a prompt prefix
+and processes the remaining tokens individually.
 
 ## Requirements
 
