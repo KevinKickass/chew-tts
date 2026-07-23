@@ -135,6 +135,40 @@ Hugging Face model directory containing the original model artifacts.
 
 ## Performance
 
+Warm end-to-end measurements for every locally available model on an
+RTX 3080 10 GB:
+
+| Model | Mode | Load | VRAM | Audio | Median wall | RTF | Realtime |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Kokoro-82M | fast voice | 0.95 s | 171 MiB | 9.475 s | 0.252 s | 0.0266 | 37.59x |
+| Chatterbox Multilingual V3 | expressive | 3.90 s | 1,290 MiB | 6.440 s | 1.525 s | 0.2368 | 4.22x |
+| Qwen3-TTS 1.7B VoiceDesign | designed voice | 4.14 s | 3,901 MiB | 8.320 s | 1.967 s | 0.2364 | 4.23x |
+| Qwen3-TTS 1.7B CustomVoice | `serena` | 4.13 s | 3,948 MiB | 9.200 s | 2.148 s | 0.2334 | 4.28x |
+| Qwen3-TTS 1.7B Base | cached ICL clone | 4.36 s | 4,040 MiB | 13.280 s | 3.191 s | 0.2403 | 4.16x |
+
+All rows use the same English input, seed 4242, native mono WAV output, one
+worker, one discarded warm-up, and the median of five sequential requests
+over localhost. Timings include HTTP handling and the complete text-to-waveform
+path, but exclude model loading and MP3 encoding. The card ran under its normal
+desktop workload with CUDA 13.2 and driver 595.58. Base uses a 2.96-second
+reference and measures the normal cached-reference path after warm-up. RTF is
+wall time divided by generated audio duration, so lower is better.
+
+### Audio samples
+
+English is the default sample for every model. Multilingual engines also
+include a German example:
+
+| Model | English | German |
+| --- | --- | --- |
+| Kokoro-82M | [MP3](samples/kokoro-en.mp3) | — |
+| Chatterbox Multilingual V3 | [MP3](samples/chatterbox-en.mp3) | [MP3](samples/chatterbox-de.mp3) |
+| Qwen3-TTS 1.7B VoiceDesign | [MP3](samples/qwen3-voice-design-en.mp3) | [MP3, whispered](samples/qwen3-voice-design-de.mp3) |
+| Qwen3-TTS 1.7B CustomVoice | [MP3](samples/qwen3-custom-en.mp3) | [MP3](samples/qwen3-custom-de.mp3) |
+| Qwen3-TTS 1.7B Base | [MP3](samples/qwen3-base-en.mp3) | [MP3](samples/qwen3-base-de.mp3) |
+
+### Kokoro concurrency
+
 Warm Kokoro measurements for the same 2.525-second English sample:
 
 | GPU | Workers | Requests/s | Audio seconds/s |
