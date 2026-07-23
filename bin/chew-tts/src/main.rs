@@ -762,7 +762,8 @@ fn cuda_voice_design_smoke(
         }
 
         let semantic_embedding = frontend.codec_embeddings(&[semantic], &mut kernels)?;
-        let acoustic_embedding = predictor.acoustic_embeddings_sum(&acoustic, &mut kernels)?;
+        let acoustic_embedding =
+            predictor.acoustic_embeddings_sum_with_session(&mut predictor_session, &mut kernels)?;
         let text_embedding = if frame_index < inputs.trailing_tokens {
             let start = frame_index * config.hidden_size;
             &inputs.trailing_text[start..start + config.hidden_size]

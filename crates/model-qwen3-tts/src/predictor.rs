@@ -35,6 +35,7 @@ pub struct CodePredictorGenerationSession {
     current_code: CudaSlice<i32>,
     all_codes: CudaSlice<i32>,
     code_embed: CudaSlice<f16>,
+    embedding_sum: CudaSlice<f32>,
 }
 
 impl CodePredictorTransformer {
@@ -143,6 +144,7 @@ impl CodePredictorTransformer {
             current_code: stream.alloc_zeros::<i32>(1)?,
             all_codes: stream.alloc_zeros::<i32>(groups)?,
             code_embed: stream.alloc_zeros::<f16>(CODEC_EMBED_DIM)?,
+            embedding_sum: stream.alloc_zeros::<f32>(CODEC_EMBED_DIM)?,
         })
     }
 
@@ -482,6 +484,46 @@ impl CodePredictorTransformer {
         stream.synchronize()?;
         let mut host = vec![0.0f32; CODEC_EMBED_DIM];
         stream.memcpy_dtoh(&sum, &mut host)?;
+        Ok(host)
+    }
+
+    /// Sum the last generated frame's acoustic embeddings without re-uploading IDs.
+    pub fn acoustic_embeddings_sum_with_session(
+        &self,
+        session: &mut CodePredictorGenerationSession,
+        kernels: &mut GpuKernels,
+    ) -> anyhow::Result<Vec<f32>> {
+        const CODEC_EMBED_DIM: usize = 2048;
+        let stream = Arc::clone(kernels.ops.stream());
+        for (group, table) in self.codec_embeddings.iter().enumerate() {
+            stream.memcpy_dtod(
+                &session.all_codes.slice(group..group + 1),
+                &mut session.current_code,
+            )?;
+            kernels.ops.gather_rows_f16(
+                table,
+                &session.current_code,
+                &mut session.code_embed,
+                1,
+                CODEC_EMBED_DIM as u32,
+            )?;
+            if group == 0 {
+                kernels.ops.copy_f16_to_f32(
+                    &session.code_embed,
+                    &mut session.embedding_sum,
+                    CODEC_EMBED_DIM as u32,
+                )?;
+            } else {
+                kernels.ops.add_inplace_f32_f16(
+                    &mut session.embedding_sum,
+                    &session.code_embed,
+                    CODEC_EMBED_DIM as u32,
+                )?;
+            }
+        }
+        stream.synchronize()?;
+        let mut host = vec![0.0f32; CODEC_EMBED_DIM];
+        stream.memcpy_dtoh(&session.embedding_sum, &mut host)?;
         Ok(host)
     }
 }
