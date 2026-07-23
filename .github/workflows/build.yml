@@ -1,0 +1,61 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Linux x86-64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check workspace
+        run: cargo check --workspace --locked
+
+      - name: Run tests
+        # The vendored cudarc examples include optional CUPTI demos whose
+        # feature is intentionally disabled in the production binary.
+        run: cargo test --workspace --exclude cudarc --locked
+
+      - name: Lint TTS binary
+        run: cargo clippy --locked -p chew-tts --no-deps
+
+      - name: Build release binary
+        run: cargo build --release --locked -p chew-tts
+
+      - name: Package binary
+        run: |
+          mkdir -p dist
+          cp target/release/chew-tts dist/chew-tts-linux-x86_64
+          chmod 755 dist/chew-tts-linux-x86_64
+          sha256sum dist/chew-tts-linux-x86_64 > dist/SHA256SUMS
+
+      - name: Upload build
+        uses: actions/upload-artifact@v4
+        with:
+          name: chew-tts-linux-x86_64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14

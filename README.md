@@ -1,8 +1,26 @@
-# Chew TTS
+<p align="center">
+  <img src="assets/chew-tts-logo.png" width="520" alt="Chew TTS logo">
+</p>
 
-Chew TTS is a Rust and CUDA speech-synthesis engine built for predictable VRAM
-usage, high throughput, and a single deployable binary. CUDA kernels are
-compiled at startup with NVRTC for the GPU that is actually present.
+<h1 align="center">Chew TTS</h1>
+
+<p align="center">
+  Native speech synthesis in one Rust binary, with CUDA kernels compiled for
+  the GPU at startup.
+</p>
+
+<p align="center">
+  <a href="https://github.com/KevinKickass/chew-tts/actions/workflows/build.yml"><img alt="Build" src="https://github.com/KevinKickass/chew-tts/actions/workflows/build.yml/badge.svg"></a>
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-7c6bf2.svg"></a>
+  <img alt="Rust 2024" src="https://img.shields.io/badge/Rust-2024-dea584.svg">
+  <img alt="CUDA NVRTC" src="https://img.shields.io/badge/CUDA-NVRTC-76b900.svg">
+  <img alt="Linux x86-64" src="https://img.shields.io/badge/Linux-x86--64-2f2b55.svg">
+</p>
+
+Chew TTS is a native Rust and CUDA speech-synthesis engine built for
+predictable VRAM usage, high throughput, and a single deployable binary. CUDA
+kernels are compiled at startup with NVRTC for the GPU that is actually
+present.
 
 The project is a TTS-focused fork of
 [Chew](https://github.com/KevinKickass/chew). It intentionally has its own
@@ -50,7 +68,7 @@ Implemented:
   vector quantization, and Base ICL prompts with reference text;
 - an eight-entry SHA-256 reference cache for speaker embeddings, waveforms,
   and ICL codec frames;
-- PyTorch parity checks for real Qwen weights, RoPE, GQA, and cached decoding.
+- PyTorch parity checks for real Qwen weights, RoPE, GQA, and cached decoding;
 - sentence-aware long-request segmentation, allowing the advertised 4,096
   characters without weakening the per-segment codec-frame safety limit;
 - native Kokoro config, PyTorch checkpoint, phoneme-token, and `.pt` voice-pack
@@ -67,7 +85,7 @@ Implemented:
   Perceiver prompt encoding, CFG, and autoregressive speech-token generation;
 - the complete native S3Gen token-conditioning encoder: lookahead convolution,
   6+4 relative-attention Conformer blocks, 2x upsampling, and the 80-bin flow
-  projection, checked against the official FP16 PyTorch path on an RTX 3080.
+  projection, checked against the official FP16 PyTorch path on an RTX 3080;
 - the complete GPU-resident S3Gen conditional-flow estimator with causal
   ResNet blocks, 64 attention/FFN blocks, skip connection, cosine Euler
   integration, and classifier-free guidance;
@@ -80,7 +98,59 @@ Next:
 - one CUDA graph for a complete 16-codebook audio frame;
 - optimized one-pass model loading and GPU-resident sampling;
 - arbitrary compressed reference-audio input in addition to native WAV;
-- persistent Kokoro model loading and removal of intermediate host transfers.
+- native Chatterbox reference-audio conditioning;
+- batched conditional/unconditional Chatterbox flow evaluation.
+
+## Quick start
+
+Build the production binary:
+
+```bash
+cargo build --release --locked -p chew-tts
+```
+
+Run an OpenAI-compatible server with any supported model directory:
+
+```bash
+./target/release/chew-tts serve /models/Kokoro-82M \
+  --gpu 0 --host 127.0.0.1 --port 18001 --workers 2
+```
+
+Generate a WAV:
+
+```bash
+curl http://127.0.0.1:18001/v1/audio/speech \
+  -H 'content-type: application/json' \
+  -d '{
+    "model": "tts-fast",
+    "input": "Hello from Chew TTS.",
+    "voice": "af_heart",
+    "language": "en",
+    "response_format": "wav"
+  }' \
+  --output speech.wav
+```
+
+Model weights are not included in this repository. Point the binary at a local
+Hugging Face model directory containing the original model artifacts.
+
+## Performance
+
+Warm Kokoro measurements for the same 2.525-second English sample:
+
+| GPU | Workers | Requests/s | Audio seconds/s |
+| --- | ---: | ---: | ---: |
+| RTX 3080 10 GB | 1 | 15.9 | 40.2 |
+| RTX 3080 10 GB | 2 | 21.6 | 54.6 |
+| RTX 3080 10 GB | 4 | 23.9 | 60.3 |
+| Tesla V100 16 GB | 1 | 10.6 | 26.8 |
+| Tesla V100 16 GB | 3 | 16.5 | 41.6 |
+| RTX A6000 48 GB | 1 | 13.1 | 33.0 |
+
+The RTX 3080 produces a 17.9-second sample in about 0.51 seconds end to end
+(RTF 0.028). Measurements include phonemization and raw 24-kHz output, but not
+network transit or compressed-audio encoding. Staging-card measurements were
+taken alongside other resident model contexts.
 
 ## Why a separate repository?
 
