@@ -240,14 +240,19 @@ timeline on CUDA's large X grid dimension, so output is not limited by the
 65,535-block Y dimension once a waveform exceeds roughly 2.7 seconds.
 
 By default, generated codes are drained through a bounded 32-frame codec
-buffer with 64 previous frames of causal context. This caps the codec working
-set at 96 frames and enables early audio delivery. PCM chunks are written
-immediately through a streaming WAV sink; generated audio is not accumulated
-in RAM, and the header is finalized at EOS. For the 6.88-second
-VoiceDesign validation sample, chunked output differs from full-sequence
-decoding by only 0.72 PCM16 levels on average (26 maximum) and remains faster
-than real time at RTF 0.83. Use `--chunk-frames 0` for exact full-sequence
-decoding.
+buffer with four previous transformed frames of causal context. The codec
+transformer's KV cache persists across chunks, so each codec frame passes
+through the transformer exactly once. Only the inexpensive causal audio tail
+is replayed to preserve the waveform boundary. Four context frames match a
+64-frame overlap within one PCM16 level after the boundary in validation,
+while avoiding the large cost of repeatedly decoding 64 old frames.
+
+PCM chunks are written immediately through a streaming WAV sink; generated
+audio is not accumulated in RAM, and the header is finalized at EOS. A
+33-frame boundary-stress run takes approximately 1.53 seconds for 2.64 seconds
+of audio on an RTX 3080 (RTF 0.58). Its maximum deviation from full-sequence
+output is 26 PCM16 levels and only 14 around the chunk boundary. Use
+`--chunk-frames 0` for exact full-sequence decoding.
 
 The current optimized acoustic path sustains roughly 95% GPU utilization on an
 RTX 3080. Moving exact Top-K 50 sampling onto the GPU reduced a 2.48-second

@@ -1,7 +1,7 @@
 use anyhow::Context;
 use chew_model_qwen3_tts::{
-    CodePredictorTransformer, CodecQuantizer, TalkerDecoderLayer, TalkerFrontend,
-    TalkerLayerKvCache, TalkerTransformer, inspect_model, load_f16_tensor,
+    CodePredictorTransformer, CodecQuantizer, CodecTransformerSession, TalkerDecoderLayer,
+    TalkerFrontend, TalkerLayerKvCache, TalkerTransformer, inspect_model, load_f16_tensor,
 };
 use clap::{Parser, Subcommand};
 use std::io::{Seek, SeekFrom, Write};
@@ -139,6 +139,9 @@ enum Command {
         /// Number of identical codec frames to decode jointly.
         #[arg(long, default_value_t = 1)]
         frames: usize,
+        /// Validate persistent codec KV state by splitting after this frame.
+        #[arg(long)]
+        stream_split: Option<usize>,
         /// Number of times to run the selected codec stage.
         #[arg(long, default_value_t = 1)]
         repeats: usize,
@@ -215,7 +218,7 @@ enum Command {
         #[arg(long, default_value_t = 32)]
         chunk_frames: usize,
         /// Previous frames retained as causal context for chunked decoding.
-        #[arg(long, default_value_t = 64)]
+        #[arg(long, default_value_t = 4)]
         chunk_context: usize,
         /// PCM16 WAV output path.
         #[arg(long)]
@@ -340,6 +343,7 @@ fn main() -> anyhow::Result<()> {
             upsample,
             audio,
             frames,
+            stream_split,
             repeats,
             wav,
             reference,
@@ -352,6 +356,7 @@ fn main() -> anyhow::Result<()> {
             upsample,
             audio,
             frames,
+            stream_split,
             repeats,
             wav.as_deref(),
             reference.as_deref(),
@@ -702,7 +707,12 @@ fn cuda_voice_design_smoke(
     } else {
         chunk_frames
     });
-    let mut codec_context = Vec::with_capacity(chunk_context);
+    let mut codec_context = Vec::with_capacity(1024 * chunk_context);
+    let mut codec_session = if chunk_frames > 0 {
+        Some(codec.start_transformer_session(max_frames, stream)?)
+    } else {
+        None
+    };
     let mut wav_writer = if chunk_frames > 0 {
         Some(Pcm16WavWriter::create(wav, 24_000)?)
     } else {
@@ -740,6 +750,9 @@ fn cuda_voice_design_smoke(
                 &codec,
                 &mut codec_frames,
                 &mut codec_context,
+                codec_session
+                    .as_mut()
+                    .expect("chunked decoding has a codec transformer session"),
                 chunk_context,
                 wav_writer
                     .as_mut()
@@ -791,6 +804,9 @@ fn cuda_voice_design_smoke(
                 &codec,
                 &mut codec_frames,
                 &mut codec_context,
+                codec_session
+                    .as_mut()
+                    .expect("chunked decoding has a codec transformer session"),
                 chunk_context,
                 wav_writer
                     .as_mut()
@@ -841,7 +857,8 @@ fn cuda_voice_design_smoke(
 fn decode_codec_chunk(
     codec: &CodecQuantizer,
     pending: &mut Vec<Vec<i32>>,
-    context: &mut Vec<Vec<i32>>,
+    context: &mut Vec<f32>,
+    session: &mut CodecTransformerSession,
     context_frames: usize,
     output: &mut Pcm16WavWriter,
     kernels: &mut chew_kernel::GpuKernels,
@@ -850,19 +867,40 @@ fn decode_codec_chunk(
         return Ok(std::time::Duration::ZERO);
     }
     const SAMPLES_PER_FRAME: usize = 1920;
-    let prefix_frames = context.len();
-    let mut decode_frames = Vec::with_capacity(prefix_frames + pending.len());
-    decode_frames.extend(context.iter().cloned());
-    decode_frames.append(pending);
+    const CHANNELS: usize = 1024;
+    let prefix_frames = context.len() / CHANNELS;
+    let new_frames = pending.len();
 
     let started = std::time::Instant::now();
-    let decoded = codec.decode_frames_audio(&decode_frames, kernels)?;
+    let transformed = codec.decode_frames_transformer_session(pending, session, kernels)?;
+    pending.clear();
+
+    let total_frames = prefix_frames + new_frames;
+    let mut decode_frames = vec![0.0; CHANNELS * total_frames];
+    for channel in 0..CHANNELS {
+        let destination = channel * total_frames;
+        if prefix_frames > 0 {
+            let source = channel * prefix_frames;
+            decode_frames[destination..destination + prefix_frames]
+                .copy_from_slice(&context[source..source + prefix_frames]);
+        }
+        let source = channel * new_frames;
+        decode_frames[destination + prefix_frames..destination + total_frames]
+            .copy_from_slice(&transformed[source..source + new_frames]);
+    }
+    let decoded = codec.decode_transformed_audio(&decode_frames, total_frames, kernels)?;
     let elapsed = started.elapsed();
     output.write_samples(&decoded[prefix_frames * SAMPLES_PER_FRAME..])?;
 
-    let keep = context_frames.min(decode_frames.len());
-    context.clear();
-    context.extend_from_slice(&decode_frames[decode_frames.len() - keep..]);
+    let keep = context_frames.min(total_frames);
+    let first_kept = total_frames - keep;
+    context.resize(CHANNELS * keep, 0.0);
+    for channel in 0..CHANNELS {
+        let source = channel * total_frames + first_kept;
+        let destination = channel * keep;
+        context[destination..destination + keep]
+            .copy_from_slice(&decode_frames[source..source + keep]);
+    }
     Ok(elapsed)
 }
 
@@ -875,6 +913,7 @@ fn cuda_codec_latent_smoke(
     upsample: bool,
     audio: bool,
     frames: usize,
+    stream_split: Option<usize>,
     repeats: usize,
     wav: Option<&std::path::Path>,
     reference: Option<&std::path::Path>,
@@ -906,6 +945,46 @@ fn cuda_codec_latent_smoke(
     let quantizer = CodecQuantizer::load(tokenizer_dir, stream)?;
     let free_loaded = allocator.free_bytes(gpu)?;
     let codec_frames = vec![codes.clone(); frames];
+    if let Some(split) = stream_split {
+        if split == 0 || split >= frames {
+            anyhow::bail!("stream-split must be between 1 and frames - 1");
+        }
+        let full = quantizer.decode_frames_transformer(&codec_frames, &mut kernels)?;
+        let mut session = quantizer.start_transformer_session(frames, stream)?;
+        let first = quantizer.decode_frames_transformer_session(
+            &codec_frames[..split],
+            &mut session,
+            &mut kernels,
+        )?;
+        let second = quantizer.decode_frames_transformer_session(
+            &codec_frames[split..],
+            &mut session,
+            &mut kernels,
+        )?;
+        let mut streamed = vec![0.0f32; full.len()];
+        for channel in 0..1024 {
+            streamed[channel * frames..channel * frames + split]
+                .copy_from_slice(&first[channel * split..(channel + 1) * split]);
+            streamed[channel * frames + split..(channel + 1) * frames].copy_from_slice(
+                &second[channel * (frames - split)..(channel + 1) * (frames - split)],
+            );
+        }
+        let (max, sum) =
+            full.iter()
+                .zip(&streamed)
+                .fold((0.0f32, 0.0f64), |(max, sum), (full, streamed)| {
+                    let delta = (full - streamed).abs();
+                    (max.max(delta), sum + f64::from(delta))
+                });
+        let mean = sum / full.len() as f64;
+        if max > 0.1 {
+            anyhow::bail!("streamed codec transformer delta {max:.7} exceeds 0.1 (mean {mean:.7})");
+        }
+        println!(
+            "streamed codec transformer: split {split}/{frames}, \
+             max delta {max:.7}, mean {mean:.7}"
+        );
+    }
     if repeats > 1 {
         if audio {
             if frames == 1 {

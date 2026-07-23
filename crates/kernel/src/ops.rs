@@ -76,6 +76,7 @@ pub struct OpsKernels {
     softmax_topk: CudaFunction,
     fused_moe_router: CudaFunction,
     conv1d_causal_f16: CudaFunction,
+    conv1d_causal_offset_f16: CudaFunction,
     conv_transpose1d_causal_f16: CudaFunction,
     transpose_f16: CudaFunction,
     gelu_erf_f16: CudaFunction,
@@ -148,6 +149,7 @@ impl OpsKernels {
             softmax_topk: loader::get_fn(&module, "softmax_topk")?,
             fused_moe_router: loader::get_fn(&module, "fused_moe_router")?,
             conv1d_causal_f16: loader::get_fn(&module, "conv1d_causal_f16")?,
+            conv1d_causal_offset_f16: loader::get_fn(&module, "conv1d_causal_offset_f16")?,
             conv_transpose1d_causal_f16: loader::get_fn(
                 &module,
                 "conv_transpose1d_causal_f16",
@@ -203,6 +205,59 @@ impl OpsKernels {
                 &self.conv1d_causal_f16,
                 LaunchConfig {
                     grid_dim: (seq_len, out_channels, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                &mut args,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Causal convolution over new positions with left context in the input.
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv1d_causal_offset_f16(
+        &self,
+        x: &CudaSlice<half::f16>,
+        weight: &CudaSlice<half::f16>,
+        bias: &CudaSlice<half::f16>,
+        out: &mut CudaSlice<half::f16>,
+        in_channels: u32,
+        out_channels: u32,
+        input_len: u32,
+        output_len: u32,
+        history_len: u32,
+        kernel_size: u32,
+        dilation: u32,
+        groups: u32,
+    ) -> Result<(), KernelError> {
+        let ic = in_channels as i32;
+        let oc = out_channels as i32;
+        let il = input_len as i32;
+        let ol = output_len as i32;
+        let hl = history_len as i32;
+        let ks = kernel_size as i32;
+        let dil = dilation as i32;
+        let grp = groups as i32;
+        let mut args: [*mut c_void; 12] = [
+            slice_ptr(x),
+            slice_ptr(weight),
+            slice_ptr(bias),
+            slice_ptr_mut(out),
+            scalar_ptr(&ic),
+            scalar_ptr(&oc),
+            scalar_ptr(&il),
+            scalar_ptr(&ol),
+            scalar_ptr(&hl),
+            scalar_ptr(&ks),
+            scalar_ptr(&dil),
+            scalar_ptr(&grp),
+        ];
+        unsafe {
+            self.fast.launch(
+                &self.conv1d_causal_offset_f16,
+                LaunchConfig {
+                    grid_dim: (output_len, out_channels, 1),
                     block_dim: (256, 1, 1),
                     shared_mem_bytes: 0,
                 },

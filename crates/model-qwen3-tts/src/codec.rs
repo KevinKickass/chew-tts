@@ -87,6 +87,19 @@ pub struct CodecQuantizer {
     decoder_final_bias: CudaSlice<f16>,
 }
 
+struct CodecLayerKvCache {
+    key: CudaSlice<f16>,
+    value: CudaSlice<f16>,
+}
+
+/// Persistent causal state for the codec's eight-layer pre-transformer.
+pub struct CodecTransformerSession {
+    caches: Vec<CodecLayerKvCache>,
+    latent_history: Vec<Vec<f32>>,
+    position: usize,
+    max_frames: usize,
+}
+
 impl CodecQuantizer {
     pub fn load(tokenizer_dir: impl AsRef<Path>, stream: &Arc<CudaStream>) -> anyhow::Result<Self> {
         let tokenizer_dir = tokenizer_dir.as_ref();
@@ -281,6 +294,28 @@ impl CodecQuantizer {
             decoder_final_activation: load_snake("decoder.decoder.5", 96)?,
             decoder_final_weight: load("decoder.decoder.6.conv.weight", &[1, 96, 7])?,
             decoder_final_bias: load("decoder.decoder.6.conv.bias", &[1])?,
+        })
+    }
+
+    pub fn start_transformer_session(
+        &self,
+        max_frames: usize,
+        stream: &Arc<CudaStream>,
+    ) -> anyhow::Result<CodecTransformerSession> {
+        ensure!(max_frames > 0, "codec session must hold at least one frame");
+        let caches = (0..self.transformer_layers.len())
+            .map(|_| {
+                Ok(CodecLayerKvCache {
+                    key: stream.alloc_zeros::<f16>(1024 * max_frames)?,
+                    value: stream.alloc_zeros::<f16>(1024 * max_frames)?,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(CodecTransformerSession {
+            caches,
+            latent_history: Vec::with_capacity(2),
+            position: 0,
+            max_frames,
         })
     }
 
@@ -773,6 +808,288 @@ impl CodecQuantizer {
         Ok(output_host.into_iter().map(f16::to_f32).collect())
     }
 
+    /// Decode a new frame chunk while retaining exact transformer KV state.
+    ///
+    /// The returned tensor is channel-first `[1024, new_frames]`.
+    pub fn decode_frames_transformer_session(
+        &self,
+        frames: &[Vec<i32>],
+        session: &mut CodecTransformerSession,
+        kernels: &mut GpuKernels,
+    ) -> anyhow::Result<Vec<f32>> {
+        const HIDDEN: usize = 512;
+        const Q_DIM: usize = 1024;
+        const FF_DIM: usize = 1024;
+        ensure!(!frames.is_empty(), "at least one codec frame is required");
+        let seq_len = frames.len();
+        ensure!(
+            session.position + seq_len <= session.max_frames,
+            "codec session exceeds {} frames",
+            session.max_frames
+        );
+
+        let mut new_latents = Vec::with_capacity(seq_len);
+        for codes in frames {
+            new_latents.push(self.decode_frame(codes, kernels)?);
+        }
+        let history_len = session.latent_history.len();
+        let input_len = history_len + seq_len;
+        let mut latent_cf = vec![0.0f32; LATENT_DIM * input_len];
+        for (position, latent) in session
+            .latent_history
+            .iter()
+            .chain(&new_latents)
+            .enumerate()
+        {
+            for channel in 0..LATENT_DIM {
+                latent_cf[channel * input_len + position] = latent[channel];
+            }
+        }
+
+        let stream = Arc::clone(kernels.ops.stream());
+        let latent_f16 = latent_cf.into_iter().map(f16::from_f32).collect::<Vec<_>>();
+        let latent_gpu = stream.clone_htod(&latent_f16)?;
+        let mut preconv_cf = stream.alloc_zeros::<f16>(1024 * seq_len)?;
+        kernels.ops.conv1d_causal_offset_f16(
+            &latent_gpu,
+            &self.pre_conv_weight,
+            &self.pre_conv_bias,
+            &mut preconv_cf,
+            LATENT_DIM as u32,
+            1024,
+            input_len as u32,
+            seq_len as u32,
+            history_len as u32,
+            3,
+            1,
+            1,
+        )?;
+        let mut preconv_cl = stream.alloc_zeros::<f16>(1024 * seq_len)?;
+        kernels
+            .ops
+            .transpose_f16(&preconv_cf, &mut preconv_cl, 1024, seq_len as u32)?;
+        let mut projected = stream.alloc_zeros::<f16>(HIDDEN * seq_len)?;
+        kernels.gemm.matmul_f16(
+            &preconv_cl,
+            &self.transformer_input_weight,
+            &mut projected,
+            seq_len as u32,
+            HIDDEN as u32,
+            1024,
+        )?;
+        kernels.ops.add_bias_f16_inplace(
+            &mut projected,
+            &self.transformer_input_bias,
+            seq_len as u32,
+            HIDDEN as u32,
+        )?;
+
+        let hidden_elements = HIDDEN * seq_len;
+        let q_elements = Q_DIM * seq_len;
+        let ff_elements = FF_DIM * seq_len;
+        let mut hidden = stream.alloc_zeros::<f32>(hidden_elements)?;
+        kernels
+            .ops
+            .copy_f16_to_f32(&projected, &mut hidden, hidden_elements as u32)?;
+        let mut norm = stream.alloc_zeros::<f16>(hidden_elements)?;
+        let mut q = stream.alloc_zeros::<f16>(q_elements)?;
+        let mut k = stream.alloc_zeros::<f16>(q_elements)?;
+        let mut v = stream.alloc_zeros::<f16>(q_elements)?;
+        let mut attention = stream.alloc_zeros::<f16>(q_elements)?;
+        let mut delta = stream.alloc_zeros::<f16>(hidden_elements)?;
+        let mut scaled = stream.alloc_zeros::<f16>(hidden_elements)?;
+        let mut gate = stream.alloc_zeros::<f16>(ff_elements)?;
+        let mut up = stream.alloc_zeros::<f16>(ff_elements)?;
+        let mut activation = stream.alloc_zeros::<f16>(ff_elements)?;
+        let cache_start = session.position * Q_DIM;
+        let cache_end = (session.position + seq_len) * Q_DIM;
+
+        for ((layer, cache), layer_index) in self
+            .transformer_layers
+            .iter()
+            .zip(&mut session.caches)
+            .zip(0usize..)
+        {
+            kernels.ops.rms_norm_f32in(
+                &hidden,
+                &layer.input_norm,
+                &mut norm,
+                seq_len as u32,
+                HIDDEN as u32,
+                1e-5,
+            )?;
+            kernels.gemm.matmul_f16(
+                &norm,
+                &layer.q_proj,
+                &mut q,
+                seq_len as u32,
+                Q_DIM as u32,
+                HIDDEN as u32,
+            )?;
+            kernels.gemm.matmul_f16(
+                &norm,
+                &layer.k_proj,
+                &mut k,
+                seq_len as u32,
+                Q_DIM as u32,
+                HIDDEN as u32,
+            )?;
+            kernels.gemm.matmul_f16(
+                &norm,
+                &layer.v_proj,
+                &mut v,
+                seq_len as u32,
+                Q_DIM as u32,
+                HIDDEN as u32,
+            )?;
+            kernels.ops.rope_neox(
+                &mut q,
+                seq_len as u32,
+                16,
+                64,
+                session.position as u32,
+                10_000.0,
+            )?;
+            kernels.ops.rope_neox(
+                &mut k,
+                seq_len as u32,
+                16,
+                64,
+                session.position as u32,
+                10_000.0,
+            )?;
+            kernels.ops.copy_f16(
+                &k,
+                &mut cache.key.slice_mut(cache_start..cache_end),
+                q_elements as u32,
+            )?;
+            kernels.ops.copy_f16(
+                &v,
+                &mut cache.value.slice_mut(cache_start..cache_end),
+                q_elements as u32,
+            )?;
+            kernels.ops.mha_fused(
+                &q,
+                &cache.key.slice(..cache_end),
+                &cache.value.slice(..cache_end),
+                &mut attention,
+                64,
+                16,
+                16,
+                seq_len as u32,
+                (session.position + seq_len) as u32,
+                session.position as u32,
+            )?;
+            kernels.gemm.matmul_f16(
+                &attention,
+                &layer.o_proj,
+                &mut delta,
+                seq_len as u32,
+                HIDDEN as u32,
+                Q_DIM as u32,
+            )?;
+            kernels.ops.mul_f16_broadcast(
+                &delta,
+                &layer.attention_scale,
+                &mut scaled,
+                hidden_elements as u32,
+                HIDDEN as u32,
+            )?;
+            kernels
+                .ops
+                .add_inplace_f32_f16(&mut hidden, &scaled, hidden_elements as u32)?;
+            kernels.ops.rms_norm_f32in(
+                &hidden,
+                &layer.post_attention_norm,
+                &mut norm,
+                seq_len as u32,
+                HIDDEN as u32,
+                1e-5,
+            )?;
+            kernels.gemm.matmul_f16(
+                &norm,
+                &layer.gate_proj,
+                &mut gate,
+                seq_len as u32,
+                FF_DIM as u32,
+                HIDDEN as u32,
+            )?;
+            kernels.gemm.matmul_f16(
+                &norm,
+                &layer.up_proj,
+                &mut up,
+                seq_len as u32,
+                FF_DIM as u32,
+                HIDDEN as u32,
+            )?;
+            kernels
+                .ops
+                .silu(&gate, &up, &mut activation, ff_elements as u32)?;
+            kernels.gemm.matmul_f16(
+                &activation,
+                &layer.down_proj,
+                &mut delta,
+                seq_len as u32,
+                HIDDEN as u32,
+                FF_DIM as u32,
+            )?;
+            kernels.ops.mul_f16_broadcast(
+                &delta,
+                &layer.mlp_scale,
+                &mut scaled,
+                hidden_elements as u32,
+                HIDDEN as u32,
+            )?;
+            kernels
+                .ops
+                .add_inplace_f32_f16(&mut hidden, &scaled, hidden_elements as u32)
+                .with_context(|| format!("codec transformer layer {layer_index} failed"))?;
+        }
+
+        kernels.ops.rms_norm_f32in(
+            &hidden,
+            &self.transformer_norm,
+            &mut norm,
+            seq_len as u32,
+            HIDDEN as u32,
+            1e-5,
+        )?;
+        let mut output_cl = stream.alloc_zeros::<f16>(1024 * seq_len)?;
+        kernels.gemm.matmul_f16(
+            &norm,
+            &self.transformer_output_weight,
+            &mut output_cl,
+            seq_len as u32,
+            1024,
+            HIDDEN as u32,
+        )?;
+        kernels.ops.add_bias_f16_inplace(
+            &mut output_cl,
+            &self.transformer_output_bias,
+            seq_len as u32,
+            1024,
+        )?;
+        let mut output_cf = stream.alloc_zeros::<f16>(1024 * seq_len)?;
+        kernels
+            .ops
+            .transpose_f16(&output_cl, &mut output_cf, seq_len as u32, 1024)?;
+        stream.synchronize()?;
+        let mut output_host = vec![f16::ZERO; 1024 * seq_len];
+        stream.memcpy_dtoh(&output_cf, &mut output_host)?;
+
+        session.position += seq_len;
+        let mut combined = session
+            .latent_history
+            .drain(..)
+            .chain(new_latents)
+            .collect::<Vec<_>>();
+        if combined.len() > 2 {
+            combined.drain(..combined.len() - 2);
+        }
+        session.latent_history = combined;
+        Ok(output_host.into_iter().map(f16::to_f32).collect())
+    }
+
     /// Run the codec front end through both 2x ConvNeXt upsampling stages.
     pub fn decode_frame_upsampled(
         &self,
@@ -916,16 +1233,35 @@ impl CodecQuantizer {
         frames: &[Vec<i32>],
         kernels: &mut GpuKernels,
     ) -> anyhow::Result<Vec<f32>> {
+        let transformed = self.decode_frames_transformer(frames, kernels)?;
+        self.decode_transformed_upsampled(&transformed, frames.len(), kernels)
+    }
+
+    /// Jointly 4x-upsample already transformed codec frames.
+    ///
+    /// `transformed` must be channel-first `[1024, frame_count]`.
+    pub fn decode_transformed_upsampled(
+        &self,
+        transformed: &[f32],
+        frame_count: usize,
+        kernels: &mut GpuKernels,
+    ) -> anyhow::Result<Vec<f32>> {
         const CHANNELS: usize = 1024;
         const EXPANDED: usize = 4096;
-        let transformed = self.decode_frames_transformer(frames, kernels)?;
+        anyhow::ensure!(
+            transformed.len() == CHANNELS * frame_count,
+            "transformed codec tensor has {} values, expected {} for {frame_count} frame(s)",
+            transformed.len(),
+            CHANNELS * frame_count
+        );
         let stream = Arc::clone(kernels.ops.stream());
         let transformed = transformed
-            .into_iter()
+            .iter()
+            .copied()
             .map(f16::from_f32)
             .collect::<Vec<_>>();
         let mut hidden = stream.clone_htod(&transformed)?;
-        let mut seq_len = frames.len();
+        let mut seq_len = frame_count;
 
         for stage in &self.upsample_stages {
             let output_len = seq_len * 2;
@@ -1061,6 +1397,19 @@ impl CodecQuantizer {
     ) -> anyhow::Result<Vec<f32>> {
         let upsampled = self.decode_frames_upsampled(frames, kernels)?;
         self.decode_upsampled_audio(upsampled, frames.len(), kernels)
+    }
+
+    /// Decode already transformed codec frames into one continuous 24-kHz waveform.
+    ///
+    /// `transformed` must be channel-first `[1024, frame_count]`.
+    pub fn decode_transformed_audio(
+        &self,
+        transformed: &[f32],
+        frame_count: usize,
+        kernels: &mut GpuKernels,
+    ) -> anyhow::Result<Vec<f32>> {
+        let upsampled = self.decode_transformed_upsampled(transformed, frame_count, kernels)?;
+        self.decode_upsampled_audio(upsampled, frame_count, kernels)
     }
 
     fn decode_upsampled_audio(

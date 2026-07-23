@@ -5,7 +5,7 @@ mod frontend;
 mod predictor;
 mod sampling;
 
-pub use codec::CodecQuantizer;
+pub use codec::{CodecQuantizer, CodecTransformerSession};
 pub use config::{
     CodePredictorConfig, ModelType, Qwen3TtsConfig, SpeakerEncoderConfig, TalkerConfig,
 };
