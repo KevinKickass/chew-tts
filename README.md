@@ -159,9 +159,9 @@ GPU. Against the independent F32 reference, the mean absolute delta is below
 
 Add `--audio --repeats 10` to run through the complete BigVGAN decoder and
 produce one 1,920-sample frame at 24 kHz. The warm single-frame path takes
-approximately 24 ms on an RTX 3080, including the codec front end. Its mean
-absolute delta against the independent F32 waveform reference is below 0.0002
-and its maximum delta below 0.0009.
+approximately 2.7 ms on an RTX 3080, including the codec front end. Dense
+causal and transposed convolutions are lowered to Tensor-Core/cuBLAS GEMMs
+instead of using scalar reduction kernels.
 
 Decode several frames jointly and write a WAV file:
 
@@ -174,9 +174,11 @@ CARGO_TARGET_DIR=/tmp/chew-tts-target \
 
 The multi-frame path preserves the causal transformer and convolution context
 instead of joining independently decoded 80-ms chunks. Three frames take
-approximately 69 ms warm for 240 ms of output on an RTX 3080 (codec RTF 0.29).
-All 5,760 samples match the independent F32 path with a mean absolute delta
-below 0.00018 and a maximum delta below 0.00085.
+approximately 4.3 ms warm for 240 ms of output on an RTX 3080 (codec RTF 0.02).
+The original scalar CUDA path was checked against the independent F32
+reference. On a 32-frame validation waveform, the GEMM path differs from that
+scalar baseline by 0.00018 on average and 0.0036 at maximum, while reducing
+codec latency from approximately 726 ms to 32 ms.
 
 Run the predictor-to-codec integration without manually supplying acoustic
 codebooks:
@@ -255,10 +257,11 @@ output is 26 PCM16 levels and only 14 around the chunk boundary. Use
 `--chunk-frames 0` for exact full-sequence decoding.
 
 The current optimized acoustic path sustains roughly 95% GPU utilization on an
-RTX 3080. Moving exact Top-K 50 sampling onto the GPU reduced a 2.48-second
-VoiceDesign validation run to approximately 1.35 seconds total inference
-(RTF 0.54), while repeated runs with the same seed produce byte-identical WAV
-files.
+RTX 3080. Exact Top-K 50 sampling stays on the GPU, and Tensor-Core/cuBLAS
+convolution lowers the complete 32-frame codec from approximately 726 ms to
+32 ms. A 2.64-second VoiceDesign boundary-stress run now takes approximately
+0.75 seconds total inference (RTF 0.28), including 61 ms of interleaved codec
+work. Repeated runs with the same seed produce byte-identical WAV files.
 
 ## Requirements
 

@@ -2299,6 +2299,49 @@ __global__ void conv1d_causal_offset_f16(
     }
 }
 
+// Unfold channel-first causal Conv1d input into row-major GEMM rows:
+// [channels, sequence] -> [sequence, channels * kernel].
+__global__ void unfold_causal_f16(
+    const __half* __restrict__ x,
+    __half* __restrict__ out,
+    int channels,
+    int seq_len,
+    int kernel_size,
+    int dilation) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    const int row_width = channels * kernel_size;
+    const int n = seq_len * row_width;
+    if (index >= n) return;
+    const int position = index / row_width;
+    const int item = index - position * row_width;
+    const int channel = item / kernel_size;
+    const int kernel_index = item - channel * kernel_size;
+    const int input_position =
+        position - (kernel_size - 1 - kernel_index) * dilation;
+    out[index] = input_position >= 0
+        ? x[channel * seq_len + input_position]
+        : __float2half(0.0f);
+}
+
+// Scatter one row-major ConvTranspose phase into channel-first output.
+__global__ void scatter_conv_transpose_phase_f16(
+    const __half* __restrict__ phase_input,
+    const __half* __restrict__ bias,
+    __half* __restrict__ output,
+    int input_len,
+    int out_channels,
+    int stride,
+    int phase) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    const int n = input_len * out_channels;
+    if (index >= n) return;
+    const int position = index / out_channels;
+    const int channel = index - position * out_channels;
+    const int output_len = input_len * stride;
+    output[channel * output_len + position * stride + phase] =
+        __hadd(phase_input[index], bias[channel]);
+}
+
 // Causal ConvTranspose1d over channel-first data. The untrimmed tail is
 // omitted, so output length is exactly input_len * stride.
 // weight: [in_channels, out_channels, kernel_size].

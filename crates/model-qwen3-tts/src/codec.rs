@@ -56,7 +56,7 @@ struct CodecResidualUnit {
 
 struct CodecDecoderBlock {
     activation: SnakeBetaWeights,
-    transposed_weight: CudaSlice<f16>,
+    transposed_phase_weights: Vec<CudaSlice<f16>>,
     transposed_bias: CudaSlice<f16>,
     residual_units: Vec<CodecResidualUnit>,
     in_channels: usize,
@@ -217,6 +217,33 @@ impl CodecQuantizer {
                 beta: load(&format!("{prefix}.beta"), &[channels])?,
             })
         };
+        let load_transposed_phases = |name: &str,
+                                      in_channels: usize,
+                                      out_channels: usize,
+                                      rate: usize|
+         -> anyhow::Result<Vec<CudaSlice<f16>>> {
+            let tensor = load_f16_tensor(tokenizer_dir, name)?;
+            let kernel_size = rate * 2;
+            ensure!(
+                tensor.shape == [in_channels, out_channels, kernel_size],
+                "{name} has shape {:?}",
+                tensor.shape
+            );
+            (0..rate)
+                .map(|phase| {
+                    let mut packed = vec![f16::ZERO; out_channels * in_channels * 2];
+                    for output in 0..out_channels {
+                        for input in 0..in_channels {
+                            let source = (input * out_channels + output) * kernel_size;
+                            let destination = (output * in_channels + input) * 2;
+                            packed[destination] = tensor.values[source + phase + rate];
+                            packed[destination + 1] = tensor.values[source + phase];
+                        }
+                    }
+                    Ok(stream.clone_htod(&packed)?)
+                })
+                .collect()
+        };
         let decoder_input_weight = load("decoder.decoder.0.conv.weight", &[1536, 1024, 7])?;
         let decoder_input_bias = load("decoder.decoder.0.conv.bias", &[1536])?;
         let mut decoder_blocks = Vec::with_capacity(4);
@@ -260,9 +287,11 @@ impl CodecQuantizer {
             }
             decoder_blocks.push(CodecDecoderBlock {
                 activation: load_snake(&format!("{prefix}.block.0"), in_channels)?,
-                transposed_weight: load(
+                transposed_phase_weights: load_transposed_phases(
                     &format!("{prefix}.block.1.conv.weight"),
-                    &[in_channels, out_channels, rate * 2],
+                    in_channels,
+                    out_channels,
+                    rate,
                 )?,
                 transposed_bias: load(&format!("{prefix}.block.1.conv.bias"), &[out_channels])?,
                 residual_units,
@@ -1423,7 +1452,7 @@ impl CodecQuantizer {
         let upsampled = stream.clone_htod(&upsampled)?;
         let mut seq_len = frame_count * 4;
         let mut hidden = stream.alloc_zeros::<f16>(1536 * seq_len)?;
-        kernels.ops.conv1d_causal_f16(
+        conv1d_causal_gemm(
             &upsampled,
             &self.decoder_input_weight,
             &self.decoder_input_bias,
@@ -1433,7 +1462,7 @@ impl CodecQuantizer {
             seq_len as u32,
             7,
             1,
-            1,
+            kernels,
         )?;
 
         for block in &self.decoder_blocks {
@@ -1448,16 +1477,16 @@ impl CodecQuantizer {
             )?;
             let output_len = seq_len * block.rate;
             let mut output = stream.alloc_zeros::<f16>(block.out_channels * output_len)?;
-            kernels.ops.conv_transpose1d_causal_f16(
+            conv_transpose1d_causal_gemm(
                 &activated,
-                &block.transposed_weight,
+                &block.transposed_phase_weights,
                 &block.transposed_bias,
                 &mut output,
                 block.in_channels as u32,
                 block.out_channels as u32,
                 seq_len as u32,
-                (block.rate * 2) as u32,
                 block.rate as u32,
+                kernels,
             )?;
 
             for unit in &block.residual_units {
@@ -1472,7 +1501,7 @@ impl CodecQuantizer {
                     output_len as u32,
                 )?;
                 let mut first_conv = stream.alloc_zeros::<f16>(block.out_channels * output_len)?;
-                kernels.ops.conv1d_causal_f16(
+                conv1d_causal_gemm(
                     &first_activation,
                     &unit.first_weight,
                     &unit.first_bias,
@@ -1482,7 +1511,7 @@ impl CodecQuantizer {
                     output_len as u32,
                     7,
                     unit.dilation as u32,
-                    1,
+                    kernels,
                 )?;
                 let mut second_activation =
                     stream.alloc_zeros::<f16>(block.out_channels * output_len)?;
@@ -1495,7 +1524,7 @@ impl CodecQuantizer {
                     output_len as u32,
                 )?;
                 let mut second_conv = stream.alloc_zeros::<f16>(block.out_channels * output_len)?;
-                kernels.ops.conv1d_causal_f16(
+                conv1d_causal_gemm(
                     &second_activation,
                     &unit.second_weight,
                     &unit.second_bias,
@@ -1505,7 +1534,7 @@ impl CodecQuantizer {
                     output_len as u32,
                     1,
                     1,
-                    1,
+                    kernels,
                 )?;
                 let mut residual = stream.alloc_zeros::<f16>(block.out_channels * output_len)?;
                 kernels.ops.add_f16(
@@ -1534,7 +1563,7 @@ impl CodecQuantizer {
             seq_len as u32,
         )?;
         let mut waveform = stream.alloc_zeros::<f16>(seq_len)?;
-        kernels.ops.conv1d_causal_f16(
+        conv1d_causal_gemm(
             &final_activation,
             &self.decoder_final_weight,
             &self.decoder_final_bias,
@@ -1544,7 +1573,7 @@ impl CodecQuantizer {
             seq_len as u32,
             7,
             1,
-            1,
+            kernels,
         )?;
         let mut clamped = stream.alloc_zeros::<f16>(seq_len)?;
         kernels
@@ -1555,4 +1584,92 @@ impl CodecQuantizer {
         stream.memcpy_dtoh(&clamped, &mut output_host)?;
         Ok(output_host.into_iter().map(f16::to_f32).collect())
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn conv1d_causal_gemm(
+    input: &CudaSlice<f16>,
+    weight: &CudaSlice<f16>,
+    bias: &CudaSlice<f16>,
+    output: &mut CudaSlice<f16>,
+    in_channels: u32,
+    out_channels: u32,
+    seq_len: u32,
+    kernel_size: u32,
+    dilation: u32,
+    kernels: &mut GpuKernels,
+) -> anyhow::Result<()> {
+    let stream = Arc::clone(kernels.ops.stream());
+    let width = in_channels * kernel_size;
+    let mut unfolded = stream.alloc_zeros::<f16>((seq_len * width) as usize)?;
+    kernels.ops.unfold_causal_f16(
+        input,
+        &mut unfolded,
+        in_channels,
+        seq_len,
+        kernel_size,
+        dilation,
+    )?;
+    let mut channel_last = stream.alloc_zeros::<f16>((seq_len * out_channels) as usize)?;
+    kernels.gemm.matmul_f16(
+        &unfolded,
+        weight,
+        &mut channel_last,
+        seq_len,
+        out_channels,
+        width,
+    )?;
+    kernels
+        .ops
+        .add_bias_f16_inplace(&mut channel_last, bias, seq_len, out_channels)?;
+    kernels
+        .ops
+        .transpose_f16(&channel_last, output, seq_len, out_channels)?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn conv_transpose1d_causal_gemm(
+    input: &CudaSlice<f16>,
+    phase_weights: &[CudaSlice<f16>],
+    bias: &CudaSlice<f16>,
+    output: &mut CudaSlice<f16>,
+    in_channels: u32,
+    out_channels: u32,
+    input_len: u32,
+    stride: u32,
+    kernels: &mut GpuKernels,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        phase_weights.len() == stride as usize,
+        "transposed convolution has {} phases, expected {stride}",
+        phase_weights.len()
+    );
+    let stream = Arc::clone(kernels.ops.stream());
+    let width = in_channels * 2;
+    let mut unfolded = stream.alloc_zeros::<f16>((input_len * width) as usize)?;
+    kernels
+        .ops
+        .unfold_causal_f16(input, &mut unfolded, in_channels, input_len, 2, 1)?;
+    let mut phase_output = stream.alloc_zeros::<f16>((input_len * out_channels) as usize)?;
+    for (phase, weight) in phase_weights.iter().enumerate() {
+        kernels.gemm.matmul_f16(
+            &unfolded,
+            weight,
+            &mut phase_output,
+            input_len,
+            out_channels,
+            width,
+        )?;
+        kernels.ops.scatter_conv_transpose_phase_f16(
+            &phase_output,
+            bias,
+            output,
+            input_len,
+            out_channels,
+            stride,
+            phase as u32,
+        )?;
+    }
+    Ok(())
 }

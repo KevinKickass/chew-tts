@@ -77,6 +77,8 @@ pub struct OpsKernels {
     fused_moe_router: CudaFunction,
     conv1d_causal_f16: CudaFunction,
     conv1d_causal_offset_f16: CudaFunction,
+    unfold_causal_f16: CudaFunction,
+    scatter_conv_transpose_phase_f16: CudaFunction,
     conv_transpose1d_causal_f16: CudaFunction,
     transpose_f16: CudaFunction,
     gelu_erf_f16: CudaFunction,
@@ -150,6 +152,11 @@ impl OpsKernels {
             fused_moe_router: loader::get_fn(&module, "fused_moe_router")?,
             conv1d_causal_f16: loader::get_fn(&module, "conv1d_causal_f16")?,
             conv1d_causal_offset_f16: loader::get_fn(&module, "conv1d_causal_offset_f16")?,
+            unfold_causal_f16: loader::get_fn(&module, "unfold_causal_f16")?,
+            scatter_conv_transpose_phase_f16: loader::get_fn(
+                &module,
+                "scatter_conv_transpose_phase_f16",
+            )?,
             conv_transpose1d_causal_f16: loader::get_fn(
                 &module,
                 "conv_transpose1d_causal_f16",
@@ -258,6 +265,83 @@ impl OpsKernels {
                 &self.conv1d_causal_offset_f16,
                 LaunchConfig {
                     grid_dim: (output_len, out_channels, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                &mut args,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Unfold channel-first causal convolution input into row-major GEMM rows.
+    pub fn unfold_causal_f16(
+        &self,
+        x: &CudaSlice<half::f16>,
+        out: &mut CudaSlice<half::f16>,
+        channels: u32,
+        seq_len: u32,
+        kernel_size: u32,
+        dilation: u32,
+    ) -> Result<(), KernelError> {
+        let ch = channels as i32;
+        let sl = seq_len as i32;
+        let ks = kernel_size as i32;
+        let dil = dilation as i32;
+        let n = channels * seq_len * kernel_size;
+        let mut args: [*mut c_void; 6] = [
+            slice_ptr(x),
+            slice_ptr_mut(out),
+            scalar_ptr(&ch),
+            scalar_ptr(&sl),
+            scalar_ptr(&ks),
+            scalar_ptr(&dil),
+        ];
+        unsafe {
+            self.fast.launch(
+                &self.unfold_causal_f16,
+                LaunchConfig {
+                    grid_dim: (n.div_ceil(256), 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                &mut args,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Scatter a row-major transposed-convolution phase to channel-first output.
+    #[allow(clippy::too_many_arguments)]
+    pub fn scatter_conv_transpose_phase_f16(
+        &self,
+        phase_input: &CudaSlice<half::f16>,
+        bias: &CudaSlice<half::f16>,
+        output: &mut CudaSlice<half::f16>,
+        input_len: u32,
+        out_channels: u32,
+        stride: u32,
+        phase: u32,
+    ) -> Result<(), KernelError> {
+        let il = input_len as i32;
+        let oc = out_channels as i32;
+        let st = stride as i32;
+        let ph = phase as i32;
+        let n = input_len * out_channels;
+        let mut args: [*mut c_void; 7] = [
+            slice_ptr(phase_input),
+            slice_ptr(bias),
+            slice_ptr_mut(output),
+            scalar_ptr(&il),
+            scalar_ptr(&oc),
+            scalar_ptr(&st),
+            scalar_ptr(&ph),
+        ];
+        unsafe {
+            self.fast.launch(
+                &self.scatter_conv_transpose_phase_f16,
+                LaunchConfig {
+                    grid_dim: (n.div_ceil(256), 1, 1),
                     block_dim: (256, 1, 1),
                     shared_mem_bytes: 0,
                 },
