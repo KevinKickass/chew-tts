@@ -81,6 +81,9 @@ enum Command {
         /// Number of synthetic hidden-state tokens.
         #[arg(long, default_value_t = 1)]
         seq_len: usize,
+        /// Prefill this many tokens, then append the remainder one-by-one.
+        #[arg(long)]
+        decode_split: Option<usize>,
         /// Optional raw little-endian f32 reference output.
         #[arg(long)]
         reference: Option<PathBuf>,
@@ -270,8 +273,9 @@ fn main() -> anyhow::Result<()> {
             model_dir,
             gpu,
             seq_len,
+            decode_split,
             reference,
-        } => cuda_talker_smoke(&model_dir, gpu, seq_len, reference.as_deref())?,
+        } => cuda_talker_smoke(&model_dir, gpu, seq_len, decode_split, reference.as_deref())?,
         Command::CudaPredictorSmoke {
             model_dir,
             gpu,
@@ -765,6 +769,7 @@ fn cuda_talker_smoke(
     model_dir: &PathBuf,
     gpu: usize,
     seq_len: usize,
+    decode_split: Option<usize>,
     reference: Option<&std::path::Path>,
 ) -> anyhow::Result<()> {
     let inspection = inspect_model(model_dir)?;
@@ -795,7 +800,34 @@ fn cuda_talker_smoke(
         .map(|index| ((index as f32 + 1.0) * 0.013).sin() * 0.125)
         .collect::<Vec<_>>();
     let forward_started = std::time::Instant::now();
-    let output = talker.forward_hidden(&hidden, seq_len, seq_len, config, &mut kernels)?;
+    let mut cached_baseline = None;
+    let output = if let Some(split) = decode_split {
+        if split == 0 || split > seq_len {
+            anyhow::bail!("decode split must be within 1..={seq_len}");
+        }
+        let mut session = talker.start_session(seq_len, split.max(1), config, stream)?;
+        let mut output = talker.forward_session(
+            &mut session,
+            &hidden[..split * config.hidden_size],
+            split,
+            config,
+            &mut kernels,
+        )?;
+        for token in split..seq_len {
+            output.extend(talker.forward_session(
+                &mut session,
+                &hidden[token * config.hidden_size..(token + 1) * config.hidden_size],
+                1,
+                config,
+                &mut kernels,
+            )?);
+        }
+        cached_baseline =
+            Some(talker.forward_hidden(&hidden, seq_len, seq_len, config, &mut kernels)?);
+        output
+    } else {
+        talker.forward_hidden(&hidden, seq_len, seq_len, config, &mut kernels)?
+    };
     let forward_elapsed = forward_started.elapsed();
     let checksum = output
         .iter()
@@ -812,8 +844,64 @@ fn cuda_talker_smoke(
         "{seq_len} token(s) forwarded in {:.3}ms, weighted checksum {checksum:.9}",
         forward_elapsed.as_secs_f64() * 1000.0
     );
+    if let Some(baseline) = cached_baseline {
+        let (max, mean) =
+            output
+                .iter()
+                .zip(&baseline)
+                .fold((0.0f32, 0.0f64), |(max, sum), (cached, full)| {
+                    let delta = (cached - full).abs();
+                    (max.max(delta), sum + f64::from(delta))
+                });
+        let mean = mean / output.len() as f64;
+        if max > 0.1 {
+            anyhow::bail!("cached talker delta {max:.7} exceeds 0.1");
+        }
+        let head = load_f16_tensor(model_dir, "talker.codec_head.weight")?;
+        let cached_token = cpu_semantic_argmax(
+            &output[output.len() - config.hidden_size..],
+            &head.values,
+            config.hidden_size,
+            config.vocab_size,
+        );
+        let full_token = cpu_semantic_argmax(
+            &baseline[baseline.len() - config.hidden_size..],
+            &head.values,
+            config.hidden_size,
+            config.vocab_size,
+        );
+        if cached_token != full_token {
+            anyhow::bail!(
+                "cached semantic token {cached_token} differs from full token {full_token}"
+            );
+        }
+        println!("cached/full delta: max {max:.7}, mean {mean:.7}, semantic token {cached_token}");
+    }
     compare_reference(&output, reference, 0.05)?;
     Ok(())
+}
+
+fn cpu_semantic_argmax(
+    hidden: &[f32],
+    weight: &[half::f16],
+    hidden_size: usize,
+    vocab_size: usize,
+) -> usize {
+    let mut best_token = 0usize;
+    let mut best_logit = f32::NEG_INFINITY;
+    for token in 0..vocab_size {
+        let row = &weight[token * hidden_size..(token + 1) * hidden_size];
+        let logit = hidden
+            .iter()
+            .zip(row)
+            .map(|(value, weight)| value * weight.to_f32())
+            .sum::<f32>();
+        if logit > best_logit {
+            best_logit = logit;
+            best_token = token;
+        }
+    }
+    best_token
 }
 
 fn compare_reference(

@@ -8,7 +8,10 @@ pub use codec::CodecQuantizer;
 pub use config::{
     CodePredictorConfig, ModelType, Qwen3TtsConfig, SpeakerEncoderConfig, TalkerConfig,
 };
-pub use cuda::{TalkerDecoderLayer, TalkerLayerKvCache, TalkerLayerScratch, TalkerTransformer};
+pub use cuda::{
+    TalkerDecoderLayer, TalkerGenerationSession, TalkerLayerKvCache, TalkerLayerScratch,
+    TalkerTransformer,
+};
 pub use frontend::TalkerFrontend;
 pub use predictor::CodePredictorTransformer;
 

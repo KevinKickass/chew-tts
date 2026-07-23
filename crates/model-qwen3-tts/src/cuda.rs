@@ -9,7 +9,7 @@ use std::sync::Arc;
 mod device;
 mod stack;
 
-pub use stack::TalkerTransformer;
+pub use stack::{TalkerGenerationSession, TalkerTransformer};
 
 /// One native CUDA Qwen3-TTS talker decoder layer.
 ///

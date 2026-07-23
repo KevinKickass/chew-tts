@@ -13,6 +13,13 @@ pub struct TalkerTransformer {
     final_norm: CudaSlice<f16>,
 }
 
+/// Persistent KV caches and scratch buffers for talker generation.
+pub struct TalkerGenerationSession {
+    caches: Vec<TalkerLayerKvCache>,
+    scratch: TalkerLayerScratch,
+    max_seq_len: usize,
+}
+
 impl TalkerTransformer {
     pub fn load(
         model_dir: impl AsRef<Path>,
@@ -43,6 +50,94 @@ impl TalkerTransformer {
 
     pub fn layer_count(&self) -> usize {
         self.layers.len()
+    }
+
+    pub fn start_session(
+        &self,
+        max_seq_len: usize,
+        max_batch_tokens: usize,
+        config: &TalkerConfig,
+        stream: &Arc<CudaStream>,
+    ) -> anyhow::Result<TalkerGenerationSession> {
+        ensure!(max_seq_len > 0, "maximum sequence length must be non-zero");
+        ensure!(
+            max_batch_tokens > 0,
+            "maximum batch token count must be non-zero"
+        );
+        let caches = (0..self.layers.len())
+            .map(|_| TalkerLayerKvCache::allocate(max_seq_len, config, stream))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(TalkerGenerationSession {
+            caches,
+            scratch: TalkerLayerScratch::allocate(max_batch_tokens, config, stream)?,
+            max_seq_len,
+        })
+    }
+
+    /// Append prepared embeddings to a persistent generation session.
+    pub fn forward_session(
+        &self,
+        session: &mut TalkerGenerationSession,
+        hidden_host: &[f32],
+        seq_len: usize,
+        config: &TalkerConfig,
+        kernels: &mut GpuKernels,
+    ) -> anyhow::Result<Vec<f32>> {
+        ensure!(seq_len > 0, "sequence length must be non-zero");
+        ensure!(
+            seq_len <= session.scratch.max_tokens,
+            "sequence has {seq_len} tokens, scratch holds {}",
+            session.scratch.max_tokens
+        );
+        ensure!(
+            hidden_host.len() == seq_len * config.hidden_size,
+            "hidden input has {} values, expected {}",
+            hidden_host.len(),
+            seq_len * config.hidden_size
+        );
+        let position = session.position();
+        ensure!(
+            position + seq_len <= session.max_seq_len,
+            "session length {} exceeds maximum {}",
+            position + seq_len,
+            session.max_seq_len
+        );
+        let stream = Arc::clone(kernels.ops.stream());
+        let mut hidden = stream.clone_htod(hidden_host)?;
+        for ((layer, cache), expected_position) in self
+            .layers
+            .iter()
+            .zip(&mut session.caches)
+            .zip(std::iter::repeat(position))
+        {
+            ensure!(
+                cache.position() == expected_position,
+                "talker layer caches are out of sync"
+            );
+            layer.forward_cached_device(
+                &mut hidden,
+                seq_len,
+                config,
+                kernels,
+                cache,
+                &mut session.scratch,
+            )?;
+        }
+        kernels.ops.rms_norm_f32in(
+            &hidden,
+            &self.final_norm,
+            &mut session.scratch.norm,
+            seq_len as u32,
+            config.hidden_size as u32,
+            config.rms_norm_eps as f32,
+        )?;
+        stream.synchronize()?;
+        let mut output = vec![f16::ZERO; seq_len * config.hidden_size];
+        stream.memcpy_dtoh(
+            &session.scratch.norm.slice(..seq_len * config.hidden_size),
+            &mut output,
+        )?;
+        Ok(output.into_iter().map(f16::to_f32).collect())
     }
 
     /// Correctness-first stack execution from prepared talker embeddings.
@@ -102,5 +197,17 @@ impl TalkerTransformer {
             &mut output_f16,
         )?;
         Ok(output_f16.into_iter().map(f16::to_f32).collect())
+    }
+}
+
+impl TalkerGenerationSession {
+    pub fn position(&self) -> usize {
+        self.caches.first().map_or(0, TalkerLayerKvCache::position)
+    }
+
+    pub fn reset(&mut self) {
+        for cache in &mut self.caches {
+            cache.reset();
+        }
     }
 }
