@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 mod cuda;
 
-pub use cuda::ChatterboxT3Layer;
+pub use cuda::{ChatterboxT3Layer, ChatterboxT3Transformer};
 
 pub const TEXT_VOCAB_SIZE: usize = 2_454;
 pub const SPEECH_VOCAB_SIZE: usize = 8_194;

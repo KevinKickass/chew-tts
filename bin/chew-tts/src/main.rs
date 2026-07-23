@@ -1,6 +1,6 @@
 use anyhow::Context;
 use chew_model_chatterbox::{
-    ChatterboxT3Layer, HIDDEN_SIZE as CHATTERBOX_HIDDEN_SIZE,
+    ChatterboxT3Layer, ChatterboxT3Transformer, HIDDEN_SIZE as CHATTERBOX_HIDDEN_SIZE,
     INTERMEDIATE_SIZE as CHATTERBOX_INTERMEDIATE_SIZE, inspect_model as inspect_chatterbox_model,
 };
 use chew_model_kokoro::{KokoroVoice, inspect_model as inspect_kokoro_model};
@@ -100,6 +100,9 @@ enum Command {
         /// T3 decoder layer to validate.
         #[arg(long, default_value_t = 0)]
         layer: usize,
+        /// Run the complete 30-layer transformer and final norm.
+        #[arg(long)]
+        stack: bool,
     },
     /// Tokenize text with the model's local Qwen2 BPE files.
     Tokenize {
@@ -502,6 +505,7 @@ fn main() -> anyhow::Result<()> {
             model_dir,
             gpu,
             layer,
+            stack,
         } => {
             let allocator = chew_vram::VramAllocator::init()?;
             anyhow::ensure!(
@@ -515,18 +519,24 @@ fn main() -> anyhow::Result<()> {
                 CHATTERBOX_HIDDEN_SIZE * CHATTERBOX_INTERMEDIATE_SIZE,
                 CHATTERBOX_INTERMEDIATE_SIZE,
             )?;
-            let layer = ChatterboxT3Layer::load(&model_dir, layer, &stream)?;
             let hidden = (0..CHATTERBOX_HIDDEN_SIZE)
                 .map(|index| ((index as f32 * 0.013).sin() * 0.2) + 0.01)
                 .collect::<Vec<_>>();
-            let output = layer.forward_first_token(&hidden, &mut kernels)?;
+            let output = if stack {
+                ChatterboxT3Transformer::load(&model_dir, &stream)?
+                    .forward_first_token(&hidden, &mut kernels)?
+            } else {
+                ChatterboxT3Layer::load(&model_dir, layer, &stream)?
+                    .forward_first_token(&hidden, &mut kernels)?
+            };
             let sum = output.iter().map(|value| f64::from(*value)).sum::<f64>();
             let sum_sq = output
                 .iter()
                 .map(|value| f64::from(*value) * f64::from(*value))
                 .sum::<f64>();
             println!(
-                "Chatterbox T3 layer CUDA: sum={sum:.9}, sum_sq={sum_sq:.9}, first={:?}",
+                "Chatterbox T3 {} CUDA: sum={sum:.9}, sum_sq={sum_sq:.9}, first={:?}",
+                if stack { "stack" } else { "layer" },
                 &output[..8]
             );
         }
