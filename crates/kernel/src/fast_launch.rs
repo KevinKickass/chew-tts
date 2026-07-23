@@ -68,19 +68,21 @@ impl FastStream {
         smem: u32,
         args: &mut [*mut c_void],
     ) {
-        sys::cuLaunchKernel(
-            func.cu_function,
-            grid.0,
-            grid.1,
-            grid.2,
-            block.0,
-            block.1,
-            block.2,
-            smem,
-            self.raw,
-            args.as_mut_ptr(),
-            std::ptr::null_mut(),
-        );
+        unsafe {
+            sys::cuLaunchKernel(
+                func.cu_function,
+                grid.0,
+                grid.1,
+                grid.2,
+                block.0,
+                block.1,
+                block.2,
+                smem,
+                self.raw,
+                args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            );
+        }
         // Intentionally ignoring CUresult — check with sync_check() at end
     }
 

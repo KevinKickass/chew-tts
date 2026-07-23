@@ -1,10 +1,12 @@
 mod config;
 mod cuda;
+mod predictor;
 
 pub use config::{
     CodePredictorConfig, ModelType, Qwen3TtsConfig, SpeakerEncoderConfig, TalkerConfig,
 };
-pub use cuda::{TalkerDecoderLayer, TalkerLayerKvCache};
+pub use cuda::{TalkerDecoderLayer, TalkerLayerKvCache, TalkerLayerScratch, TalkerTransformer};
+pub use predictor::CodePredictorTransformer;
 
 use chew_safetensors::{MappedSafetensors, TensorInfo};
 use std::fs;

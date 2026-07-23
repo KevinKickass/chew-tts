@@ -6,6 +6,11 @@ use half::f16;
 use std::path::Path;
 use std::sync::Arc;
 
+mod device;
+mod stack;
+
+pub use stack::TalkerTransformer;
+
 /// One native CUDA Qwen3-TTS talker decoder layer.
 ///
 /// This intentionally owns unquantized f16 weights first. It gives us a small,
@@ -32,6 +37,48 @@ pub struct TalkerLayerKvCache {
     position: usize,
     max_seq_len: usize,
     kv_dim: usize,
+}
+
+/// Reusable device buffers shared by every talker layer.
+pub struct TalkerLayerScratch {
+    max_tokens: usize,
+    pub(crate) norm: CudaSlice<f16>,
+    q: CudaSlice<f16>,
+    k: CudaSlice<f16>,
+    v: CudaSlice<f16>,
+    attention: CudaSlice<f16>,
+    attention_out: CudaSlice<f16>,
+    gate: CudaSlice<f16>,
+    up: CudaSlice<f16>,
+    activation: CudaSlice<f16>,
+    mlp_out: CudaSlice<f16>,
+}
+
+impl TalkerLayerScratch {
+    pub fn allocate(
+        max_tokens: usize,
+        config: &TalkerConfig,
+        stream: &Arc<CudaStream>,
+    ) -> anyhow::Result<Self> {
+        ensure!(max_tokens > 0, "scratch capacity must be non-zero");
+        let hidden = config.hidden_size;
+        let q_dim = config.num_attention_heads * config.head_dim;
+        let kv_dim = config.num_key_value_heads * config.head_dim;
+        let intermediate = config.intermediate_size;
+        Ok(Self {
+            max_tokens,
+            norm: stream.alloc_zeros::<f16>(max_tokens * hidden)?,
+            q: stream.alloc_zeros::<f16>(max_tokens * q_dim)?,
+            k: stream.alloc_zeros::<f16>(max_tokens * kv_dim)?,
+            v: stream.alloc_zeros::<f16>(max_tokens * kv_dim)?,
+            attention: stream.alloc_zeros::<f16>(max_tokens * q_dim)?,
+            attention_out: stream.alloc_zeros::<f16>(max_tokens * hidden)?,
+            gate: stream.alloc_zeros::<f16>(max_tokens * intermediate)?,
+            up: stream.alloc_zeros::<f16>(max_tokens * intermediate)?,
+            activation: stream.alloc_zeros::<f16>(max_tokens * intermediate)?,
+            mlp_out: stream.alloc_zeros::<f16>(max_tokens * hidden)?,
+        })
+    }
 }
 
 impl TalkerLayerKvCache {
@@ -67,7 +114,20 @@ impl TalkerDecoderLayer {
         config: &TalkerConfig,
         stream: &Arc<CudaStream>,
     ) -> anyhow::Result<Self> {
-        let prefix = format!("talker.model.layers.{layer_index}");
+        Self::load_from_prefix(
+            model_dir,
+            &format!("talker.model.layers.{layer_index}"),
+            config,
+            stream,
+        )
+    }
+
+    pub(super) fn load_from_prefix(
+        model_dir: impl AsRef<Path>,
+        prefix: &str,
+        config: &TalkerConfig,
+        stream: &Arc<CudaStream>,
+    ) -> anyhow::Result<Self> {
         let load = |suffix: &str, expected: &[usize]| -> anyhow::Result<CudaSlice<f16>> {
             let name = format!("{prefix}.{suffix}");
             let tensor = load_f16_tensor(model_dir.as_ref(), &name)

@@ -415,4 +415,89 @@ __global__ void gemv_dual_q4_k(const void* __restrict__ W_gate,
 // gemv_qkv_q4_k removed — replaced by separate Q GEMV + K+V dual GEMV.
 // The 3-matrix fused kernel had register pressure issues causing corrupted output.
 
+// ============================================================================
+// Dense f16 GEMV for native Safetensors weights
+// ============================================================================
+// One 256-thread block computes one output row with f32 accumulation.
+__global__ void gemv_f16(const __half* __restrict__ x,
+                         const __half* __restrict__ weight,
+                         __half* __restrict__ out,
+                         int N,
+                         int K) {
+    const int row = blockIdx.x;
+    if (row >= N) return;
+    const int tid = threadIdx.x;
+    const __half* w = weight + (long long)row * K;
+    float sum = 0.0f;
+    for (int col = tid; col < K; col += blockDim.x) {
+        sum += __half2float(x[col]) * __half2float(w[col]);
+    }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+    }
+    __shared__ float warp_sums[8];
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    if (lane == 0) warp_sums[warp] = sum;
+    __syncthreads();
+    if (warp == 0) {
+        sum = lane < 8 ? warp_sums[lane] : 0.0f;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+        }
+        if (lane == 0) out[row] = __float2half(sum);
+    }
+}
+
+// Gate and up projections share the input read and launch overhead.
+__global__ void gemv_dual_f16(const __half* __restrict__ x,
+                              const __half* __restrict__ gate_weight,
+                              const __half* __restrict__ up_weight,
+                              __half* __restrict__ gate_out,
+                              __half* __restrict__ up_out,
+                              int N,
+                              int K) {
+    const int row = blockIdx.x;
+    if (row >= N) return;
+    const int tid = threadIdx.x;
+    const __half* gate = gate_weight + (long long)row * K;
+    const __half* up = up_weight + (long long)row * K;
+    float gate_sum = 0.0f;
+    float up_sum = 0.0f;
+    for (int col = tid; col < K; col += blockDim.x) {
+        const float value = __half2float(x[col]);
+        gate_sum += value * __half2float(gate[col]);
+        up_sum += value * __half2float(up[col]);
+    }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        gate_sum += __shfl_down_sync(0xFFFFFFFF, gate_sum, offset);
+        up_sum += __shfl_down_sync(0xFFFFFFFF, up_sum, offset);
+    }
+    __shared__ float gate_warp_sums[8];
+    __shared__ float up_warp_sums[8];
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    if (lane == 0) {
+        gate_warp_sums[warp] = gate_sum;
+        up_warp_sums[warp] = up_sum;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        gate_sum = lane < 8 ? gate_warp_sums[lane] : 0.0f;
+        up_sum = lane < 8 ? up_warp_sums[lane] : 0.0f;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            gate_sum += __shfl_down_sync(0xFFFFFFFF, gate_sum, offset);
+            up_sum += __shfl_down_sync(0xFFFFFFFF, up_sum, offset);
+        }
+        if (lane == 0) {
+            gate_out[row] = __float2half(gate_sum);
+            up_out[row] = __float2half(up_sum);
+        }
+    }
+}
+
 } // extern "C"

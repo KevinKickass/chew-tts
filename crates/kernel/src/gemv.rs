@@ -1,6 +1,6 @@
 use crate::fast_launch::{FastStream, scalar_ptr, slice_ptr, slice_ptr_mut, view_ptr};
 use crate::loader::{self, KernelError};
-use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, CudaStream, CudaView, LaunchConfig};
+use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, CudaStream, CudaView};
 use std::sync::Arc;
 
 const GEMV_CU: &str = include_str!("cuda/gemv.cu");
@@ -10,13 +10,14 @@ const GEMV_CU: &str = include_str!("cuda/gemv.cu");
 /// Two-phase: quantize x to Q8_1 once, then GEMV reads int8 input.
 pub struct GemvKernels {
     fast: FastStream,
-    stream: Arc<CudaStream>,
     _module: Arc<CudaModule>,
     quantize_x: CudaFunction,
     q4_k: CudaFunction,
     dual_q4_k: CudaFunction,
     q6_k: CudaFunction,
     q8_0: CudaFunction,
+    f16: CudaFunction,
+    dual_f16: CudaFunction,
     /// Pre-allocated Q8_1 buffer for input vector (max_k / 32 * 36 bytes)
     /// Q8_1 format: half2 ds (4 bytes) + int8_t qs[32] = 36 bytes per block
     x_q8: CudaSlice<u8>,
@@ -34,12 +35,13 @@ impl GemvKernels {
 
         Ok(Self {
             fast: FastStream::new(stream),
-            stream: Arc::clone(stream),
             quantize_x: loader::get_fn(&module, "quantize_x_q8_1")?,
             q4_k: loader::get_fn(&module, "gemv_q4_k")?,
             dual_q4_k: loader::get_fn(&module, "gemv_dual_q4_k")?,
             q6_k: loader::get_fn(&module, "gemv_q6_k")?,
             q8_0: loader::get_fn(&module, "gemv_q8_0")?,
+            f16: loader::get_fn(&module, "gemv_f16")?,
+            dual_f16: loader::get_fn(&module, "gemv_dual_f16")?,
             _module: module,
             x_q8,
         })
@@ -181,12 +183,6 @@ impl GemvKernels {
             return Ok(false);
         }
 
-        let cfg = LaunchConfig {
-            grid_dim: (n, 1, 1),
-            block_dim: (128, 1, 1),
-            shared_mem_bytes: 0,
-        };
-
         let n_i32 = n as i32;
         let k_i32 = k as i32;
 
@@ -204,5 +200,59 @@ impl GemvKernels {
                 .fire(&self.dual_q4_k, (n, 1, 1), (128, 1, 1), 0, &mut args);
         }
         Ok(true)
+    }
+
+    /// Dense f16 GEMV for native row-major Safetensors weights.
+    pub fn gemv_f16(
+        &self,
+        x: &CudaSlice<half::f16>,
+        weight: &CudaSlice<half::f16>,
+        out: &mut CudaSlice<half::f16>,
+        n: u32,
+        k: u32,
+    ) -> Result<(), KernelError> {
+        let n_i32 = n as i32;
+        let k_i32 = k as i32;
+        let mut args = [
+            slice_ptr(x),
+            slice_ptr(weight),
+            slice_ptr_mut(out),
+            scalar_ptr(&n_i32),
+            scalar_ptr(&k_i32),
+        ];
+        unsafe {
+            self.fast
+                .fire(&self.f16, (n, 1, 1), (256, 1, 1), 0, &mut args);
+        }
+        Ok(())
+    }
+
+    /// Fused dense f16 gate/up GEMV.
+    pub fn gemv_dual_f16(
+        &self,
+        x: &CudaSlice<half::f16>,
+        gate_weight: &CudaSlice<half::f16>,
+        up_weight: &CudaSlice<half::f16>,
+        gate_out: &mut CudaSlice<half::f16>,
+        up_out: &mut CudaSlice<half::f16>,
+        n: u32,
+        k: u32,
+    ) -> Result<(), KernelError> {
+        let n_i32 = n as i32;
+        let k_i32 = k as i32;
+        let mut args = [
+            slice_ptr(x),
+            slice_ptr(gate_weight),
+            slice_ptr(up_weight),
+            slice_ptr_mut(gate_out),
+            slice_ptr_mut(up_out),
+            scalar_ptr(&n_i32),
+            scalar_ptr(&k_i32),
+        ];
+        unsafe {
+            self.fast
+                .fire(&self.dual_f16, (n, 1, 1), (256, 1, 1), 0, &mut args);
+        }
+        Ok(())
     }
 }

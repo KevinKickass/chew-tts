@@ -22,11 +22,13 @@ Implemented:
 - inspection of real Hugging Face model directories;
 - native F16 CUDA execution of a complete Qwen talker decoder layer;
 - causal multi-token prefill and incremental decoding with a native KV cache;
+- GPU-resident execution of all 28 talker layers without host round-trips;
+- a native dense F16 decode GEMV path;
+- GPU-resident execution of the five-layer Qwen code predictor;
 - PyTorch parity checks for real Qwen weights, RoPE, GQA, and cached decoding.
 
 Next:
 
-- GPU-resident execution of the complete 28-layer talker;
 - code-predictor decode and GPU-side sampling;
 - one CUDA graph for a complete 16-codebook audio frame;
 - the 12 Hz speech-tokenizer decoder;
@@ -101,6 +103,21 @@ An optional raw little-endian F32 output can be supplied with `--reference`.
 The command then fails if CUDA and the reference differ beyond the configured
 correctness tolerance. `--decode-split` fills the KV cache with a prompt prefix
 and processes the remaining tokens individually.
+
+Run the complete talker stack from a prepared hidden state:
+
+```bash
+CARGO_TARGET_DIR=/tmp/chew-tts-target \
+  cargo run --release -p chew-tts -- \
+  cuda-talker-smoke /models/Qwen3-TTS-12Hz-1.7B-VoiceDesign --gpu 0
+```
+
+On an RTX 3080, the initial dense F16 implementation loads the 28-layer talker
+into approximately 2.7 GiB of VRAM and executes one synthetic decode token in
+approximately 7 ms. The five-layer code predictor occupies another 172 MiB and
+executes in approximately 0.7 ms per codebook step. Talker plus 15 predictor
+steps therefore take roughly 17 ms per 80-ms audio frame, before embeddings,
+sampling, and the speech codec.
 
 ## Requirements
 

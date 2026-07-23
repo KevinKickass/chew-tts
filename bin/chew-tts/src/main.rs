@@ -1,6 +1,7 @@
 use anyhow::Context;
 use chew_model_qwen3_tts::{
-    TalkerDecoderLayer, TalkerLayerKvCache, inspect_model, load_f16_tensor,
+    CodePredictorTransformer, TalkerDecoderLayer, TalkerLayerKvCache, TalkerTransformer,
+    inspect_model, load_f16_tensor,
 };
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -35,6 +36,9 @@ enum Command {
         /// Two-dimensional weight tensor to test.
         #[arg(long, default_value = "talker.model.layers.0.self_attn.q_proj.weight")]
         tensor: String,
+        /// Use the native decode GEMV instead of cuBLAS GEMM.
+        #[arg(long)]
+        gemv: bool,
     },
     /// Run one complete native Qwen talker decoder layer on CUDA.
     CudaLayerSmoke {
@@ -52,6 +56,34 @@ enum Command {
         /// Split after this many tokens and decode the remainder one-by-one.
         #[arg(long)]
         decode_split: Option<usize>,
+        /// Optional raw little-endian f32 reference output.
+        #[arg(long)]
+        reference: Option<PathBuf>,
+    },
+    /// Load and execute the complete GPU-resident Qwen talker stack.
+    CudaTalkerSmoke {
+        /// Directory containing config.json and Safetensors weights.
+        model_dir: PathBuf,
+        /// Zero-based CUDA device index.
+        #[arg(long, default_value_t = 0)]
+        gpu: usize,
+        /// Number of synthetic hidden-state tokens.
+        #[arg(long, default_value_t = 1)]
+        seq_len: usize,
+        /// Optional raw little-endian f32 reference output.
+        #[arg(long)]
+        reference: Option<PathBuf>,
+    },
+    /// Load and execute the complete Qwen code-predictor transformer.
+    CudaPredictorSmoke {
+        /// Directory containing config.json and Safetensors weights.
+        model_dir: PathBuf,
+        /// Zero-based CUDA device index.
+        #[arg(long, default_value_t = 0)]
+        gpu: usize,
+        /// Number of prepared predictor tokens.
+        #[arg(long, default_value_t = 1)]
+        seq_len: usize,
         /// Optional raw little-endian f32 reference output.
         #[arg(long)]
         reference: Option<PathBuf>,
@@ -118,7 +150,8 @@ fn main() -> anyhow::Result<()> {
             model_dir,
             gpu,
             tensor,
-        } => cuda_linear_smoke(&model_dir, gpu, &tensor)?,
+            gemv,
+        } => cuda_linear_smoke(&model_dir, gpu, &tensor, gemv)?,
         Command::CudaLayerSmoke {
             model_dir,
             gpu,
@@ -134,11 +167,184 @@ fn main() -> anyhow::Result<()> {
             decode_split,
             reference.as_deref(),
         )?,
+        Command::CudaTalkerSmoke {
+            model_dir,
+            gpu,
+            seq_len,
+            reference,
+        } => cuda_talker_smoke(&model_dir, gpu, seq_len, reference.as_deref())?,
+        Command::CudaPredictorSmoke {
+            model_dir,
+            gpu,
+            seq_len,
+            reference,
+        } => cuda_predictor_smoke(&model_dir, gpu, seq_len, reference.as_deref())?,
     }
     Ok(())
 }
 
-fn cuda_linear_smoke(model_dir: &PathBuf, gpu: usize, tensor_name: &str) -> anyhow::Result<()> {
+fn cuda_predictor_smoke(
+    model_dir: &PathBuf,
+    gpu: usize,
+    seq_len: usize,
+    reference: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    let inspection = inspect_model(model_dir)?;
+    let config = &inspection.config.talker_config.code_predictor_config;
+    if seq_len == 0 {
+        anyhow::bail!("sequence length must be non-zero");
+    }
+    let allocator = chew_vram::VramAllocator::init()?;
+    if gpu >= allocator.gpu_count() {
+        anyhow::bail!(
+            "GPU index {gpu} is out of range; detected {} device(s)",
+            allocator.gpu_count()
+        );
+    }
+    let free_before = allocator.free_bytes(gpu)?;
+    let stream = allocator.stream(gpu);
+    let mut kernels = chew_kernel::GpuKernels::load(
+        stream,
+        config.intermediate_size * config.hidden_size,
+        config.intermediate_size,
+    )?;
+    let load_started = std::time::Instant::now();
+    let predictor = CodePredictorTransformer::load(model_dir, config, stream)?;
+    let load_elapsed = load_started.elapsed();
+    let free_loaded = allocator.free_bytes(gpu)?;
+
+    let hidden = (0..seq_len * config.hidden_size)
+        .map(|index| ((index as f32 + 1.0) * 0.013).sin() * 0.125)
+        .collect::<Vec<_>>();
+    let forward_started = std::time::Instant::now();
+    let output = predictor.forward_hidden(&hidden, seq_len, seq_len, &mut kernels)?;
+    let forward_elapsed = forward_started.elapsed();
+    let checksum = output
+        .iter()
+        .enumerate()
+        .map(|(index, value)| (index as f64 + 1.0) * f64::from(*value))
+        .sum::<f64>();
+    println!(
+        "{} predictor layers loaded in {:.3}s, {:.1} MiB VRAM",
+        predictor.layer_count(),
+        load_elapsed.as_secs_f64(),
+        free_before.saturating_sub(free_loaded) as f64 / 1024.0_f64.powi(2)
+    );
+    println!(
+        "{seq_len} token(s) forwarded in {:.3}ms, weighted checksum {checksum:.9}",
+        forward_elapsed.as_secs_f64() * 1000.0
+    );
+    compare_reference(&output, reference, 0.02)?;
+    Ok(())
+}
+
+fn cuda_talker_smoke(
+    model_dir: &PathBuf,
+    gpu: usize,
+    seq_len: usize,
+    reference: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    let inspection = inspect_model(model_dir)?;
+    let config = &inspection.config.talker_config;
+    if seq_len == 0 {
+        anyhow::bail!("sequence length must be non-zero");
+    }
+    let allocator = chew_vram::VramAllocator::init()?;
+    if gpu >= allocator.gpu_count() {
+        anyhow::bail!(
+            "GPU index {gpu} is out of range; detected {} device(s)",
+            allocator.gpu_count()
+        );
+    }
+    let free_before = allocator.free_bytes(gpu)?;
+    let stream = allocator.stream(gpu);
+    let mut kernels = chew_kernel::GpuKernels::load(
+        stream,
+        config.intermediate_size * config.hidden_size,
+        config.intermediate_size,
+    )?;
+    let load_started = std::time::Instant::now();
+    let talker = TalkerTransformer::load(model_dir, config, stream)?;
+    let load_elapsed = load_started.elapsed();
+    let free_loaded = allocator.free_bytes(gpu)?;
+
+    let hidden = (0..seq_len * config.hidden_size)
+        .map(|index| ((index as f32 + 1.0) * 0.013).sin() * 0.125)
+        .collect::<Vec<_>>();
+    let forward_started = std::time::Instant::now();
+    let output = talker.forward_hidden(&hidden, seq_len, seq_len, config, &mut kernels)?;
+    let forward_elapsed = forward_started.elapsed();
+    let checksum = output
+        .iter()
+        .enumerate()
+        .map(|(index, value)| (index as f64 + 1.0) * f64::from(*value))
+        .sum::<f64>();
+    println!(
+        "{} talker layers loaded in {:.3}s, {:.1} MiB VRAM",
+        talker.layer_count(),
+        load_elapsed.as_secs_f64(),
+        free_before.saturating_sub(free_loaded) as f64 / 1024.0_f64.powi(2)
+    );
+    println!(
+        "{seq_len} token(s) forwarded in {:.3}ms, weighted checksum {checksum:.9}",
+        forward_elapsed.as_secs_f64() * 1000.0
+    );
+    compare_reference(&output, reference, 0.05)?;
+    Ok(())
+}
+
+fn compare_reference(
+    output: &[f32],
+    reference: Option<&std::path::Path>,
+    tolerance: f32,
+) -> anyhow::Result<()> {
+    let Some(reference) = reference else {
+        return Ok(());
+    };
+    let bytes = std::fs::read(reference)?;
+    if bytes.len() != output.len() * 4 {
+        anyhow::bail!(
+            "{} has {} bytes, expected {} raw f32 bytes",
+            reference.display(),
+            bytes.len(),
+            output.len() * 4
+        );
+    }
+    let expected = bytes
+        .chunks_exact(4)
+        .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("four-byte chunk")))
+        .collect::<Vec<_>>();
+    let mut max_abs_error = 0.0f32;
+    let mut max_error_index = 0usize;
+    let mut mean_abs_error = 0.0f64;
+    for (index, (actual, expected)) in output.iter().zip(&expected).enumerate() {
+        let error = (actual - expected).abs();
+        if error > max_abs_error {
+            max_abs_error = error;
+            max_error_index = index;
+        }
+        mean_abs_error += f64::from(error);
+    }
+    mean_abs_error /= output.len() as f64;
+    if max_abs_error > tolerance {
+        anyhow::bail!(
+            "reference parity failed: max delta {max_abs_error:.7} exceeds {tolerance:.7}"
+        );
+    }
+    println!(
+        "reference delta: max {max_abs_error:.7} at {max_error_index} \
+         (CUDA {:.7}, reference {:.7}), mean {mean_abs_error:.7}",
+        output[max_error_index], expected[max_error_index]
+    );
+    Ok(())
+}
+
+fn cuda_linear_smoke(
+    model_dir: &PathBuf,
+    gpu: usize,
+    tensor_name: &str,
+    use_gemv: bool,
+) -> anyhow::Result<()> {
     let tensor = load_f16_tensor(model_dir, tensor_name)
         .with_context(|| format!("could not load tensor {tensor_name}"))?;
     let [n, k]: [usize; 2] = tensor
@@ -163,14 +369,24 @@ fn cuda_linear_smoke(model_dir: &PathBuf, gpu: usize, tensor_name: &str) -> anyh
     let input_gpu = stream.clone_htod(&input)?;
     let weights_gpu = stream.clone_htod(&tensor.values)?;
     let mut output_gpu = stream.alloc_zeros::<half::f16>(n)?;
-    kernels.gemm.matmul_f16(
-        &input_gpu,
-        &weights_gpu,
-        &mut output_gpu,
-        1,
-        n as u32,
-        k as u32,
-    )?;
+    if use_gemv {
+        kernels.gemv.gemv_f16(
+            &input_gpu,
+            &weights_gpu,
+            &mut output_gpu,
+            n as u32,
+            k as u32,
+        )?;
+    } else {
+        kernels.gemm.matmul_f16(
+            &input_gpu,
+            &weights_gpu,
+            &mut output_gpu,
+            1,
+            n as u32,
+            k as u32,
+        )?;
+    }
     let mut output = vec![half::f16::ZERO; n];
     stream.memcpy_dtoh(&output_gpu, &mut output)?;
 
@@ -191,7 +407,10 @@ fn cuda_linear_smoke(model_dir: &PathBuf, gpu: usize, tensor_name: &str) -> anyh
     if max_abs_error > 0.08 {
         anyhow::bail!("linear parity failed: maximum absolute error {max_abs_error:.6}");
     }
-    println!("linear parity passed for {tensor_name} [{n}, {k}], max abs error {max_abs_error:.6}");
+    println!(
+        "{} parity passed for {tensor_name} [{n}, {k}], max abs error {max_abs_error:.6}",
+        if use_gemv { "GEMV" } else { "GEMM" }
+    );
     Ok(())
 }
 

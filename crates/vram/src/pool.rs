@@ -2,7 +2,7 @@ use crate::allocator::{GpuBuffer, VramAllocator, VramError};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{debug, info, warn};
+use tracing::info;
 
 const SAFETY_MARGIN: u64 = 512 * 1024 * 1024; // 512 MB
 
