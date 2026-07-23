@@ -197,13 +197,15 @@ impl OpsKernels {
             scalar_ptr(&grp),
         ];
         unsafe {
-            self.fast.fire(
+            self.fast.launch(
                 &self.conv1d_causal_f16,
-                (seq_len, out_channels, 1),
-                (256, 1, 1),
-                0,
+                LaunchConfig {
+                    grid_dim: (seq_len, out_channels, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                },
                 &mut args,
-            );
+            )?;
         }
         Ok(())
     }
@@ -239,13 +241,15 @@ impl OpsKernels {
             scalar_ptr(&st),
         ];
         unsafe {
-            self.fast.fire(
+            self.fast.launch(
                 &self.conv_transpose1d_causal_f16,
-                (input_len * stride, out_channels, 1),
-                (256, 1, 1),
-                0,
+                LaunchConfig {
+                    grid_dim: (input_len * stride, out_channels, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                },
                 &mut args,
-            );
+            )?;
         }
         Ok(())
     }
