@@ -11,7 +11,8 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::io::{AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info};
@@ -39,8 +40,9 @@ struct AppState {
 
 #[derive(Deserialize)]
 struct SpeechRequest {
-    #[serde(default = "default_model")]
-    model: String,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(alias = "text")]
     input: String,
     #[serde(default = "default_voice")]
     voice: String,
@@ -70,9 +72,6 @@ struct SpeechRequest {
     reference_text: Option<String>,
 }
 
-fn default_model() -> String {
-    "tts-voice-design".into()
-}
 fn default_voice() -> String {
     "alloy".into()
 }
@@ -103,6 +102,72 @@ pub async fn run(
     max_frames: usize,
     queue_capacity: usize,
 ) -> anyhow::Result<()> {
+    let (state, load_elapsed) = start_engine(model_dir, gpu, max_frames, queue_capacity).await?;
+    let app = Router::new()
+        .route("/health", get(health))
+        .route("/v1/models", get(models))
+        .route("/v1/audio/speech", post(speech))
+        .route("/internal/audio/raw", post(raw_speech))
+        .with_state(Arc::clone(&state));
+    let listener = TcpListener::bind((host.as_str(), port)).await?;
+    info!(
+        host,
+        port,
+        load_seconds = load_elapsed.as_secs_f64(),
+        vram_mib = state.vram_bytes as f64 / 1024.0_f64.powi(2),
+        protocol = "http",
+        "Chew TTS ready"
+    );
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+    Ok(())
+}
+
+/// Serves Fleet's existing one-request-per-connection protocol. The client
+/// writes one JSON object, half-closes the connection, and receives raw mono
+/// f32le samples at 24 kHz until EOF.
+pub async fn run_fleet(
+    model_dir: PathBuf,
+    gpu: usize,
+    host: String,
+    port: u16,
+    max_frames: usize,
+    queue_capacity: usize,
+) -> anyhow::Result<()> {
+    let (state, load_elapsed) = start_engine(model_dir, gpu, max_frames, queue_capacity).await?;
+    let listener = TcpListener::bind((host.as_str(), port)).await?;
+    info!(
+        host,
+        port,
+        load_seconds = load_elapsed.as_secs_f64(),
+        vram_mib = state.vram_bytes as f64 / 1024.0_f64.powi(2),
+        protocol = "fleet-tcp",
+        "Chew TTS ready"
+    );
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (stream, peer) = accepted?;
+                let state = Arc::clone(&state);
+                tokio::spawn(async move {
+                    if let Err(message) = handle_fleet_connection(stream, state).await {
+                        error!(%peer, error = %message, "Fleet TTS request failed");
+                    }
+                });
+            }
+            _ = shutdown_signal() => break,
+        }
+    }
+    Ok(())
+}
+
+async fn start_engine(
+    model_dir: PathBuf,
+    gpu: usize,
+    max_frames: usize,
+    queue_capacity: usize,
+) -> anyhow::Result<(Arc<AppState>, std::time::Duration)> {
     anyhow::ensure!(queue_capacity > 0, "queue capacity must be non-zero");
     let (jobs, receiver) = mpsc::channel(queue_capacity);
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
@@ -131,30 +196,15 @@ pub async fn run(
         .map_err(|_| anyhow::anyhow!("GPU worker exited during startup"))?
         .map_err(anyhow::Error::msg)?;
 
-    let state = Arc::new(AppState {
-        jobs,
-        model,
-        max_frames,
-        vram_bytes,
-    });
-    let app = Router::new()
-        .route("/health", get(health))
-        .route("/v1/models", get(models))
-        .route("/v1/audio/speech", post(speech))
-        .route("/internal/audio/raw", post(raw_speech))
-        .with_state(state);
-    let listener = tokio::net::TcpListener::bind((host.as_str(), port)).await?;
-    info!(
-        host,
-        port,
-        load_seconds = load_elapsed.as_secs_f64(),
-        vram_mib = vram_bytes as f64 / 1024.0_f64.powi(2),
-        "Chew TTS ready"
-    );
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
-    Ok(())
+    Ok((
+        Arc::new(AppState {
+            jobs,
+            model,
+            max_frames,
+            vram_bytes,
+        }),
+        load_elapsed,
+    ))
 }
 
 async fn shutdown_signal() {
@@ -237,12 +287,15 @@ async fn raw_speech(
     State(state): State<Arc<AppState>>,
     Json(request): Json<SpeechRequest>,
 ) -> Response {
+    let speed = request.speed;
     match submit(&state, request).await {
         Ok(audio) => {
-            let mut raw = Vec::with_capacity(audio.samples.len() * 4);
-            for sample in audio.samples {
-                raw.extend_from_slice(&sample.to_le_bytes());
-            }
+            let raw = match raw_f32le(audio.samples, speed).await {
+                Ok(raw) => raw,
+                Err(message) => {
+                    return error_response(StatusCode::INTERNAL_SERVER_ERROR, &message);
+                }
+            };
             Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, "audio/x-f32le")
@@ -256,6 +309,38 @@ async fn raw_speech(
         }
         Err(response) => response,
     }
+}
+
+const MAX_FLEET_REQUEST_BYTES: u64 = 40 * 1024 * 1024;
+
+async fn handle_fleet_connection(
+    mut stream: TcpStream,
+    state: Arc<AppState>,
+) -> Result<(), String> {
+    let mut body = Vec::new();
+    (&mut stream)
+        .take(MAX_FLEET_REQUEST_BYTES + 1)
+        .read_to_end(&mut body)
+        .await
+        .map_err(|error| format!("could not read request: {error}"))?;
+    if body.len() as u64 > MAX_FLEET_REQUEST_BYTES {
+        return Err("request exceeds 40 MiB".into());
+    }
+    let request: SpeechRequest =
+        serde_json::from_slice(&body).map_err(|error| format!("invalid request JSON: {error}"))?;
+    let speed = request.speed;
+    let audio = submit(&state, request)
+        .await
+        .map_err(|_| "synthesis request was rejected".to_string())?;
+    let raw = raw_f32le(audio.samples, speed).await?;
+    stream
+        .write_all(&raw)
+        .await
+        .map_err(|error| format!("could not write audio: {error}"))?;
+    stream
+        .shutdown()
+        .await
+        .map_err(|error| format!("could not finish response: {error}"))
 }
 
 async fn submit(state: &Arc<AppState>, request: SpeechRequest) -> Result<GeneratedAudio, Response> {
@@ -277,16 +362,23 @@ async fn submit(state: &Arc<AppState>, request: SpeechRequest) -> Result<Generat
             "speed must be between 0.25 and 4.0",
         ));
     }
-    if request.model != state.model
-        && !matches!(
-            request.model.as_str(),
-            "qwen3-tts-voice-design" | "qwen3-tts-customvoice" | "qwen3-tts"
-        )
-    {
-        return Err(error_response(
-            StatusCode::BAD_REQUEST,
-            &format!("unsupported model {:?}", request.model),
-        ));
+    if let Some(model) = request.model.as_deref() {
+        if model != state.model
+            && !matches!(
+                model,
+                "qwen3-tts-voice-design"
+                    | "qwen3-tts-customvoice"
+                    | "qwen3-tts"
+                    | "tts-multilingual"
+                    | "tts-premium"
+                    | "tts-voice-clone"
+            )
+        {
+            return Err(error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("unsupported model {model:?}"),
+            ));
+        }
     }
     let instruction = request
         .instruct
@@ -444,6 +536,21 @@ async fn encode_audio(
     transcode(samples, format, speed).await
 }
 
+async fn raw_f32le(samples: Vec<f32>, speed: f32) -> Result<Vec<u8>, String> {
+    if speed == 1.0 {
+        let mut raw = Vec::with_capacity(samples.len() * 4);
+        for sample in samples {
+            raw.extend_from_slice(&sample.to_le_bytes());
+        }
+        return Ok(raw);
+    }
+    transcode_raw(samples, speed).await
+}
+
+async fn transcode_raw(samples: Vec<f32>, speed: f32) -> Result<Vec<u8>, String> {
+    run_ffmpeg(samples, speed, "pcm_f32le", "f32le").await
+}
+
 async fn transcode(samples: Vec<f32>, format: AudioFormat, speed: f32) -> Result<Vec<u8>, String> {
     let (codec, container) = match format {
         AudioFormat::Mp3 => ("libmp3lame", "mp3"),
@@ -453,6 +560,15 @@ async fn transcode(samples: Vec<f32>, format: AudioFormat, speed: f32) -> Result
         AudioFormat::Wav => ("pcm_s16le", "wav"),
         AudioFormat::Pcm => ("pcm_s16le", "s16le"),
     };
+    run_ffmpeg(samples, speed, codec, container).await
+}
+
+async fn run_ffmpeg(
+    samples: Vec<f32>,
+    speed: f32,
+    codec: &str,
+    container: &str,
+) -> Result<Vec<u8>, String> {
     let mut raw = Vec::with_capacity(samples.len() * 4);
     for sample in samples {
         raw.extend_from_slice(&sample.to_le_bytes());
@@ -598,5 +714,26 @@ mod tests {
         assert_eq!(&wav[8..12], b"WAVE");
         assert_eq!(u32::from_le_bytes(wav[40..44].try_into().unwrap()), 4);
         assert_eq!(&wav[44..], &pcm);
+    }
+
+    #[test]
+    fn accepts_fleet_text_field_and_voice_clone_extensions() {
+        let request: SpeechRequest = serde_json::from_value(json!({
+            "text": "Guten Abend.",
+            "voice": "clone",
+            "language": "de",
+            "instruct": "Leise und freundlich.",
+            "reference_audio": "UklGRg==",
+            "reference_text": "Guten Abend.",
+            "speed": 1.1
+        }))
+        .unwrap();
+
+        assert_eq!(request.input, "Guten Abend.");
+        assert_eq!(request.language, "de");
+        assert_eq!(request.instruct.as_deref(), Some("Leise und freundlich."));
+        assert_eq!(request.reference_text.as_deref(), Some("Guten Abend."));
+        assert_eq!(request.speed, 1.1);
+        assert!(request.model.is_none());
     }
 }

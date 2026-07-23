@@ -44,6 +44,26 @@ enum Command {
         #[arg(long, default_value_t = 16)]
         queue_capacity: usize,
     },
+    /// Run Fleet's raw JSON-over-TCP protocol and return f32le/24 kHz audio.
+    FleetServe {
+        /// Qwen3-TTS model directory.
+        model_dir: PathBuf,
+        /// Zero-based CUDA device index.
+        #[arg(long, default_value_t = 0)]
+        gpu: usize,
+        /// Listen address.
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// Listen port.
+        #[arg(long, default_value_t = 18001)]
+        port: u16,
+        /// Per-request codec-frame safety limit and session capacity.
+        #[arg(long, default_value_t = 2048)]
+        max_frames: usize,
+        /// Maximum number of waiting synthesis requests.
+        #[arg(long, default_value_t = 16)]
+        queue_capacity: usize,
+    },
     /// Validate a Qwen3-TTS model and print its inference geometry.
     Inspect {
         /// Directory containing config.json and Safetensors weights.
@@ -306,6 +326,24 @@ fn main() -> anyhow::Result<()> {
             .enable_all()
             .build()?
             .block_on(server::run(
+                model_dir,
+                gpu,
+                host,
+                port,
+                max_frames,
+                queue_capacity,
+            ))?,
+        Command::FleetServe {
+            model_dir,
+            gpu,
+            host,
+            port,
+            max_frames,
+            queue_capacity,
+        } => tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?
+            .block_on(server::run_fleet(
                 model_dir,
                 gpu,
                 host,

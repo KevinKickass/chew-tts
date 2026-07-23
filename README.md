@@ -336,6 +336,22 @@ Responses include `server-timing`, `x-sllm-audio-duration-ms`, and
 requests completed without model reload; the WAV response was byte-identical
 to the validated CLI output.
 
+For a Fleet GPU host, the same native engine can speak the existing
+JSON-over-TCP worker protocol directly:
+
+```bash
+chew-tts fleet-serve /models/Qwen3-TTS-12Hz-1.7B-Base \
+  --gpu 0 --host 0.0.0.0 --port 18001
+```
+
+Each connection carries one JSON request (Fleet's `text` field is accepted as
+an alias for `input`) and returns mono 24-kHz `f32le` samples. Voice,
+instruction, reference audio, reference transcript, language, sampling, and
+speed fields use the same native synthesis path as HTTP. This mode has no
+Python or PyTorch runtime dependency. A local RTX 3080 protocol test generated
+4.16 seconds of audio in about 1.1 seconds; `speed: 2.0` returned the expected
+2.08-second raw stream.
+
 ## Requirements
 
 - NVIDIA GPU with compute capability 7.0 or newer
