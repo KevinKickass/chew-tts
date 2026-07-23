@@ -346,10 +346,16 @@ impl VoiceDesignEngine {
         let prompt_elapsed = prompt_started.elapsed();
 
         let generation_started = Instant::now();
-        // ICL decoding needs the reference codec frames as left context. The
-        // official implementation decodes reference + generated frames in one
-        // pass and removes the reference portion afterwards.
-        let chunk_frames = if wants_icl { 0 } else { request.chunk_frames };
+        // ICL decoding needs the reference codec frames as left context. Prime
+        // the stateful codec decoder with that context in bounded chunks and
+        // discard its audio. Decoding reference + generated frames in one large
+        // pass creates prohibitively large temporary vocoder tensors for long
+        // requests and can exhaust/poison the CUDA context.
+        let chunk_frames = if wants_icl {
+            request.chunk_frames.clamp(1, 64)
+        } else {
+            request.chunk_frames
+        };
         let reference_frames = if wants_icl {
             base_codes.as_ref().map_or(0, Vec::len)
         } else {
@@ -358,9 +364,12 @@ impl VoiceDesignEngine {
         let mut pending = Vec::with_capacity(chunk_frames.max(1));
         let mut transformed_context = Vec::with_capacity(1024 * request.chunk_context);
         let mut codec_session = if chunk_frames > 0 {
+            let codec_capacity = reference_frames
+                .checked_add(request.max_frames)
+                .context("reference plus generation frame count overflow")?;
             Some(
                 self.codec
-                    .start_transformer_session(request.max_frames, &self.stream)?,
+                    .start_transformer_session(codec_capacity, &self.stream)?,
             )
         } else {
             None
@@ -376,6 +385,41 @@ impl VoiceDesignEngine {
         };
         let mut samples = Vec::new();
         let mut codec_elapsed = Duration::ZERO;
+        if wants_icl {
+            let mut discarded_reference_samples = Vec::new();
+            for frame in base_codes
+                .as_deref()
+                .context("Base reference codec frames are unavailable")?
+            {
+                pending.push(frame.clone());
+                if pending.len() >= chunk_frames {
+                    codec_elapsed += decode_codec_chunk(
+                        &self.codec,
+                        &mut pending,
+                        &mut transformed_context,
+                        codec_session
+                            .as_mut()
+                            .expect("ICL decoding has a codec transformer session"),
+                        request.chunk_context,
+                        &mut discarded_reference_samples,
+                        &mut self.kernels,
+                    )?;
+                }
+            }
+            if !pending.is_empty() {
+                codec_elapsed += decode_codec_chunk(
+                    &self.codec,
+                    &mut pending,
+                    &mut transformed_context,
+                    codec_session
+                        .as_mut()
+                        .expect("ICL decoding has a codec transformer session"),
+                    request.chunk_context,
+                    &mut discarded_reference_samples,
+                    &mut self.kernels,
+                )?;
+            }
+        }
         let mut generated_frames = 0usize;
         for frame_index in 0..request.max_frames {
             if semantic == 2_150 {
@@ -464,13 +508,6 @@ impl VoiceDesignEngine {
             samples = self
                 .codec
                 .decode_frames_audio(&all_frames, &mut self.kernels)?;
-            if reference_frames > 0 {
-                let cut = reference_frames
-                    .saturating_mul(samples.len())
-                    .checked_div(all_frames.len())
-                    .unwrap_or_default();
-                samples.drain(..cut.min(samples.len()));
-            }
             codec_elapsed = decode_started.elapsed();
         } else if !pending.is_empty() {
             codec_elapsed += decode_codec_chunk(
