@@ -25,6 +25,20 @@ struct CodecTransformerLayer {
     mlp_scale: CudaSlice<f16>,
 }
 
+struct CodecUpsampleStage {
+    transposed_weight: CudaSlice<f16>,
+    transposed_bias: CudaSlice<f16>,
+    depthwise_weight: CudaSlice<f16>,
+    depthwise_bias: CudaSlice<f16>,
+    norm_weight: CudaSlice<f16>,
+    norm_bias: CudaSlice<f16>,
+    pointwise_in_weight: CudaSlice<f16>,
+    pointwise_in_bias: CudaSlice<f16>,
+    pointwise_out_weight: CudaSlice<f16>,
+    pointwise_out_bias: CudaSlice<f16>,
+    gamma: CudaSlice<f16>,
+}
+
 /// Qwen 12-Hz codec codebooks and their 1x1 output projections.
 pub struct CodecQuantizer {
     first_codebook: CudaSlice<f16>,
@@ -39,6 +53,7 @@ pub struct CodecQuantizer {
     transformer_norm: CudaSlice<f16>,
     transformer_output_weight: CudaSlice<f16>,
     transformer_output_bias: CudaSlice<f16>,
+    upsample_stages: Vec<CodecUpsampleStage>,
 }
 
 impl CodecQuantizer {
@@ -135,6 +150,23 @@ impl CodecQuantizer {
                 mlp_scale: load(&format!("{prefix}.mlp_layer_scale.scale"), &[512])?,
             });
         }
+        let mut upsample_stages = Vec::with_capacity(2);
+        for stage in 0..2 {
+            let prefix = format!("decoder.upsample.{stage}");
+            upsample_stages.push(CodecUpsampleStage {
+                transposed_weight: load(&format!("{prefix}.0.conv.weight"), &[1024, 1024, 2])?,
+                transposed_bias: load(&format!("{prefix}.0.conv.bias"), &[1024])?,
+                depthwise_weight: load(&format!("{prefix}.1.dwconv.conv.weight"), &[1024, 1, 7])?,
+                depthwise_bias: load(&format!("{prefix}.1.dwconv.conv.bias"), &[1024])?,
+                norm_weight: load(&format!("{prefix}.1.norm.weight"), &[1024])?,
+                norm_bias: load(&format!("{prefix}.1.norm.bias"), &[1024])?,
+                pointwise_in_weight: load(&format!("{prefix}.1.pwconv1.weight"), &[4096, 1024])?,
+                pointwise_in_bias: load(&format!("{prefix}.1.pwconv1.bias"), &[4096])?,
+                pointwise_out_weight: load(&format!("{prefix}.1.pwconv2.weight"), &[1024, 4096])?,
+                pointwise_out_bias: load(&format!("{prefix}.1.pwconv2.bias"), &[1024])?,
+                gamma: load(&format!("{prefix}.1.gamma"), &[1024])?,
+            });
+        }
         Ok(Self {
             first_codebook,
             rest_codebooks,
@@ -151,6 +183,7 @@ impl CodecQuantizer {
                 &[1024, 512],
             )?,
             transformer_output_bias: load("decoder.pre_transformer.output_proj.bias", &[1024])?,
+            upsample_stages,
         })
     }
 
@@ -414,6 +447,141 @@ impl CodecQuantizer {
         stream.synchronize()?;
         let mut output_host = vec![f16::ZERO; 1024];
         stream.memcpy_dtoh(&output, &mut output_host)?;
+        Ok(output_host.into_iter().map(f16::to_f32).collect())
+    }
+
+    /// Run the codec front end through both 2x ConvNeXt upsampling stages.
+    pub fn decode_frame_upsampled(
+        &self,
+        codes: &[i32],
+        kernels: &mut GpuKernels,
+    ) -> anyhow::Result<Vec<f32>> {
+        const CHANNELS: usize = 1024;
+        const EXPANDED: usize = 4096;
+        let transformed = self.decode_frame_transformer(codes, kernels)?;
+        let stream = Arc::clone(kernels.ops.stream());
+        let transformed = transformed
+            .into_iter()
+            .map(f16::from_f32)
+            .collect::<Vec<_>>();
+        let mut hidden = stream.clone_htod(&transformed)?;
+        let mut seq_len = 1usize;
+
+        for stage in &self.upsample_stages {
+            let output_len = seq_len * 2;
+            let mut residual = stream.alloc_zeros::<f16>(CHANNELS * output_len)?;
+            kernels.ops.conv_transpose1d_causal_f16(
+                &hidden,
+                &stage.transposed_weight,
+                &stage.transposed_bias,
+                &mut residual,
+                CHANNELS as u32,
+                CHANNELS as u32,
+                seq_len as u32,
+                2,
+                2,
+            )?;
+
+            let mut depthwise = stream.alloc_zeros::<f16>(CHANNELS * output_len)?;
+            kernels.ops.conv1d_causal_f16(
+                &residual,
+                &stage.depthwise_weight,
+                &stage.depthwise_bias,
+                &mut depthwise,
+                CHANNELS as u32,
+                CHANNELS as u32,
+                output_len as u32,
+                7,
+                1,
+                CHANNELS as u32,
+            )?;
+            let mut channel_last = stream.alloc_zeros::<f16>(CHANNELS * output_len)?;
+            kernels.ops.transpose_f16(
+                &depthwise,
+                &mut channel_last,
+                CHANNELS as u32,
+                output_len as u32,
+            )?;
+            let mut channel_last_f32 = stream.alloc_zeros::<f32>(CHANNELS * output_len)?;
+            kernels.ops.copy_f16_to_f32(
+                &channel_last,
+                &mut channel_last_f32,
+                (CHANNELS * output_len) as u32,
+            )?;
+            let mut normalized = stream.alloc_zeros::<f16>(CHANNELS * output_len)?;
+            kernels.ops.layer_norm_f32in(
+                &channel_last_f32,
+                &stage.norm_weight,
+                &stage.norm_bias,
+                &mut normalized,
+                output_len as u32,
+                CHANNELS as u32,
+                1e-6,
+            )?;
+
+            let mut expanded = stream.alloc_zeros::<f16>(EXPANDED * output_len)?;
+            kernels.gemm.matmul_f16(
+                &normalized,
+                &stage.pointwise_in_weight,
+                &mut expanded,
+                output_len as u32,
+                EXPANDED as u32,
+                CHANNELS as u32,
+            )?;
+            kernels.ops.add_bias_f16_inplace(
+                &mut expanded,
+                &stage.pointwise_in_bias,
+                output_len as u32,
+                EXPANDED as u32,
+            )?;
+            let mut activated = stream.alloc_zeros::<f16>(EXPANDED * output_len)?;
+            kernels
+                .ops
+                .gelu_erf_f16(&expanded, &mut activated, (EXPANDED * output_len) as u32)?;
+            let mut projected = stream.alloc_zeros::<f16>(CHANNELS * output_len)?;
+            kernels.gemm.matmul_f16(
+                &activated,
+                &stage.pointwise_out_weight,
+                &mut projected,
+                output_len as u32,
+                CHANNELS as u32,
+                EXPANDED as u32,
+            )?;
+            kernels.ops.add_bias_f16_inplace(
+                &mut projected,
+                &stage.pointwise_out_bias,
+                output_len as u32,
+                CHANNELS as u32,
+            )?;
+            let mut scaled = stream.alloc_zeros::<f16>(CHANNELS * output_len)?;
+            kernels.ops.mul_f16_broadcast(
+                &projected,
+                &stage.gamma,
+                &mut scaled,
+                (CHANNELS * output_len) as u32,
+                CHANNELS as u32,
+            )?;
+            let mut channel_first = stream.alloc_zeros::<f16>(CHANNELS * output_len)?;
+            kernels.ops.transpose_f16(
+                &scaled,
+                &mut channel_first,
+                output_len as u32,
+                CHANNELS as u32,
+            )?;
+            let mut output = stream.alloc_zeros::<f16>(CHANNELS * output_len)?;
+            kernels.ops.add_f16(
+                &residual,
+                &channel_first,
+                &mut output,
+                (CHANNELS * output_len) as u32,
+            )?;
+            hidden = output;
+            seq_len = output_len;
+        }
+
+        stream.synchronize()?;
+        let mut output_host = vec![f16::ZERO; CHANNELS * seq_len];
+        stream.memcpy_dtoh(&hidden, &mut output_host)?;
         Ok(output_host.into_iter().map(f16::to_f32).collect())
     }
 }

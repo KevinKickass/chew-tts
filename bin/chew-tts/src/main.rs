@@ -116,6 +116,12 @@ enum Command {
         /// Also run the codec's eight-layer pre-transformer.
         #[arg(long)]
         transformer: bool,
+        /// Also run both 2x ConvNeXt upsampling stages.
+        #[arg(long)]
+        upsample: bool,
+        /// Number of times to run the selected codec stage.
+        #[arg(long, default_value_t = 1)]
+        repeats: usize,
         /// Optional raw little-endian f32 reference latent.
         #[arg(long)]
         reference: Option<PathBuf>,
@@ -228,6 +234,8 @@ fn main() -> anyhow::Result<()> {
             codes,
             preconv,
             transformer,
+            upsample,
+            repeats,
             reference,
         } => cuda_codec_latent_smoke(
             &tokenizer_dir,
@@ -235,6 +243,8 @@ fn main() -> anyhow::Result<()> {
             &codes,
             preconv,
             transformer,
+            upsample,
+            repeats,
             reference.as_deref(),
         )?,
     }
@@ -247,8 +257,13 @@ fn cuda_codec_latent_smoke(
     codes: &str,
     preconv: bool,
     transformer: bool,
+    upsample: bool,
+    repeats: usize,
     reference: Option<&std::path::Path>,
 ) -> anyhow::Result<()> {
+    if repeats == 0 {
+        anyhow::bail!("repeats must be non-zero");
+    }
     let codes = codes
         .split(',')
         .map(|value| value.trim().parse::<i32>())
@@ -266,15 +281,33 @@ fn cuda_codec_latent_smoke(
     let mut kernels = chew_kernel::GpuKernels::load(stream, 512 * 256, 512)?;
     let quantizer = CodecQuantizer::load(tokenizer_dir, stream)?;
     let free_loaded = allocator.free_bytes(gpu)?;
+    if repeats > 1 {
+        if upsample {
+            quantizer.decode_frame_upsampled(&codes, &mut kernels)?;
+        } else if transformer {
+            quantizer.decode_frame_transformer(&codes, &mut kernels)?;
+        } else if preconv {
+            quantizer.decode_frame_preconv(&codes, &mut kernels)?;
+        } else {
+            quantizer.decode_frame(&codes, &mut kernels)?;
+        }
+    }
     let started = std::time::Instant::now();
-    let latent = if transformer {
-        quantizer.decode_frame_transformer(&codes, &mut kernels)?
-    } else if preconv {
-        quantizer.decode_frame_preconv(&codes, &mut kernels)?
-    } else {
-        quantizer.decode_frame(&codes, &mut kernels)?
-    };
-    let stage = if transformer {
+    let mut latent = Vec::new();
+    for _ in 0..repeats {
+        latent = if upsample {
+            quantizer.decode_frame_upsampled(&codes, &mut kernels)?
+        } else if transformer {
+            quantizer.decode_frame_transformer(&codes, &mut kernels)?
+        } else if preconv {
+            quantizer.decode_frame_preconv(&codes, &mut kernels)?
+        } else {
+            quantizer.decode_frame(&codes, &mut kernels)?
+        };
+    }
+    let stage = if upsample {
+        "upsampled"
+    } else if transformer {
         "transformer"
     } else if preconv {
         "pre-conv"
@@ -282,13 +315,18 @@ fn cuda_codec_latent_smoke(
         "quantizer"
     };
     println!(
-        "codec {}: {:.1} MiB VRAM, {:.3}ms, output[0..8]={:?}",
+        "codec {}: {:.1} MiB VRAM, {:.3}ms/run ({} run(s)), output[0..8]={:?}",
         stage,
         free_before.saturating_sub(free_loaded) as f64 / 1024.0_f64.powi(2),
-        started.elapsed().as_secs_f64() * 1000.0,
+        started.elapsed().as_secs_f64() * 1000.0 / repeats as f64,
+        repeats,
         &latent[..8]
     );
-    compare_reference(&latent, reference, if transformer { 0.1 } else { 0.02 })?;
+    compare_reference(
+        &latent,
+        reference,
+        if transformer || upsample { 0.1 } else { 0.02 },
+    )?;
     Ok(())
 }
 

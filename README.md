@@ -28,12 +28,13 @@ Implemented:
 - complete 15-codebook acoustic generation with GPU embeddings and argmax;
 - native decoding of all 16 codec codebooks into the 512-channel latent;
 - the codec's causal pre-convolution and eight-layer transformer on CUDA;
+- both 2x causal ConvNeXt codec upsampling stages;
 - PyTorch parity checks for real Qwen weights, RoPE, GQA, and cached decoding.
 
 Next:
 
 - one CUDA graph for a complete 16-codebook audio frame;
-- the convolutional upsampling stages of the 12 Hz speech-tokenizer decoder;
+- the BigVGAN waveform decoder of the 12 Hz speech tokenizer;
 - speaker and reference-audio encoders for voice cloning;
 - Kokoro as the second model family.
 
@@ -136,6 +137,12 @@ This codec front end uses approximately 108 MiB of VRAM and takes approximately
 0.8 ms per frame on an RTX 3080. Its output is checked against an independent
 F32 PyTorch implementation; the measured maximum absolute delta is below
 0.00005 for the documented validation frame.
+
+Add `--upsample --repeats 10` to validate and benchmark both causal ConvNeXt
+upsampling stages. After one cuBLAS warm-up pass, the complete path through the
+four 1024-channel output steps takes approximately 1.1 ms per frame on the same
+GPU. Against the independent F32 reference, the mean absolute delta is below
+0.002.
 
 ## Requirements
 

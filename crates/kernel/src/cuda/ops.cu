@@ -2145,4 +2145,87 @@ __global__ void conv1d_causal_f16(const __half* __restrict__ x,
     }
 }
 
+// Causal ConvTranspose1d over channel-first data. The untrimmed tail is
+// omitted, so output length is exactly input_len * stride.
+// weight: [in_channels, out_channels, kernel_size].
+__global__ void conv_transpose1d_causal_f16(
+    const __half* __restrict__ x,
+    const __half* __restrict__ weight,
+    const __half* __restrict__ bias,
+    __half* __restrict__ out,
+    int in_channels,
+    int out_channels,
+    int input_len,
+    int kernel_size,
+    int stride) {
+    const int out_channel = blockIdx.x;
+    const int position = blockIdx.y;
+    const int output_len = input_len * stride;
+    if (out_channel >= out_channels || position >= output_len) return;
+    float sum = 0.0f;
+    const int work = in_channels * kernel_size;
+    for (int item = threadIdx.x; item < work; item += blockDim.x) {
+        const int input_channel = item / kernel_size;
+        const int kernel_index = item % kernel_size;
+        const int source = position - kernel_index;
+        if (source >= 0 && source % stride == 0) {
+            const int input_position = source / stride;
+            if (input_position < input_len) {
+                const int input_index = input_channel * input_len + input_position;
+                const int weight_index =
+                    (input_channel * out_channels + out_channel) * kernel_size
+                    + kernel_index;
+                sum += __half2float(x[input_index])
+                    * __half2float(weight[weight_index]);
+            }
+        }
+    }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+    }
+    __shared__ float warp_sums[8];
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    if (lane == 0) warp_sums[warp] = sum;
+    __syncthreads();
+    if (warp == 0) {
+        sum = lane < 8 ? warp_sums[lane] : 0.0f;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+        }
+        if (lane == 0) {
+            out[out_channel * output_len + position] =
+                __float2half(sum + __half2float(bias[out_channel]));
+        }
+    }
+}
+
+// Transpose a row-major [rows, cols] f16 matrix.
+__global__ void transpose_f16(const __half* __restrict__ x,
+                              __half* __restrict__ out,
+                              int rows,
+                              int cols) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    const int n = rows * cols;
+    if (index < n) {
+        const int row = index / cols;
+        const int col = index % cols;
+        out[col * rows + row] = x[index];
+    }
+}
+
+// Exact erf-based GELU used by the codec's ConvNeXt blocks.
+__global__ void gelu_erf_f16(const __half* __restrict__ x,
+                             __half* __restrict__ out,
+                             int n) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < n) {
+        const float value = __half2float(x[index]);
+        out[index] = __float2half(
+            0.5f * value * (1.0f + erff(value * 0.7071067811865475f)));
+    }
+}
+
 } // extern "C"

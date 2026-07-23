@@ -75,6 +75,9 @@ pub struct OpsKernels {
     softmax_topk: CudaFunction,
     fused_moe_router: CudaFunction,
     conv1d_causal_f16: CudaFunction,
+    conv_transpose1d_causal_f16: CudaFunction,
+    transpose_f16: CudaFunction,
+    gelu_erf_f16: CudaFunction,
 }
 
 impl OpsKernels {
@@ -140,6 +143,12 @@ impl OpsKernels {
             softmax_topk: loader::get_fn(&module, "softmax_topk")?,
             fused_moe_router: loader::get_fn(&module, "fused_moe_router")?,
             conv1d_causal_f16: loader::get_fn(&module, "conv1d_causal_f16")?,
+            conv_transpose1d_causal_f16: loader::get_fn(
+                &module,
+                "conv_transpose1d_causal_f16",
+            )?,
+            transpose_f16: loader::get_fn(&module, "transpose_f16")?,
+            gelu_erf_f16: loader::get_fn(&module, "gelu_erf_f16")?,
             _module: module,
         })
     }
@@ -186,6 +195,104 @@ impl OpsKernels {
                 &self.conv1d_causal_f16,
                 (out_channels, seq_len, 1),
                 (256, 1, 1),
+                0,
+                &mut args,
+            );
+        }
+        Ok(())
+    }
+
+    /// Causal transposed convolution over channel-first f16 data.
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv_transpose1d_causal_f16(
+        &self,
+        x: &CudaSlice<half::f16>,
+        weight: &CudaSlice<half::f16>,
+        bias: &CudaSlice<half::f16>,
+        out: &mut CudaSlice<half::f16>,
+        in_channels: u32,
+        out_channels: u32,
+        input_len: u32,
+        kernel_size: u32,
+        stride: u32,
+    ) -> Result<(), KernelError> {
+        let ic = in_channels as i32;
+        let oc = out_channels as i32;
+        let il = input_len as i32;
+        let ks = kernel_size as i32;
+        let st = stride as i32;
+        let mut args: [*mut c_void; 9] = [
+            slice_ptr(x),
+            slice_ptr(weight),
+            slice_ptr(bias),
+            slice_ptr_mut(out),
+            scalar_ptr(&ic),
+            scalar_ptr(&oc),
+            scalar_ptr(&il),
+            scalar_ptr(&ks),
+            scalar_ptr(&st),
+        ];
+        unsafe {
+            self.fast.fire(
+                &self.conv_transpose1d_causal_f16,
+                (out_channels, input_len * stride, 1),
+                (256, 1, 1),
+                0,
+                &mut args,
+            );
+        }
+        Ok(())
+    }
+
+    /// Transpose a row-major f16 matrix.
+    pub fn transpose_f16(
+        &self,
+        x: &CudaSlice<half::f16>,
+        out: &mut CudaSlice<half::f16>,
+        rows: u32,
+        cols: u32,
+    ) -> Result<(), KernelError> {
+        let n = rows * cols;
+        let threads = 256;
+        let rows_i = rows as i32;
+        let cols_i = cols as i32;
+        let mut args: [*mut c_void; 4] = [
+            slice_ptr(x),
+            slice_ptr_mut(out),
+            scalar_ptr(&rows_i),
+            scalar_ptr(&cols_i),
+        ];
+        unsafe {
+            self.fast.fire(
+                &self.transpose_f16,
+                ((n + threads - 1) / threads, 1, 1),
+                (threads, 1, 1),
+                0,
+                &mut args,
+            );
+        }
+        Ok(())
+    }
+
+    /// Exact erf-based GELU for codec ConvNeXt blocks.
+    pub fn gelu_erf_f16(
+        &self,
+        x: &CudaSlice<half::f16>,
+        out: &mut CudaSlice<half::f16>,
+        n: u32,
+    ) -> Result<(), KernelError> {
+        let threads = 256;
+        let n_i = n as i32;
+        let mut args: [*mut c_void; 3] = [
+            slice_ptr(x),
+            slice_ptr_mut(out),
+            scalar_ptr(&n_i),
+        ];
+        unsafe {
+            self.fast.fire(
+                &self.gelu_erf_f16,
+                ((n + threads - 1) / threads, 1, 1),
+                (threads, 1, 1),
                 0,
                 &mut args,
             );
