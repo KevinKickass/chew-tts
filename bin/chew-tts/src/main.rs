@@ -4,6 +4,7 @@ use chew_model_qwen3_tts::{
     TalkerTransformer, inspect_model, load_f16_tensor,
 };
 use clap::{Parser, Subcommand};
+use std::io::Write;
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
@@ -122,9 +123,15 @@ enum Command {
         /// Decode the complete 1,920-sample waveform frame.
         #[arg(long)]
         audio: bool,
+        /// Number of identical codec frames to decode jointly.
+        #[arg(long, default_value_t = 1)]
+        frames: usize,
         /// Number of times to run the selected codec stage.
         #[arg(long, default_value_t = 1)]
         repeats: usize,
+        /// Optional PCM16 WAV output; requires --audio.
+        #[arg(long)]
+        wav: Option<PathBuf>,
         /// Optional raw little-endian f32 reference latent.
         #[arg(long)]
         reference: Option<PathBuf>,
@@ -239,7 +246,9 @@ fn main() -> anyhow::Result<()> {
             transformer,
             upsample,
             audio,
+            frames,
             repeats,
+            wav,
             reference,
         } => cuda_codec_latent_smoke(
             &tokenizer_dir,
@@ -249,7 +258,9 @@ fn main() -> anyhow::Result<()> {
             transformer,
             upsample,
             audio,
+            frames,
             repeats,
+            wav.as_deref(),
             reference.as_deref(),
         )?,
     }
@@ -264,11 +275,19 @@ fn cuda_codec_latent_smoke(
     transformer: bool,
     upsample: bool,
     audio: bool,
+    frames: usize,
     repeats: usize,
+    wav: Option<&std::path::Path>,
     reference: Option<&std::path::Path>,
 ) -> anyhow::Result<()> {
+    if frames == 0 {
+        anyhow::bail!("frames must be non-zero");
+    }
     if repeats == 0 {
         anyhow::bail!("repeats must be non-zero");
+    }
+    if wav.is_some() && !audio {
+        anyhow::bail!("--wav requires --audio");
     }
     let codes = codes
         .split(',')
@@ -287,13 +306,26 @@ fn cuda_codec_latent_smoke(
     let mut kernels = chew_kernel::GpuKernels::load(stream, 512 * 256, 512)?;
     let quantizer = CodecQuantizer::load(tokenizer_dir, stream)?;
     let free_loaded = allocator.free_bytes(gpu)?;
+    let codec_frames = vec![codes.clone(); frames];
     if repeats > 1 {
         if audio {
-            quantizer.decode_frame_audio(&codes, &mut kernels)?;
+            if frames == 1 {
+                quantizer.decode_frame_audio(&codes, &mut kernels)?;
+            } else {
+                quantizer.decode_frames_audio(&codec_frames, &mut kernels)?;
+            }
         } else if upsample {
-            quantizer.decode_frame_upsampled(&codes, &mut kernels)?;
+            if frames == 1 {
+                quantizer.decode_frame_upsampled(&codes, &mut kernels)?;
+            } else {
+                quantizer.decode_frames_upsampled(&codec_frames, &mut kernels)?;
+            }
         } else if transformer {
-            quantizer.decode_frame_transformer(&codes, &mut kernels)?;
+            if frames == 1 {
+                quantizer.decode_frame_transformer(&codes, &mut kernels)?;
+            } else {
+                quantizer.decode_frames_transformer(&codec_frames, &mut kernels)?;
+            }
         } else if preconv {
             quantizer.decode_frame_preconv(&codes, &mut kernels)?;
         } else {
@@ -304,11 +336,23 @@ fn cuda_codec_latent_smoke(
     let mut latent = Vec::new();
     for _ in 0..repeats {
         latent = if audio {
-            quantizer.decode_frame_audio(&codes, &mut kernels)?
+            if frames == 1 {
+                quantizer.decode_frame_audio(&codes, &mut kernels)?
+            } else {
+                quantizer.decode_frames_audio(&codec_frames, &mut kernels)?
+            }
         } else if upsample {
-            quantizer.decode_frame_upsampled(&codes, &mut kernels)?
+            if frames == 1 {
+                quantizer.decode_frame_upsampled(&codes, &mut kernels)?
+            } else {
+                quantizer.decode_frames_upsampled(&codec_frames, &mut kernels)?
+            }
         } else if transformer {
-            quantizer.decode_frame_transformer(&codes, &mut kernels)?
+            if frames == 1 {
+                quantizer.decode_frame_transformer(&codes, &mut kernels)?
+            } else {
+                quantizer.decode_frames_transformer(&codec_frames, &mut kernels)?
+            }
         } else if preconv {
             quantizer.decode_frame_preconv(&codes, &mut kernels)?
         } else {
@@ -334,6 +378,10 @@ fn cuda_codec_latent_smoke(
         repeats,
         &latent[..8]
     );
+    if let Some(path) = wav {
+        write_pcm16_wav(path, &latent, 24_000)?;
+        println!("wrote {} samples to {}", latent.len(), path.display());
+    }
     compare_reference(
         &latent,
         reference,
@@ -343,6 +391,40 @@ fn cuda_codec_latent_smoke(
             0.02
         },
     )?;
+    Ok(())
+}
+
+fn write_pcm16_wav(
+    path: &std::path::Path,
+    samples: &[f32],
+    sample_rate: u32,
+) -> anyhow::Result<()> {
+    let data_bytes = samples
+        .len()
+        .checked_mul(2)
+        .context("WAV data is too large")?;
+    let data_bytes = u32::try_from(data_bytes).context("WAV data exceeds 4 GiB")?;
+    let riff_size = 36u32
+        .checked_add(data_bytes)
+        .context("WAV RIFF size overflow")?;
+    let mut file = std::fs::File::create(path)
+        .with_context(|| format!("could not create WAV {}", path.display()))?;
+    file.write_all(b"RIFF")?;
+    file.write_all(&riff_size.to_le_bytes())?;
+    file.write_all(b"WAVEfmt ")?;
+    file.write_all(&16u32.to_le_bytes())?;
+    file.write_all(&1u16.to_le_bytes())?;
+    file.write_all(&1u16.to_le_bytes())?;
+    file.write_all(&sample_rate.to_le_bytes())?;
+    file.write_all(&(sample_rate * 2).to_le_bytes())?;
+    file.write_all(&2u16.to_le_bytes())?;
+    file.write_all(&16u16.to_le_bytes())?;
+    file.write_all(b"data")?;
+    file.write_all(&data_bytes.to_le_bytes())?;
+    for sample in samples {
+        let pcm = (sample.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16;
+        file.write_all(&pcm.to_le_bytes())?;
+    }
     Ok(())
 }
 

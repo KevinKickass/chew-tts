@@ -31,12 +31,15 @@ Implemented:
 - both 2x causal ConvNeXt codec upsampling stages;
 - the complete BigVGAN waveform decoder, including SnakeBeta activations,
   dilated residual units, and all four upsampling blocks;
+- joint multi-frame decoding with causal transformer attention and convolution
+  history preserved across frame boundaries;
+- mono 24-kHz PCM16 WAV output from the native codec path;
 - PyTorch parity checks for real Qwen weights, RoPE, GQA, and cached decoding.
 
 Next:
 
 - one CUDA graph for a complete 16-codebook audio frame;
-- multi-frame codec decoding with preserved causal history;
+- integration of generated talker/predictor code frames with the codec;
 - speaker and reference-audio encoders for voice cloning;
 - Kokoro as the second model family.
 
@@ -150,9 +153,22 @@ Add `--audio --repeats 10` to run through the complete BigVGAN decoder and
 produce one 1,920-sample frame at 24 kHz. The warm single-frame path takes
 approximately 24 ms on an RTX 3080, including the codec front end. Its mean
 absolute delta against the independent F32 waveform reference is below 0.0002
-and its maximum delta below 0.0009. Multi-frame decoding is still required
-before these isolated frames can be joined into continuous speech, because
-the causal transformer and convolutions must retain their preceding context.
+and its maximum delta below 0.0009.
+
+Decode several frames jointly and write a WAV file:
+
+```bash
+CARGO_TARGET_DIR=/tmp/chew-tts-target \
+  cargo run --release -p chew-tts -- \
+  cuda-codec-latent-smoke /models/Qwen3-TTS-12Hz-1.7B-VoiceDesign/speech_tokenizer \
+  --gpu 0 --audio --frames 3 --repeats 10 --wav /tmp/codec.wav
+```
+
+The multi-frame path preserves the causal transformer and convolution context
+instead of joining independently decoded 80-ms chunks. Three frames take
+approximately 69 ms warm for 240 ms of output on an RTX 3080 (codec RTF 0.29).
+All 5,760 samples match the independent F32 path with a mean absolute delta
+below 0.00018 and a maximum delta below 0.00085.
 
 ## Requirements
 
