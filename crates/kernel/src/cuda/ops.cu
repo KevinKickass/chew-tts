@@ -1214,6 +1214,188 @@ __global__ void mha_naive_masked(const __half* __restrict__ q,
     }
 }
 
+// Full bidirectional MHA over independent, equally-sized sequences packed
+// contiguously along the row dimension. Grid: (heads, seq_len, batches).
+__global__ void mha_naive_batched_full(const __half* __restrict__ q,
+                                       const __half* __restrict__ k,
+                                       const __half* __restrict__ v,
+                                       __half* __restrict__ out,
+                                       int head_dim,
+                                       int n_heads,
+                                       int n_kv_heads,
+                                       int seq_len,
+                                       float scale) {
+    const int head = blockIdx.x;
+    const int q_pos = blockIdx.y;
+    const int batch = blockIdx.z;
+    const int kv_head = head / (n_heads / n_kv_heads);
+    const int q_stride = n_heads * head_dim;
+    const int kv_stride = n_kv_heads * head_dim;
+    const int row_offset = batch * seq_len;
+    const int tid = threadIdx.x;
+    const int nt = blockDim.x;
+
+    const __half *Q_ptr =
+        q + (row_offset + q_pos) * q_stride + head * head_dim;
+    __half *out_ptr =
+        out + (row_offset + q_pos) * q_stride + head * head_dim;
+
+    extern __shared__ float scores[];
+    __shared__ float red[256];
+
+    // One warp cooperates on each Q·K dot product. This keeps the K loads
+    // coalesced; assigning a complete key to one thread made every lane read
+    // a different, widely-strided row and dominated the flow runtime.
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int warps = nt >> 5;
+    for (int kp = warp; kp < seq_len; kp += warps) {
+        const __half *K_ptr =
+            k + (row_offset + kp) * kv_stride + kv_head * head_dim;
+        float score = 0.0f;
+        for (int d = lane; d < head_dim; d += 32) {
+            score += __half2float(Q_ptr[d]) * __half2float(K_ptr[d]);
+        }
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            score += __shfl_down_sync(0xFFFFFFFF, score, offset);
+        }
+        if (lane == 0) scores[kp] = score * scale;
+    }
+    __syncthreads();
+
+    float lmax = -3.402823466e+38F;
+    for (int kp = tid; kp < seq_len; kp += nt) {
+        lmax = fmaxf(lmax, scores[kp]);
+    }
+    red[tid] = lmax;
+    __syncthreads();
+    for (int offset = nt / 2; offset > 0; offset >>= 1) {
+        if (tid < offset) red[tid] = fmaxf(red[tid], red[tid + offset]);
+        __syncthreads();
+    }
+    const float maximum = red[0];
+
+    float local_sum = 0.0f;
+    for (int kp = tid; kp < seq_len; kp += nt) {
+        const float probability = expf(scores[kp] - maximum);
+        scores[kp] = probability;
+        local_sum += probability;
+    }
+    red[tid] = local_sum;
+    __syncthreads();
+    for (int offset = nt / 2; offset > 0; offset >>= 1) {
+        if (tid < offset) red[tid] += red[tid + offset];
+        __syncthreads();
+    }
+    const float inverse_sum = red[0] > 0.0f ? 1.0f / red[0] : 0.0f;
+    __syncthreads();
+
+    for (int d = tid; d < head_dim; d += nt) {
+        float value = 0.0f;
+        for (int kp = 0; kp < seq_len; ++kp) {
+            const __half *V_ptr =
+                v + (row_offset + kp) * kv_stride + kv_head * head_dim;
+            value += scores[kp] * __half2float(V_ptr[d]);
+        }
+        out_ptr[d] = __float2half(value * inverse_sum);
+    }
+}
+
+__global__ void attention_pack_qkv_f16(
+    const __half* __restrict__ q,
+    const __half* __restrict__ k,
+    const __half* __restrict__ v,
+    __half* __restrict__ q_packed,
+    __half* __restrict__ k_packed,
+    __half* __restrict__ v_transposed,
+    int total_rows,
+    int sequence_len,
+    int heads,
+    int head_dim) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    const int width = heads * head_dim;
+    const int count = total_rows * width;
+    if (index >= count) return;
+    const int row = index / width;
+    const int feature = index - row * width;
+    const int head = feature / head_dim;
+    const int dim = feature - head * head_dim;
+    const int batch = row / sequence_len;
+    const int position = row - batch * sequence_len;
+    const int head_batch = batch * heads + head;
+    const int packed = (head_batch * sequence_len + position) * head_dim + dim;
+    q_packed[packed] = q[index];
+    k_packed[packed] = k[index];
+    v_transposed[(head_batch * head_dim + dim) * sequence_len + position] = v[index];
+}
+
+__global__ void attention_unpack_f16(
+    const __half* __restrict__ packed,
+    __half* __restrict__ output,
+    int total_rows,
+    int sequence_len,
+    int heads,
+    int head_dim) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    const int width = heads * head_dim;
+    const int count = total_rows * width;
+    if (index >= count) return;
+    const int row = index / width;
+    const int feature = index - row * width;
+    const int head = feature / head_dim;
+    const int dim = feature - head * head_dim;
+    const int batch = row / sequence_len;
+    const int position = row - batch * sequence_len;
+    const int head_batch = batch * heads + head;
+    output[index] =
+        packed[(head_batch * sequence_len + position) * head_dim + dim];
+}
+
+__global__ void softmax_rows_scaled_f16_inplace(
+    __half* __restrict__ values,
+    int rows,
+    int columns,
+    float scale) {
+    const int row = blockIdx.x;
+    if (row >= rows) return;
+    const int tid = threadIdx.x;
+    __half *row_values = values + (long)row * columns;
+    __shared__ float reduction[256];
+
+    float maximum = -3.402823466e+38F;
+    for (int column = tid; column < columns; column += blockDim.x) {
+        maximum = fmaxf(maximum, __half2float(row_values[column]) * scale);
+    }
+    reduction[tid] = maximum;
+    __syncthreads();
+    for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
+        if (tid < offset) {
+            reduction[tid] = fmaxf(reduction[tid], reduction[tid + offset]);
+        }
+        __syncthreads();
+    }
+    maximum = reduction[0];
+
+    float sum = 0.0f;
+    for (int column = tid; column < columns; column += blockDim.x) {
+        const float probability =
+            expf(__half2float(row_values[column]) * scale - maximum);
+        row_values[column] = __float2half(probability);
+        sum += probability;
+    }
+    reduction[tid] = sum;
+    __syncthreads();
+    for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
+        if (tid < offset) reduction[tid] += reduction[tid + offset];
+        __syncthreads();
+    }
+    const float inverse = reduction[0] > 0.0f ? 1.0f / reduction[0] : 0.0f;
+    for (int column = tid; column < columns; column += blockDim.x) {
+        row_values[column] =
+            __float2half(__half2float(row_values[column]) * inverse);
+    }
+}
+
 // --- Entropy-bound reduce: per canvas position (one block), compute argmax,
 // entropy, and an inverse-CDF multinomial sample over the vocab. Reads logits
 // directly on-device (no 134MB readback). Grid: (c_len,), Block: (256,) ---
@@ -2591,6 +2773,32 @@ __global__ void unfold_causal_f16(
         position - (kernel_size - 1 - kernel_index) * dilation;
     out[index] = input_position >= 0
         ? x[channel * seq_len + input_position]
+        : __float2half(0.0f);
+}
+
+// Batch-aware causal unfold. Sequences are concatenated along the time axis
+// in channel-first storage; context never crosses a sequence boundary.
+__global__ void unfold_causal_batched_f16(
+    const __half* __restrict__ x,
+    __half* __restrict__ out,
+    int channels,
+    int total_len,
+    int sequence_len,
+    int kernel_size,
+    int dilation) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    const int row_width = channels * kernel_size;
+    const int n = total_len * row_width;
+    if (index >= n) return;
+    const int position = index / row_width;
+    const int item = index - position * row_width;
+    const int channel = item / kernel_size;
+    const int kernel_index = item - channel * kernel_size;
+    const int sequence_start = (position / sequence_len) * sequence_len;
+    const int input_position =
+        position - (kernel_size - 1 - kernel_index) * dilation;
+    out[index] = input_position >= sequence_start
+        ? x[channel * total_len + input_position]
         : __float2half(0.0f);
 }
 

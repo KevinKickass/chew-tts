@@ -625,10 +625,9 @@ impl ChatterboxS3Flow {
                 unconditional.extend_from_slice(&state[range]);
                 unconditional.extend(std::iter::repeat_n(0.0, 240));
             }
-            let velocity_cond = self.estimator.forward(&conditional, frames, t0, kernels)?;
-            let velocity_uncond = self
-                .estimator
-                .forward(&unconditional, frames, t0, kernels)?;
+            let (velocity_cond, velocity_uncond) =
+                self.estimator
+                    .forward_cfg(&conditional, &unconditional, frames, t0, kernels)?;
             let dt = t1 - t0;
             for ((value, cond), uncond) in state.iter_mut().zip(velocity_cond).zip(velocity_uncond)
             {

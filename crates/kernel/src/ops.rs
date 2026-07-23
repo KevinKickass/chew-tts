@@ -46,6 +46,10 @@ pub struct OpsKernels {
     mha_naive_full: CudaFunction,
     mha_relative_full: CudaFunction,
     mha_naive_masked: CudaFunction,
+    mha_naive_batched_full: CudaFunction,
+    attention_pack_qkv_f16: CudaFunction,
+    attention_unpack_f16: CudaFunction,
+    softmax_rows_scaled_f16_inplace: CudaFunction,
     gather_rows_f16: CudaFunction,
     scatter_add_rows_f16: CudaFunction,
     eb_reduce: CudaFunction,
@@ -92,6 +96,7 @@ pub struct OpsKernels {
     conv1d_general_f16: CudaFunction,
     conv1d_causal_offset_f16: CudaFunction,
     unfold_causal_f16: CudaFunction,
+    unfold_causal_batched_f16: CudaFunction,
     unfold_conv1d_f16: CudaFunction,
     unfold_adjacent_f16: CudaFunction,
     scatter_conv_transpose_phase_f16: CudaFunction,
@@ -150,6 +155,13 @@ impl OpsKernels {
             mha_naive_full: loader::get_fn(&module, "mha_naive_full")?,
             mha_relative_full: loader::get_fn(&module, "mha_relative_full")?,
             mha_naive_masked: loader::get_fn(&module, "mha_naive_masked")?,
+            mha_naive_batched_full: loader::get_fn(&module, "mha_naive_batched_full")?,
+            attention_pack_qkv_f16: loader::get_fn(&module, "attention_pack_qkv_f16")?,
+            attention_unpack_f16: loader::get_fn(&module, "attention_unpack_f16")?,
+            softmax_rows_scaled_f16_inplace: loader::get_fn(
+                &module,
+                "softmax_rows_scaled_f16_inplace",
+            )?,
             gather_rows_f16: loader::get_fn(&module, "gather_rows_f16")?,
             scatter_add_rows_f16: loader::get_fn(&module, "scatter_add_rows_f16")?,
             eb_reduce: loader::get_fn(&module, "eb_reduce")?,
@@ -193,6 +205,7 @@ impl OpsKernels {
             conv1d_general_f16: loader::get_fn(&module, "conv1d_general_f16")?,
             conv1d_causal_offset_f16: loader::get_fn(&module, "conv1d_causal_offset_f16")?,
             unfold_causal_f16: loader::get_fn(&module, "unfold_causal_f16")?,
+            unfold_causal_batched_f16: loader::get_fn(&module, "unfold_causal_batched_f16")?,
             unfold_conv1d_f16: loader::get_fn(&module, "unfold_conv1d_f16")?,
             unfold_adjacent_f16: loader::get_fn(&module, "unfold_adjacent_f16")?,
             scatter_conv_transpose_phase_f16: loader::get_fn(
@@ -448,6 +461,47 @@ impl OpsKernels {
         unsafe {
             self.fast.launch(
                 &self.unfold_causal_f16,
+                LaunchConfig {
+                    grid_dim: (n.div_ceil(256), 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                &mut args,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Batch-aware causal unfold for sequences concatenated along time.
+    #[allow(clippy::too_many_arguments)]
+    pub fn unfold_causal_batched_f16(
+        &self,
+        x: &CudaSlice<half::f16>,
+        out: &mut CudaSlice<half::f16>,
+        channels: u32,
+        total_len: u32,
+        sequence_len: u32,
+        kernel_size: u32,
+        dilation: u32,
+    ) -> Result<(), KernelError> {
+        let ch = channels as i32;
+        let total = total_len as i32;
+        let sequence = sequence_len as i32;
+        let kernel = kernel_size as i32;
+        let dilation = dilation as i32;
+        let n = channels * total_len * kernel_size;
+        let mut args: [*mut c_void; 7] = [
+            slice_ptr(x),
+            slice_ptr_mut(out),
+            scalar_ptr(&ch),
+            scalar_ptr(&total),
+            scalar_ptr(&sequence),
+            scalar_ptr(&kernel),
+            scalar_ptr(&dilation),
+        ];
+        unsafe {
+            self.fast.launch(
+                &self.unfold_causal_batched_f16,
                 LaunchConfig {
                     grid_dim: (n.div_ceil(256), 1, 1),
                     block_dim: (256, 1, 1),
@@ -3124,6 +3178,154 @@ impl OpsKernels {
                 (n_heads, seq_len, 1),
                 (128, 1, 1),
                 smem,
+                &mut args,
+            );
+        }
+        Ok(())
+    }
+
+    /// Full bidirectional MHA over equally-sized sequences packed by batch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mha_naive_batched_full(
+        &self,
+        q: &CudaSlice<half::f16>,
+        k: &CudaView<'_, half::f16>,
+        v: &CudaView<'_, half::f16>,
+        out: &mut CudaSlice<half::f16>,
+        head_dim: u32,
+        n_heads: u32,
+        n_kv_heads: u32,
+        seq_len: u32,
+        batches: u32,
+        scale: f32,
+    ) -> Result<(), KernelError> {
+        let shared = (seq_len as usize * std::mem::size_of::<f32>()) as u32;
+        let head_dim_i32 = head_dim as i32;
+        let n_heads_i32 = n_heads as i32;
+        let n_kv_heads_i32 = n_kv_heads as i32;
+        let seq_len_i32 = seq_len as i32;
+        let mut args: [*mut c_void; 9] = [
+            slice_ptr(q),
+            view_ptr(k),
+            view_ptr(v),
+            slice_ptr_mut(out),
+            scalar_ptr(&head_dim_i32),
+            scalar_ptr(&n_heads_i32),
+            scalar_ptr(&n_kv_heads_i32),
+            scalar_ptr(&seq_len_i32),
+            scalar_ptr(&scale),
+        ];
+        unsafe {
+            self.fast.fire(
+                &self.mha_naive_batched_full,
+                (n_heads, seq_len, batches),
+                (128, 1, 1),
+                shared,
+                &mut args,
+            );
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_pack_qkv_f16(
+        &self,
+        q: &CudaSlice<half::f16>,
+        k: &CudaSlice<half::f16>,
+        v: &CudaSlice<half::f16>,
+        q_packed: &mut CudaSlice<half::f16>,
+        k_packed: &mut CudaSlice<half::f16>,
+        v_transposed: &mut CudaSlice<half::f16>,
+        total_rows: u32,
+        sequence_len: u32,
+        heads: u32,
+        head_dim: u32,
+    ) -> Result<(), KernelError> {
+        let total_rows_i32 = total_rows as i32;
+        let sequence_len_i32 = sequence_len as i32;
+        let heads_i32 = heads as i32;
+        let head_dim_i32 = head_dim as i32;
+        let elements = total_rows * heads * head_dim;
+        let mut args: [*mut c_void; 10] = [
+            slice_ptr(q),
+            slice_ptr(k),
+            slice_ptr(v),
+            slice_ptr_mut(q_packed),
+            slice_ptr_mut(k_packed),
+            slice_ptr_mut(v_transposed),
+            scalar_ptr(&total_rows_i32),
+            scalar_ptr(&sequence_len_i32),
+            scalar_ptr(&heads_i32),
+            scalar_ptr(&head_dim_i32),
+        ];
+        unsafe {
+            self.fast.fire(
+                &self.attention_pack_qkv_f16,
+                (elements.div_ceil(256), 1, 1),
+                (256, 1, 1),
+                0,
+                &mut args,
+            );
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_unpack_f16(
+        &self,
+        packed: &CudaSlice<half::f16>,
+        output: &mut CudaSlice<half::f16>,
+        total_rows: u32,
+        sequence_len: u32,
+        heads: u32,
+        head_dim: u32,
+    ) -> Result<(), KernelError> {
+        let total_rows_i32 = total_rows as i32;
+        let sequence_len_i32 = sequence_len as i32;
+        let heads_i32 = heads as i32;
+        let head_dim_i32 = head_dim as i32;
+        let elements = total_rows * heads * head_dim;
+        let mut args: [*mut c_void; 6] = [
+            slice_ptr(packed),
+            slice_ptr_mut(output),
+            scalar_ptr(&total_rows_i32),
+            scalar_ptr(&sequence_len_i32),
+            scalar_ptr(&heads_i32),
+            scalar_ptr(&head_dim_i32),
+        ];
+        unsafe {
+            self.fast.fire(
+                &self.attention_unpack_f16,
+                (elements.div_ceil(256), 1, 1),
+                (256, 1, 1),
+                0,
+                &mut args,
+            );
+        }
+        Ok(())
+    }
+
+    pub fn softmax_rows_scaled_f16_inplace(
+        &self,
+        values: &mut CudaSlice<half::f16>,
+        rows: u32,
+        columns: u32,
+        scale: f32,
+    ) -> Result<(), KernelError> {
+        let rows_i32 = rows as i32;
+        let columns_i32 = columns as i32;
+        let mut args: [*mut c_void; 4] = [
+            slice_ptr_mut(values),
+            scalar_ptr(&rows_i32),
+            scalar_ptr(&columns_i32),
+            scalar_ptr(&scale),
+        ];
+        unsafe {
+            self.fast.fire(
+                &self.softmax_rows_scaled_f16_inplace,
+                (rows, 1, 1),
+                (256, 1, 1),
+                0,
                 &mut args,
             );
         }

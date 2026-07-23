@@ -75,6 +75,50 @@ pub struct ChatterboxFlowTransformerBlock {
     ff2_bias: CudaSlice<f16>,
 }
 
+struct ChatterboxFlowTransformerScratch {
+    norm: CudaSlice<f16>,
+    q: CudaSlice<f16>,
+    k: CudaSlice<f16>,
+    v: CudaSlice<f16>,
+    attention: CudaSlice<f16>,
+    q_packed: CudaSlice<f16>,
+    k_packed: CudaSlice<f16>,
+    v_transposed: CudaSlice<f16>,
+    attention_scores: CudaSlice<f16>,
+    attention_packed: CudaSlice<f16>,
+    batch_frames: usize,
+    delta: CudaSlice<f16>,
+    ff: CudaSlice<f16>,
+    activated: CudaSlice<f16>,
+}
+
+impl ChatterboxFlowTransformerScratch {
+    fn new(seq_len: usize, batch_frames: usize, stream: &Arc<CudaStream>) -> anyhow::Result<Self> {
+        ensure!(
+            batch_frames > 0 && seq_len.is_multiple_of(batch_frames),
+            "invalid flow attention batch geometry"
+        );
+        let batches = seq_len / batch_frames;
+        let head_batches = batches * HEADS;
+        Ok(Self {
+            norm: stream.alloc_zeros(seq_len * DIM)?,
+            q: stream.alloc_zeros(seq_len * ATTENTION_DIM)?,
+            k: stream.alloc_zeros(seq_len * ATTENTION_DIM)?,
+            v: stream.alloc_zeros(seq_len * ATTENTION_DIM)?,
+            attention: stream.alloc_zeros(seq_len * ATTENTION_DIM)?,
+            q_packed: stream.alloc_zeros(seq_len * ATTENTION_DIM)?,
+            k_packed: stream.alloc_zeros(seq_len * ATTENTION_DIM)?,
+            v_transposed: stream.alloc_zeros(seq_len * ATTENTION_DIM)?,
+            attention_scores: stream.alloc_zeros(head_batches * batch_frames * batch_frames)?,
+            attention_packed: stream.alloc_zeros(seq_len * ATTENTION_DIM)?,
+            batch_frames,
+            delta: stream.alloc_zeros(seq_len * DIM)?,
+            ff: stream.alloc_zeros(seq_len * FF_DIM)?,
+            activated: stream.alloc_zeros(seq_len * FF_DIM)?,
+        })
+    }
+}
+
 impl ChatterboxFlowTransformerBlock {
     /// `prefix` addresses a block such as
     /// `flow.decoder.estimator.mid_blocks.0.1.0`.
@@ -121,7 +165,8 @@ impl ChatterboxFlowTransformerBlock {
         let stream = Arc::clone(kernels.ops.stream());
         let n = seq_len * DIM;
         let mut hidden = stream.clone_htod(input)?;
-        self.forward_device(&mut hidden, seq_len, kernels)?;
+        let mut scratch = ChatterboxFlowTransformerScratch::new(seq_len, seq_len, &stream)?;
+        self.forward_device(&mut hidden, seq_len, &mut scratch, kernels)?;
         stream.synchronize()?;
         let mut output = vec![0.0; n];
         stream.memcpy_dtoh(&hidden, &mut output)?;
@@ -132,30 +177,26 @@ impl ChatterboxFlowTransformerBlock {
         &self,
         hidden: &mut CudaSlice<f32>,
         seq_len: usize,
+        scratch: &mut ChatterboxFlowTransformerScratch,
         kernels: &mut GpuKernels,
     ) -> anyhow::Result<()> {
-        let stream = Arc::clone(kernels.ops.stream());
         let n = seq_len * DIM;
-        let mut norm = stream.alloc_zeros::<f16>(n)?;
         kernels.ops.layer_norm_f32in(
             hidden,
             &self.norm1_weight,
             &self.norm1_bias,
-            &mut norm,
+            &mut scratch.norm,
             seq_len as u32,
             DIM as u32,
             1e-5,
         )?;
-        let mut q = stream.alloc_zeros::<f16>(seq_len * ATTENTION_DIM)?;
-        let mut k = stream.alloc_zeros::<f16>(seq_len * ATTENTION_DIM)?;
-        let mut v = stream.alloc_zeros::<f16>(seq_len * ATTENTION_DIM)?;
         for (weight, output) in [
-            (&self.q_weight, &mut q),
-            (&self.k_weight, &mut k),
-            (&self.v_weight, &mut v),
+            (&self.q_weight, &mut scratch.q),
+            (&self.k_weight, &mut scratch.k),
+            (&self.v_weight, &mut scratch.v),
         ] {
             kernels.gemm.matmul_f16(
-                &norm,
+                &scratch.norm,
                 weight,
                 output,
                 seq_len as u32,
@@ -163,71 +204,115 @@ impl ChatterboxFlowTransformerBlock {
                 DIM as u32,
             )?;
         }
-        let mut attention = stream.alloc_zeros::<f16>(seq_len * ATTENTION_DIM)?;
-        kernels.ops.mha_naive_full(
-            &q,
-            &k.slice(..),
-            &v.slice(..),
-            &mut attention,
+        let batches = seq_len / scratch.batch_frames;
+        let head_batches = batches * HEADS;
+        kernels.ops.attention_pack_qkv_f16(
+            &scratch.q,
+            &scratch.k,
+            &scratch.v,
+            &mut scratch.q_packed,
+            &mut scratch.k_packed,
+            &mut scratch.v_transposed,
+            seq_len as u32,
+            scratch.batch_frames as u32,
+            HEADS as u32,
             HEAD_DIM as u32,
-            HEADS as u32,
-            HEADS as u32,
-            seq_len as u32,
-            seq_len as u32,
-            1.0 / (HEAD_DIM as f32).sqrt(),
-            0.0,
         )?;
-        let mut delta = stream.alloc_zeros::<f16>(n)?;
+        kernels.gemm.matmul_f16_strided_batched(
+            &scratch.q_packed,
+            &scratch.k_packed,
+            &mut scratch.attention_scores,
+            scratch.batch_frames as u32,
+            scratch.batch_frames as u32,
+            HEAD_DIM as u32,
+            head_batches as u32,
+        )?;
+        kernels.ops.softmax_rows_scaled_f16_inplace(
+            &mut scratch.attention_scores,
+            (head_batches * scratch.batch_frames) as u32,
+            scratch.batch_frames as u32,
+            1.0 / (HEAD_DIM as f32).sqrt(),
+        )?;
+        kernels.gemm.matmul_f16_strided_batched(
+            &scratch.attention_scores,
+            &scratch.v_transposed,
+            &mut scratch.attention_packed,
+            scratch.batch_frames as u32,
+            HEAD_DIM as u32,
+            scratch.batch_frames as u32,
+            head_batches as u32,
+        )?;
+        kernels.ops.attention_unpack_f16(
+            &scratch.attention_packed,
+            &mut scratch.attention,
+            seq_len as u32,
+            scratch.batch_frames as u32,
+            HEADS as u32,
+            HEAD_DIM as u32,
+        )?;
         kernels.gemm.matmul_f16(
-            &attention,
+            &scratch.attention,
             &self.out_weight,
-            &mut delta,
+            &mut scratch.delta,
             seq_len as u32,
             DIM as u32,
             ATTENTION_DIM as u32,
         )?;
+        kernels.ops.add_bias_f16_inplace(
+            &mut scratch.delta,
+            &self.out_bias,
+            seq_len as u32,
+            DIM as u32,
+        )?;
         kernels
             .ops
-            .add_bias_f16_inplace(&mut delta, &self.out_bias, seq_len as u32, DIM as u32)?;
-        kernels.ops.add_inplace_f32_f16(hidden, &delta, n as u32)?;
+            .add_inplace_f32_f16(hidden, &scratch.delta, n as u32)?;
 
         kernels.ops.layer_norm_f32in(
             hidden,
             &self.norm3_weight,
             &self.norm3_bias,
-            &mut norm,
+            &mut scratch.norm,
             seq_len as u32,
             DIM as u32,
             1e-5,
         )?;
-        let mut ff = stream.alloc_zeros::<f16>(seq_len * FF_DIM)?;
         kernels.gemm.matmul_f16(
-            &norm,
+            &scratch.norm,
             &self.ff1_weight,
-            &mut ff,
+            &mut scratch.ff,
             seq_len as u32,
             FF_DIM as u32,
             DIM as u32,
         )?;
-        kernels
-            .ops
-            .add_bias_f16_inplace(&mut ff, &self.ff1_bias, seq_len as u32, FF_DIM as u32)?;
-        let mut activated = stream.alloc_zeros::<f16>(seq_len * FF_DIM)?;
-        kernels
-            .ops
-            .gelu_erf_f16(&ff, &mut activated, (seq_len * FF_DIM) as u32)?;
+        kernels.ops.add_bias_f16_inplace(
+            &mut scratch.ff,
+            &self.ff1_bias,
+            seq_len as u32,
+            FF_DIM as u32,
+        )?;
+        kernels.ops.gelu_erf_f16(
+            &scratch.ff,
+            &mut scratch.activated,
+            (seq_len * FF_DIM) as u32,
+        )?;
         kernels.gemm.matmul_f16(
-            &activated,
+            &scratch.activated,
             &self.ff2_weight,
-            &mut delta,
+            &mut scratch.delta,
             seq_len as u32,
             DIM as u32,
             FF_DIM as u32,
         )?;
+        kernels.ops.add_bias_f16_inplace(
+            &mut scratch.delta,
+            &self.ff2_bias,
+            seq_len as u32,
+            DIM as u32,
+        )?;
         kernels
             .ops
-            .add_bias_f16_inplace(&mut delta, &self.ff2_bias, seq_len as u32, DIM as u32)?;
-        kernels.ops.add_inplace_f32_f16(hidden, &delta, n as u32)?;
+            .add_inplace_f32_f16(hidden, &scratch.delta, n as u32)?;
         Ok(())
     }
 }
@@ -370,7 +455,7 @@ impl ChatterboxFlowResnetBlock {
             .map(f16::from_f32)
             .collect::<Vec<_>>();
         let time = stream.clone_htod(&time)?;
-        let output = self.forward_device(&input, seq_len, &time, kernels)?;
+        let output = self.forward_device(&input, seq_len, seq_len, &time, kernels)?;
         stream.synchronize()?;
         let mut host = vec![0.0; seq_len * DIM];
         stream.memcpy_dtoh(&output, &mut host)?;
@@ -381,6 +466,7 @@ impl ChatterboxFlowResnetBlock {
         &self,
         input: &CudaSlice<f32>,
         seq_len: usize,
+        batch_frames: usize,
         time_embedding: &CudaSlice<f16>,
         kernels: &mut GpuKernels,
     ) -> anyhow::Result<CudaSlice<f32>> {
@@ -398,18 +484,17 @@ impl ChatterboxFlowResnetBlock {
             seq_len as u32,
             self.input_channels as u32,
         )?;
-        let mut first_cf = stream.alloc_zeros::<f16>(seq_len * DIM)?;
-        kernels.ops.conv1d_causal_f16(
+        let first_cf = causal_conv_channel_first_f16(
             &input_cf,
             &self.conv1_weight,
             &self.conv1_bias,
-            &mut first_cf,
-            self.input_channels as u32,
-            DIM as u32,
-            seq_len as u32,
+            self.input_channels,
+            DIM,
+            seq_len,
+            batch_frames,
             3,
             1,
-            1,
+            kernels,
         )?;
         let mut first = stream.alloc_zeros::<f16>(seq_len * DIM)?;
         kernels
@@ -446,18 +531,17 @@ impl ChatterboxFlowResnetBlock {
         kernels
             .ops
             .transpose_f16(&first, &mut first_cf, seq_len as u32, DIM as u32)?;
-        let mut second_cf = stream.alloc_zeros::<f16>(seq_len * DIM)?;
-        kernels.ops.conv1d_causal_f16(
+        let second_cf = causal_conv_channel_first_f16(
             &first_cf,
             &self.conv2_weight,
             &self.conv2_bias,
-            &mut second_cf,
-            DIM as u32,
-            DIM as u32,
-            seq_len as u32,
+            DIM,
+            DIM,
+            seq_len,
+            batch_frames,
             3,
             1,
-            1,
+            kernels,
         )?;
         let mut second = stream.alloc_zeros::<f16>(seq_len * DIM)?;
         kernels
@@ -471,18 +555,17 @@ impl ChatterboxFlowResnetBlock {
             kernels,
         )?;
 
-        let mut residual_cf = stream.alloc_zeros::<f16>(seq_len * DIM)?;
-        kernels.ops.conv1d_causal_f16(
+        let residual_cf = causal_conv_channel_first_f16(
             &input_cf,
             &self.residual_weight,
             &self.residual_bias,
-            &mut residual_cf,
-            self.input_channels as u32,
-            DIM as u32,
-            seq_len as u32,
+            self.input_channels,
+            DIM,
+            seq_len,
+            batch_frames,
             1,
             1,
-            1,
+            kernels,
         )?;
         let mut residual = stream.alloc_zeros::<f16>(seq_len * DIM)?;
         kernels
@@ -576,26 +659,66 @@ impl ChatterboxFlowEstimator {
         timestep: f32,
         kernels: &mut GpuKernels,
     ) -> anyhow::Result<Vec<f32>> {
+        self.forward_batched(input, frames, frames, timestep, kernels)
+    }
+
+    /// Evaluate the conditional and unconditional CFG branches as one GPU
+    /// batch while keeping attention and causal convolutions isolated.
+    pub fn forward_cfg(
+        &self,
+        conditional: &[f32],
+        unconditional: &[f32],
+        frames: usize,
+        timestep: f32,
+        kernels: &mut GpuKernels,
+    ) -> anyhow::Result<(Vec<f32>, Vec<f32>)> {
         ensure!(
-            frames > 0 && input.len() == frames * 320,
-            "flow estimator expects [frames, 320]"
+            conditional.len() == frames * 320 && unconditional.len() == frames * 320,
+            "flow CFG estimator expects two [frames, 320] inputs"
+        );
+        let mut input = Vec::with_capacity(conditional.len() + unconditional.len());
+        input.extend_from_slice(conditional);
+        input.extend_from_slice(unconditional);
+        let output = self.forward_batched(&input, frames * 2, frames, timestep, kernels)?;
+        let split = frames * 80;
+        Ok((output[..split].to_vec(), output[split..].to_vec()))
+    }
+
+    fn forward_batched(
+        &self,
+        input: &[f32],
+        total_frames: usize,
+        batch_frames: usize,
+        timestep: f32,
+        kernels: &mut GpuKernels,
+    ) -> anyhow::Result<Vec<f32>> {
+        ensure!(
+            batch_frames > 0
+                && total_frames.is_multiple_of(batch_frames)
+                && input.len() == total_frames * 320,
+            "flow estimator expects a whole batch of [frames, 320] inputs"
         );
         let stream = Arc::clone(kernels.ops.stream());
         let input = stream.clone_htod(input)?;
         let time = self.time.forward_device(timestep, kernels)?;
-        let mut hidden = self
-            .down_resnet
-            .forward_device(&input, frames, &time, kernels)?;
+        let mut transformer_scratch =
+            ChatterboxFlowTransformerScratch::new(total_frames, batch_frames, &stream)?;
+        let mut hidden =
+            self.down_resnet
+                .forward_device(&input, total_frames, batch_frames, &time, kernels)?;
         for block in &self.down_transformers {
-            block.forward_device(&mut hidden, frames, kernels)?;
+            block.forward_device(&mut hidden, total_frames, &mut transformer_scratch, kernels)?;
         }
-        let mut skip = stream.alloc_zeros::<f16>(frames * DIM)?;
-        kernels
-            .ops
-            .copy_f32_to_f16(&hidden, &mut skip.slice_mut(..), (frames * DIM) as u32)?;
+        let mut skip = stream.alloc_zeros::<f16>(total_frames * DIM)?;
+        kernels.ops.copy_f32_to_f16(
+            &hidden,
+            &mut skip.slice_mut(..),
+            (total_frames * DIM) as u32,
+        )?;
         hidden = causal_conv_frame_major(
             &hidden,
-            frames,
+            total_frames,
+            batch_frames,
             DIM,
             DIM,
             &self.downsample_weight,
@@ -604,24 +727,35 @@ impl ChatterboxFlowEstimator {
             kernels,
         )?;
         for (resnet, transformers) in &self.mid {
-            hidden = resnet.forward_device(&hidden, frames, &time, kernels)?;
+            hidden = resnet.forward_device(&hidden, total_frames, batch_frames, &time, kernels)?;
             for block in transformers {
-                block.forward_device(&mut hidden, frames, kernels)?;
+                block.forward_device(
+                    &mut hidden,
+                    total_frames,
+                    &mut transformer_scratch,
+                    kernels,
+                )?;
             }
         }
-        let mut joined = stream.alloc_zeros::<f32>(frames * DIM * 2)?;
-        kernels
-            .ops
-            .concat_f32_f16_rows(&hidden, &skip, &mut joined, frames as u32, 256, 256)?;
-        hidden = self
-            .up_resnet
-            .forward_device(&joined, frames, &time, kernels)?;
+        let mut joined = stream.alloc_zeros::<f32>(total_frames * DIM * 2)?;
+        kernels.ops.concat_f32_f16_rows(
+            &hidden,
+            &skip,
+            &mut joined,
+            total_frames as u32,
+            256,
+            256,
+        )?;
+        hidden =
+            self.up_resnet
+                .forward_device(&joined, total_frames, batch_frames, &time, kernels)?;
         for block in &self.up_transformers {
-            block.forward_device(&mut hidden, frames, kernels)?;
+            block.forward_device(&mut hidden, total_frames, &mut transformer_scratch, kernels)?;
         }
         hidden = causal_conv_frame_major(
             &hidden,
-            frames,
+            total_frames,
+            batch_frames,
             DIM,
             DIM,
             &self.upsample_weight,
@@ -631,7 +765,8 @@ impl ChatterboxFlowEstimator {
         )?;
         let final_conv = causal_conv_frame_major_f16(
             &hidden,
-            frames,
+            total_frames,
+            batch_frames,
             DIM,
             DIM,
             &self.final_weight,
@@ -641,25 +776,28 @@ impl ChatterboxFlowEstimator {
         )?;
         let final_hidden = norm_mish(
             &final_conv,
-            frames,
+            total_frames,
             &self.final_norm_weight,
             &self.final_norm_bias,
             kernels,
         )?;
-        let mut output = stream.alloc_zeros::<f16>(frames * 80)?;
+        let mut output = stream.alloc_zeros::<f16>(total_frames * 80)?;
         kernels.gemm.matmul_f16(
             &final_hidden,
             &self.projection_weight,
             &mut output,
-            frames as u32,
+            total_frames as u32,
             80,
             DIM as u32,
         )?;
-        kernels
-            .ops
-            .add_bias_f16_inplace(&mut output, &self.projection_bias, frames as u32, 80)?;
+        kernels.ops.add_bias_f16_inplace(
+            &mut output,
+            &self.projection_bias,
+            total_frames as u32,
+            80,
+        )?;
         stream.synchronize()?;
-        let mut host = vec![f16::ZERO; frames * 80];
+        let mut host = vec![f16::ZERO; total_frames * 80];
         stream.memcpy_dtoh(&output, &mut host)?;
         Ok(host.into_iter().map(f16::to_f32).collect())
     }
@@ -669,6 +807,7 @@ impl ChatterboxFlowEstimator {
 fn causal_conv_frame_major(
     input: &CudaSlice<f32>,
     frames: usize,
+    batch_frames: usize,
     in_channels: usize,
     out_channels: usize,
     weight: &CudaSlice<f16>,
@@ -679,6 +818,7 @@ fn causal_conv_frame_major(
     let f16 = causal_conv_frame_major_f16(
         input,
         frames,
+        batch_frames,
         in_channels,
         out_channels,
         weight,
@@ -698,6 +838,7 @@ fn causal_conv_frame_major(
 fn causal_conv_frame_major_f16(
     input: &CudaSlice<f32>,
     frames: usize,
+    batch_frames: usize,
     in_channels: usize,
     out_channels: usize,
     weight: &CudaSlice<f16>,
@@ -716,23 +857,66 @@ fn causal_conv_frame_major_f16(
     kernels
         .ops
         .transpose_f16(&sequence, &mut channels, frames as u32, in_channels as u32)?;
-    let mut convolved = stream.alloc_zeros::<f16>(frames * out_channels)?;
-    kernels.ops.conv1d_causal_f16(
+    let convolved = causal_conv_channel_first_f16(
         &channels,
         weight,
         bias,
-        &mut convolved,
-        in_channels as u32,
-        out_channels as u32,
-        frames as u32,
-        kernel as u32,
+        in_channels,
+        out_channels,
+        frames,
+        batch_frames,
+        kernel,
         1,
-        1,
+        kernels,
     )?;
     let mut output = stream.alloc_zeros::<f16>(frames * out_channels)?;
     kernels
         .ops
         .transpose_f16(&convolved, &mut output, out_channels as u32, frames as u32)?;
+    Ok(output)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn causal_conv_channel_first_f16(
+    input: &CudaSlice<f16>,
+    weight: &CudaSlice<f16>,
+    bias: &CudaSlice<f16>,
+    in_channels: usize,
+    out_channels: usize,
+    frames: usize,
+    batch_frames: usize,
+    kernel: usize,
+    dilation: usize,
+    kernels: &mut GpuKernels,
+) -> anyhow::Result<CudaSlice<f16>> {
+    let stream = Arc::clone(kernels.ops.stream());
+    let width = in_channels * kernel;
+    let mut unfolded = stream.alloc_zeros::<f16>(frames * width)?;
+    kernels.ops.unfold_causal_batched_f16(
+        input,
+        &mut unfolded,
+        in_channels as u32,
+        frames as u32,
+        batch_frames as u32,
+        kernel as u32,
+        dilation as u32,
+    )?;
+    let mut rows = stream.alloc_zeros::<f16>(frames * out_channels)?;
+    kernels.gemm.matmul_f16(
+        &unfolded,
+        weight,
+        &mut rows,
+        frames as u32,
+        out_channels as u32,
+        width as u32,
+    )?;
+    kernels
+        .ops
+        .add_bias_f16_inplace(&mut rows, bias, frames as u32, out_channels as u32)?;
+    let mut output = stream.alloc_zeros::<f16>(frames * out_channels)?;
+    kernels
+        .ops
+        .transpose_f16(&rows, &mut output, frames as u32, out_channels as u32)?;
     Ok(output)
 }
 

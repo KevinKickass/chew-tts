@@ -172,6 +172,7 @@ impl ChatterboxEngine {
         drop(conditional);
         drop(unconditional);
         let codec_started = Instant::now();
+        let flow_started = Instant::now();
         let mel = self.flow.generate_mel(
             &generated,
             &self.conditioning,
@@ -179,15 +180,23 @@ impl ChatterboxEngine {
             request.seed.wrapping_add(1),
             &mut self.kernels,
         )?;
+        let flow_elapsed = flow_started.elapsed();
+        let hift_started = Instant::now();
         let mut samples = self.hift.synthesize(
             &mel,
             mel.len() / 80,
             request.seed.wrapping_add(2),
             &mut self.kernels,
         )?;
+        let hift_elapsed = hift_started.elapsed();
         apply_leading_fade(&mut samples);
         self.stream.synchronize()?;
         let codec_elapsed = codec_started.elapsed();
+        tracing::debug!(
+            flow_ms = flow_elapsed.as_secs_f64() * 1_000.0,
+            hift_ms = hift_elapsed.as_secs_f64() * 1_000.0,
+            "Chatterbox codec stages"
+        );
         Ok(SynthesisOutput {
             samples,
             generated_frames: generated.len(),
