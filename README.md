@@ -67,14 +67,16 @@ Implemented:
 - the complete GPU-resident S3Gen conditional-flow estimator with causal
   ResNet blocks, 64 attention/FFN blocks, skip connection, cosine Euler
   integration, and classifier-free guidance;
+- the complete native HiFT neural-source-filter vocoder: F0 predictor,
+  harmonic source, GPU upsampling and Snake ResBlocks, 16-point STFT/ISTFT,
+  and 24-kHz waveform output.
 
 Next:
 
 - one CUDA graph for a complete 16-codebook audio frame;
 - optimized one-pass model loading and GPU-resident sampling;
 - arbitrary compressed reference-audio input in addition to native WAV;
-- Kokoro Albert, duration/prosody, and iSTFTNet CUDA inference;
-- Chatterbox HiFT mel-to-waveform generator.
+- complete Kokoro Albert, duration/prosody, and iSTFTNet inference.
 
 ## Why a separate repository?
 
@@ -163,6 +165,20 @@ The native ten-step CFM path, including both conditional and unconditional CFG
 evaluations, takes about 15 seconds for 100 generated speech tokens (200 new
 mel frames) on the same GPU. This measurement also includes process startup,
 model loading, NVRTC, and the token-conditioning encoder.
+
+Run T3, S3Gen, and HiFT end to end:
+
+```bash
+cargo run --release -p chew-tts -- \
+  cuda-chatterbox-generation-smoke /models/chatterbox-v3 \
+  --language de --text 'Hallo aus der nativen Engine.' \
+  --max-tokens 100 --flow-steps 10 --wav /tmp/chatterbox.wav
+```
+
+The HiFT path was checked against the official PyTorch implementation at every
+major stage. A local 20-token smoke test generated 0.8 seconds of finite,
+unclipped 24-kHz audio; the complete post-T3 S3Gen and vocoder path took 8.7
+seconds on an RTX 3080, including model loading.
 
 ## CUDA validation
 

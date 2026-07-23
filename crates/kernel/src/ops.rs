@@ -79,18 +79,22 @@ pub struct OpsKernels {
     fused_moe_router: CudaFunction,
     conv1d_causal_f16: CudaFunction,
     conv1d_padded_f16: CudaFunction,
+    conv1d_general_f16: CudaFunction,
     conv1d_causal_offset_f16: CudaFunction,
     unfold_causal_f16: CudaFunction,
     scatter_conv_transpose_phase_f16: CudaFunction,
     conv_transpose1d_causal_f16: CudaFunction,
+    conv_transpose1d_general_f16: CudaFunction,
     transpose_f16: CudaFunction,
     gelu_erf_f16: CudaFunction,
     silu_act_f16: CudaFunction,
     leaky_relu_f16: CudaFunction,
+    elu_f16: CudaFunction,
     mish_f16: CudaFunction,
     repeat_interleave_f16: CudaFunction,
     concat_f32_f16_rows: CudaFunction,
     snake_beta_f16: CudaFunction,
+    snake_f16: CudaFunction,
     clamp_f16: CudaFunction,
 }
 
@@ -161,6 +165,7 @@ impl OpsKernels {
             fused_moe_router: loader::get_fn(&module, "fused_moe_router")?,
             conv1d_causal_f16: loader::get_fn(&module, "conv1d_causal_f16")?,
             conv1d_padded_f16: loader::get_fn(&module, "conv1d_padded_f16")?,
+            conv1d_general_f16: loader::get_fn(&module, "conv1d_general_f16")?,
             conv1d_causal_offset_f16: loader::get_fn(&module, "conv1d_causal_offset_f16")?,
             unfold_causal_f16: loader::get_fn(&module, "unfold_causal_f16")?,
             scatter_conv_transpose_phase_f16: loader::get_fn(
@@ -168,14 +173,17 @@ impl OpsKernels {
                 "scatter_conv_transpose_phase_f16",
             )?,
             conv_transpose1d_causal_f16: loader::get_fn(&module, "conv_transpose1d_causal_f16")?,
+            conv_transpose1d_general_f16: loader::get_fn(&module, "conv_transpose1d_general_f16")?,
             transpose_f16: loader::get_fn(&module, "transpose_f16")?,
             gelu_erf_f16: loader::get_fn(&module, "gelu_erf_f16")?,
             silu_act_f16: loader::get_fn(&module, "silu_act_f16")?,
             leaky_relu_f16: loader::get_fn(&module, "leaky_relu_f16")?,
+            elu_f16: loader::get_fn(&module, "elu_f16")?,
             mish_f16: loader::get_fn(&module, "mish_f16")?,
             repeat_interleave_f16: loader::get_fn(&module, "repeat_interleave_f16")?,
             concat_f32_f16_rows: loader::get_fn(&module, "concat_f32_f16_rows")?,
             snake_beta_f16: loader::get_fn(&module, "snake_beta_f16")?,
+            snake_f16: loader::get_fn(&module, "snake_f16")?,
             clamp_f16: loader::get_fn(&module, "clamp_f16")?,
             _module: module,
         })
@@ -271,6 +279,59 @@ impl OpsKernels {
                 0,
                 &mut args,
             );
+        }
+        Ok(())
+    }
+
+    /// General PyTorch-compatible Conv1d over channel-first f16 data.
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv1d_general_f16(
+        &self,
+        x: &CudaSlice<half::f16>,
+        weight: &CudaSlice<half::f16>,
+        bias: &CudaSlice<half::f16>,
+        out: &mut CudaSlice<half::f16>,
+        in_channels: u32,
+        out_channels: u32,
+        input_len: u32,
+        output_len: u32,
+        kernel_size: u32,
+        stride: u32,
+        padding: u32,
+        dilation: u32,
+    ) -> Result<(), KernelError> {
+        let ic = in_channels as i32;
+        let oc = out_channels as i32;
+        let il = input_len as i32;
+        let ol = output_len as i32;
+        let ks = kernel_size as i32;
+        let st = stride as i32;
+        let pad = padding as i32;
+        let dil = dilation as i32;
+        let mut args: [*mut c_void; 12] = [
+            slice_ptr(x),
+            slice_ptr(weight),
+            slice_ptr(bias),
+            slice_ptr_mut(out),
+            scalar_ptr(&ic),
+            scalar_ptr(&oc),
+            scalar_ptr(&il),
+            scalar_ptr(&ol),
+            scalar_ptr(&ks),
+            scalar_ptr(&st),
+            scalar_ptr(&pad),
+            scalar_ptr(&dil),
+        ];
+        unsafe {
+            self.fast.launch(
+                &self.conv1d_general_f16,
+                LaunchConfig {
+                    grid_dim: (output_len, out_channels, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                &mut args,
+            )?;
         }
         Ok(())
     }
@@ -449,6 +510,56 @@ impl OpsKernels {
         Ok(())
     }
 
+    /// PyTorch-compatible ConvTranspose1d with dilation=1/output_padding=0.
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv_transpose1d_general_f16(
+        &self,
+        x: &CudaSlice<half::f16>,
+        weight: &CudaSlice<half::f16>,
+        bias: &CudaSlice<half::f16>,
+        out: &mut CudaSlice<half::f16>,
+        in_channels: u32,
+        out_channels: u32,
+        input_len: u32,
+        output_len: u32,
+        kernel_size: u32,
+        stride: u32,
+        padding: u32,
+    ) -> Result<(), KernelError> {
+        let ic = in_channels as i32;
+        let oc = out_channels as i32;
+        let il = input_len as i32;
+        let ol = output_len as i32;
+        let ks = kernel_size as i32;
+        let st = stride as i32;
+        let pad = padding as i32;
+        let mut args: [*mut c_void; 11] = [
+            slice_ptr(x),
+            slice_ptr(weight),
+            slice_ptr(bias),
+            slice_ptr_mut(out),
+            scalar_ptr(&ic),
+            scalar_ptr(&oc),
+            scalar_ptr(&il),
+            scalar_ptr(&ol),
+            scalar_ptr(&ks),
+            scalar_ptr(&st),
+            scalar_ptr(&pad),
+        ];
+        unsafe {
+            self.fast.launch(
+                &self.conv_transpose1d_general_f16,
+                LaunchConfig {
+                    grid_dim: (output_len, out_channels, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                &mut args,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Transpose a row-major f16 matrix.
     pub fn transpose_f16(
         &self,
@@ -541,6 +652,27 @@ impl OpsKernels {
         unsafe {
             self.fast.fire(
                 &self.leaky_relu_f16,
+                (n.div_ceil(threads), 1, 1),
+                (threads, 1, 1),
+                0,
+                &mut args,
+            );
+        }
+        Ok(())
+    }
+
+    pub fn elu_f16(
+        &self,
+        x: &CudaSlice<half::f16>,
+        out: &mut CudaSlice<half::f16>,
+        n: u32,
+    ) -> Result<(), KernelError> {
+        let threads = 256;
+        let n_i = n as i32;
+        let mut args: [*mut c_void; 3] = [slice_ptr(x), slice_ptr_mut(out), scalar_ptr(&n_i)];
+        unsafe {
+            self.fast.fire(
+                &self.elu_f16,
                 (n.div_ceil(threads), 1, 1),
                 (threads, 1, 1),
                 0,
@@ -664,6 +796,38 @@ impl OpsKernels {
             self.fast.fire(
                 &self.snake_beta_f16,
                 ((n + threads - 1) / threads, 1, 1),
+                (threads, 1, 1),
+                0,
+                &mut args,
+            );
+        }
+        Ok(())
+    }
+
+    /// Channel-wise Snake with linear alpha over channel-first f16 data.
+    pub fn snake_f16(
+        &self,
+        x: &CudaSlice<half::f16>,
+        alpha: &CudaSlice<half::f16>,
+        out: &mut CudaSlice<half::f16>,
+        channels: u32,
+        seq_len: u32,
+    ) -> Result<(), KernelError> {
+        let n = channels * seq_len;
+        let threads = 256;
+        let channels_i = channels as i32;
+        let seq_len_i = seq_len as i32;
+        let mut args: [*mut c_void; 5] = [
+            slice_ptr(x),
+            slice_ptr(alpha),
+            slice_ptr_mut(out),
+            scalar_ptr(&channels_i),
+            scalar_ptr(&seq_len_i),
+        ];
+        unsafe {
+            self.fast.fire(
+                &self.snake_f16,
+                (n.div_ceil(threads), 1, 1),
                 (threads, 1, 1),
                 0,
                 &mut args,

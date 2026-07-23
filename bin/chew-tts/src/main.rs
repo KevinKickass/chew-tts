@@ -1,11 +1,11 @@
 use anyhow::Context;
 use chew_model_chatterbox::{
-    ChatterboxConditioning, ChatterboxFlowEstimator, ChatterboxFlowResnetBlock,
-    ChatterboxFlowTimeEmbedding, ChatterboxFlowTransformerBlock, ChatterboxS3ConformerLayer,
-    ChatterboxS3Encoder, ChatterboxS3Flow, ChatterboxT3Frontend, ChatterboxT3Layer,
-    ChatterboxT3Transformer, ChatterboxTokenizer, HIDDEN_SIZE as CHATTERBOX_HIDDEN_SIZE,
-    INTERMEDIATE_SIZE as CHATTERBOX_INTERMEDIATE_SIZE, S3_HIDDEN_SIZE,
-    inspect_model as inspect_chatterbox_model,
+    ChatterboxConditioning, ChatterboxF0Predictor, ChatterboxFlowEstimator,
+    ChatterboxFlowResnetBlock, ChatterboxFlowTimeEmbedding, ChatterboxFlowTransformerBlock,
+    ChatterboxHiFT, ChatterboxS3ConformerLayer, ChatterboxS3Encoder, ChatterboxS3Flow,
+    ChatterboxT3Frontend, ChatterboxT3Layer, ChatterboxT3Transformer, ChatterboxTokenizer,
+    HIDDEN_SIZE as CHATTERBOX_HIDDEN_SIZE, INTERMEDIATE_SIZE as CHATTERBOX_INTERMEDIATE_SIZE,
+    S3_HIDDEN_SIZE, inspect_model as inspect_chatterbox_model,
 };
 use chew_model_kokoro::{KokoroVoice, inspect_model as inspect_kokoro_model};
 use chew_model_qwen3_tts::{
@@ -201,6 +201,24 @@ enum Command {
         #[arg(long, default_value_t = 4)]
         generated_tokens: usize,
     },
+    /// Run the native HiFT convolutional F0 predictor on deterministic mel.
+    CudaChatterboxF0Smoke {
+        model_dir: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        gpu: usize,
+        #[arg(long, default_value_t = 16)]
+        frames: usize,
+    },
+    /// Run the complete native HiFT vocoder on deterministic mel.
+    CudaChatterboxHiFtSmoke {
+        model_dir: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        gpu: usize,
+        #[arg(long, default_value_t = 8)]
+        frames: usize,
+        #[arg(long)]
+        wav: PathBuf,
+    },
     /// Generate native Chatterbox speech tokens through the complete T3 path.
     CudaChatterboxGenerationSmoke {
         /// Directory containing Chatterbox V3 weights, tokenizer, and conds.pt.
@@ -220,6 +238,12 @@ enum Command {
         /// Classifier-free guidance strength.
         #[arg(long, default_value_t = 0.5)]
         cfg_weight: f32,
+        /// Optionally continue through S3Gen and HiFT into a 24-kHz WAV.
+        #[arg(long)]
+        wav: Option<PathBuf>,
+        /// Conditional-flow Euler steps when --wav is set.
+        #[arg(long, default_value_t = 10)]
+        flow_steps: usize,
     },
     /// Tokenize text with the model's local Qwen2 BPE files.
     Tokenize {
@@ -936,6 +960,66 @@ fn main() -> anyhow::Result<()> {
                 &mel[..8]
             );
         }
+        Command::CudaChatterboxF0Smoke {
+            model_dir,
+            gpu,
+            frames,
+        } => {
+            anyhow::ensure!(frames > 0, "frame count must be non-zero");
+            let allocator = chew_vram::VramAllocator::init()?;
+            anyhow::ensure!(gpu < allocator.gpu_count(), "GPU index out of range");
+            let stream = std::sync::Arc::clone(allocator.stream(gpu));
+            let mut kernels =
+                chew_kernel::GpuKernels::load(&stream, S3_HIDDEN_SIZE * 2_048, 2_048)?;
+            let mel = (0..frames * 80)
+                .map(|index| (index as f32 * 0.017).sin() * 0.25)
+                .collect::<Vec<_>>();
+            let f0 = ChatterboxF0Predictor::load(&model_dir, &stream)?.predict(
+                &mel,
+                frames,
+                &mut kernels,
+            )?;
+            println!(
+                "Chatterbox HiFT F0 CUDA: frames={}, sum={:.9}, sum_sq={:.9}, first={:?}",
+                frames,
+                f0.iter().map(|x| f64::from(*x)).sum::<f64>(),
+                f0.iter()
+                    .map(|x| f64::from(*x) * f64::from(*x))
+                    .sum::<f64>(),
+                &f0[..f0.len().min(8)]
+            );
+        }
+        Command::CudaChatterboxHiFtSmoke {
+            model_dir,
+            gpu,
+            frames,
+            wav,
+        } => {
+            anyhow::ensure!(frames > 0, "frame count must be non-zero");
+            let allocator = chew_vram::VramAllocator::init()?;
+            anyhow::ensure!(gpu < allocator.gpu_count(), "GPU index out of range");
+            let stream = std::sync::Arc::clone(allocator.stream(gpu));
+            let mut kernels =
+                chew_kernel::GpuKernels::load(&stream, S3_HIDDEN_SIZE * 2_048, 2_048)?;
+            let mel = (0..frames * 80)
+                .map(|index| (index as f32 * 0.017).sin() * 0.25)
+                .collect::<Vec<_>>();
+            let audio = ChatterboxHiFT::load(&model_dir, &stream)?.synthesize(
+                &mel,
+                frames,
+                42,
+                &mut kernels,
+            )?;
+            write_pcm16_wav(&wav, &audio, 24_000)?;
+            println!(
+                "Chatterbox HiFT CUDA: frames={}, samples={}, peak={:.6}, rms={:.6}, wav={}",
+                frames,
+                audio.len(),
+                audio.iter().map(|value| value.abs()).fold(0.0f32, f32::max),
+                (audio.iter().map(|value| value * value).sum::<f32>() / audio.len() as f32).sqrt(),
+                wav.display()
+            );
+        }
         Command::CudaChatterboxGenerationSmoke {
             model_dir,
             gpu,
@@ -943,6 +1027,8 @@ fn main() -> anyhow::Result<()> {
             text,
             max_tokens,
             cfg_weight,
+            wav,
+            flow_steps,
         } => {
             anyhow::ensure!(max_tokens > 0, "max tokens must be non-zero");
             let allocator = chew_vram::VramAllocator::init()?;
@@ -1020,6 +1106,43 @@ fn main() -> anyhow::Result<()> {
                 prefix.tokens,
                 generated,
             );
+            if let Some(wav) = wav {
+                let generated = generated
+                    .into_iter()
+                    .take_while(|token| *token != 6_562)
+                    .collect::<Vec<_>>();
+                anyhow::ensure!(!generated.is_empty(), "T3 produced no speech tokens");
+                drop(conditional_hidden);
+                drop(unconditional_hidden);
+                drop(conditional);
+                drop(unconditional);
+                drop(transformer);
+                drop(frontend);
+                let started = std::time::Instant::now();
+                let mel = ChatterboxS3Flow::load(&model_dir, &stream)?.generate_mel(
+                    &generated,
+                    &conditioning,
+                    flow_steps,
+                    42,
+                    &mut kernels,
+                )?;
+                let mel_frames = mel.len() / 80;
+                let audio = ChatterboxHiFT::load(&model_dir, &stream)?.synthesize(
+                    &mel,
+                    mel_frames,
+                    43,
+                    &mut kernels,
+                )?;
+                write_pcm16_wav(&wav, &audio, 24_000)?;
+                println!(
+                    "Chatterbox end-to-end: mel_frames={}, samples={}, audio_seconds={:.3}, post-T3_seconds={:.3}, wav={}",
+                    mel_frames,
+                    audio.len(),
+                    audio.len() as f64 / 24_000.0,
+                    started.elapsed().as_secs_f64(),
+                    wav.display()
+                );
+            }
         }
         Command::Tokenize { model_dir, text } => {
             let tokenizer = load_qwen_tokenizer(&model_dir)?;

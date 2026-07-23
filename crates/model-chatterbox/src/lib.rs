@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 mod cuda;
 mod flow;
 mod frontend;
+mod hift;
 mod s3gen;
 mod tokenizer;
 
@@ -15,6 +16,7 @@ pub use flow::{
     ChatterboxFlowTransformerBlock,
 };
 pub use frontend::{ChatterboxT3Frontend, ChatterboxT3Prefix};
+pub use hift::{ChatterboxF0Predictor, ChatterboxHiFT};
 pub use s3gen::{
     ChatterboxS3ConformerLayer, ChatterboxS3Encoder, ChatterboxS3Flow, S3_HIDDEN_SIZE,
     S3_INTERMEDIATE_SIZE,

@@ -2443,6 +2443,55 @@ __global__ void conv1d_padded_f16(const __half* __restrict__ x,
     }
 }
 
+// General PyTorch-compatible Conv1d over channel-first f16 data.
+// weight: [out_channels, in_channels, kernel_size].
+__global__ void conv1d_general_f16(const __half* __restrict__ x,
+                                   const __half* __restrict__ weight,
+                                   const __half* __restrict__ bias,
+                                   __half* __restrict__ out,
+                                   int in_channels,
+                                   int out_channels,
+                                   int input_len,
+                                   int output_len,
+                                   int kernel_size,
+                                   int stride,
+                                   int padding,
+                                   int dilation) {
+    const int position = blockIdx.x;
+    const int out_channel = blockIdx.y;
+    if (out_channel >= out_channels || position >= output_len) return;
+    float sum = 0.0f;
+    const int work = in_channels * kernel_size;
+    for (int item = threadIdx.x; item < work; item += blockDim.x) {
+        const int input_channel = item / kernel_size;
+        const int kernel_index = item - input_channel * kernel_size;
+        const int source = position * stride - padding + kernel_index * dilation;
+        if (source >= 0 && source < input_len) {
+            sum += __half2float(x[input_channel * input_len + source])
+                * __half2float(weight[
+                    (out_channel * in_channels + input_channel) * kernel_size
+                    + kernel_index]);
+        }
+    }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+    __shared__ float warp_sums[8];
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    if (lane == 0) warp_sums[warp] = sum;
+    __syncthreads();
+    if (warp == 0) {
+        sum = lane < 8 ? warp_sums[lane] : 0.0f;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+        if (lane == 0)
+            out[out_channel * output_len + position] =
+                __float2half(sum + __half2float(bias[out_channel]));
+    }
+}
+
 // Streaming causal convolution. x contains history followed by new positions;
 // out contains only the new positions.
 __global__ void conv1d_causal_offset_f16(
@@ -2607,6 +2656,58 @@ __global__ void conv_transpose1d_causal_f16(
     }
 }
 
+// PyTorch-compatible ConvTranspose1d with dilation=1 and output_padding=0.
+// weight: [in_channels, out_channels, kernel_size].
+__global__ void conv_transpose1d_general_f16(
+    const __half* __restrict__ x,
+    const __half* __restrict__ weight,
+    const __half* __restrict__ bias,
+    __half* __restrict__ out,
+    int in_channels,
+    int out_channels,
+    int input_len,
+    int output_len,
+    int kernel_size,
+    int stride,
+    int padding) {
+    const int position = blockIdx.x;
+    const int out_channel = blockIdx.y;
+    if (out_channel >= out_channels || position >= output_len) return;
+    float sum = 0.0f;
+    const int work = in_channels * kernel_size;
+    for (int item = threadIdx.x; item < work; item += blockDim.x) {
+        const int input_channel = item / kernel_size;
+        const int kernel_index = item - input_channel * kernel_size;
+        const int numerator = position + padding - kernel_index;
+        if (numerator >= 0 && numerator % stride == 0) {
+            const int source = numerator / stride;
+            if (source < input_len) {
+                sum += __half2float(x[input_channel * input_len + source])
+                    * __half2float(weight[
+                        (input_channel * out_channels + out_channel) * kernel_size
+                        + kernel_index]);
+            }
+        }
+    }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+    __shared__ float warp_sums[8];
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    if (lane == 0) warp_sums[warp] = sum;
+    __syncthreads();
+    if (warp == 0) {
+        sum = lane < 8 ? warp_sums[lane] : 0.0f;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+        if (lane == 0)
+            out[out_channel * output_len + position] =
+                __float2half(sum + __half2float(bias[out_channel]));
+    }
+}
+
 // Transpose a row-major [rows, cols] f16 matrix.
 __global__ void transpose_f16(const __half* __restrict__ x,
                               __half* __restrict__ out,
@@ -2651,6 +2752,16 @@ __global__ void leaky_relu_f16(const __half* __restrict__ x,
     if (index < n) {
         const float value = __half2float(x[index]);
         out[index] = __float2half(value >= 0.0f ? value : value * negative_slope);
+    }
+}
+
+__global__ void elu_f16(const __half* __restrict__ x,
+                        __half* __restrict__ out,
+                        int n) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < n) {
+        const float value = __half2float(x[index]);
+        out[index] = __float2half(value >= 0.0f ? value : expm1f(value));
     }
 }
 
@@ -2714,6 +2825,24 @@ __global__ void snake_beta_f16(const __half* __restrict__ x,
         const float magnitude = expf(__half2float(beta[channel])) + 1e-9f;
         const float periodic = sinf(frequency * value);
         out[index] = __float2half(value + periodic * periodic / magnitude);
+    }
+}
+
+// Channel-wise Snake activation with linear (not log-scale) alpha.
+__global__ void snake_f16(const __half* __restrict__ x,
+                          const __half* __restrict__ alpha,
+                          __half* __restrict__ out,
+                          int channels,
+                          int seq_len) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    const int n = channels * seq_len;
+    if (index < n) {
+        const int channel = index / seq_len;
+        const float value = __half2float(x[index]);
+        const float frequency = __half2float(alpha[channel]);
+        const float periodic = sinf(frequency * value);
+        out[index] = __float2half(
+            value + periodic * periodic / (frequency + 1e-9f));
     }
 }
 
