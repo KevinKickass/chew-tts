@@ -55,6 +55,9 @@ Implemented:
   characters without weakening the per-segment codec-frame safety limit;
 - native Kokoro config, PyTorch checkpoint, phoneme-token, and `.pt` voice-pack
   loading with real-storage validation;
+- native Kokoro ALBERT, GPU bidirectional LSTM, duration encoder, style
+  conditioning, duration projection, and acoustic alignment with PyTorch
+  parity;
 - native Chatterbox Multilingual V3 T3, S3Gen, and voice-encoder artifact
   validation;
 - GPU-resident execution of all 30 Chatterbox T3 Llama layers and final norm,

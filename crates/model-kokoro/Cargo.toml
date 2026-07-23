@@ -8,6 +8,9 @@ description = "Native Kokoro model configuration and checkpoint loading for Chew
 [dependencies]
 anyhow.workspace = true
 candle-core.workspace = true
+chew-kernel.workspace = true
+cudarc.workspace = true
+half.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 zip.workspace = true

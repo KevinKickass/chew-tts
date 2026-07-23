@@ -7,7 +7,10 @@ use chew_model_chatterbox::{
     HIDDEN_SIZE as CHATTERBOX_HIDDEN_SIZE, INTERMEDIATE_SIZE as CHATTERBOX_INTERMEDIATE_SIZE,
     S3_HIDDEN_SIZE, inspect_model as inspect_chatterbox_model,
 };
-use chew_model_kokoro::{KokoroVoice, inspect_model as inspect_kokoro_model};
+use chew_model_kokoro::{
+    KokoroAlbert, KokoroBiLstm, KokoroCheckpoint, KokoroProsodyFrontend, KokoroVoice,
+    inspect_model as inspect_kokoro_model,
+};
 use chew_model_qwen3_tts::{
     CodePredictorTransformer, CodecEncoder, CodecQuantizer, CodecTransformerSession,
     SpeakerEncoder, TalkerDecoderLayer, TalkerFrontend, TalkerLayerKvCache, TalkerTransformer,
@@ -88,6 +91,30 @@ enum Command {
         /// Optional already-phonemized input to validate and map to token IDs.
         #[arg(long)]
         phonemes: Option<String>,
+    },
+    /// Run Kokoro's native twelve-pass shared ALBERT and 512-wide projection.
+    CudaKokoroAlbertSmoke {
+        model_dir: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        gpu: usize,
+        phonemes: String,
+    },
+    /// Validate Kokoro's native bidirectional LSTM CUDA cell.
+    CudaKokoroLstmSmoke {
+        model_dir: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        gpu: usize,
+        #[arg(long, default_value_t = 8)]
+        frames: usize,
+    },
+    /// Run Kokoro ALBERT, duration encoder, and duration projection.
+    CudaKokoroProsodySmoke {
+        model_dir: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        gpu: usize,
+        #[arg(long, default_value_t = 1.0)]
+        speed: f32,
+        phonemes: String,
     },
     /// Validate Chatterbox Multilingual V3 T3, S3Gen, and voice-encoder weights.
     InspectChatterbox {
@@ -617,6 +644,90 @@ fn main() -> anyhow::Result<()> {
                     path.display(),
                 );
             }
+        }
+        Command::CudaKokoroAlbertSmoke {
+            model_dir,
+            gpu,
+            phonemes,
+        } => {
+            let config = chew_model_kokoro::KokoroConfig::load(&model_dir)?;
+            let tokens = config.tokenize_phonemes(&phonemes)?;
+            let allocator = chew_vram::VramAllocator::init()?;
+            anyhow::ensure!(gpu < allocator.gpu_count(), "GPU index out of range");
+            let stream = std::sync::Arc::clone(allocator.stream(gpu));
+            let mut kernels = chew_kernel::GpuKernels::load(&stream, 768 * 2_048, 2_048)?;
+            let output =
+                KokoroAlbert::load(&model_dir, &stream)?.encode(&tokens.ids, &mut kernels)?;
+            println!(
+                "Kokoro ALBERT CUDA: tokens={}, sum={:.9}, sum_sq={:.9}, first={:?}",
+                tokens.ids.len(),
+                output.iter().map(|x| f64::from(*x)).sum::<f64>(),
+                output
+                    .iter()
+                    .map(|x| f64::from(*x) * f64::from(*x))
+                    .sum::<f64>(),
+                &output[..8]
+            );
+        }
+        Command::CudaKokoroLstmSmoke {
+            model_dir,
+            gpu,
+            frames,
+        } => {
+            anyhow::ensure!(frames > 0, "frame count must be non-zero");
+            let allocator = chew_vram::VramAllocator::init()?;
+            anyhow::ensure!(gpu < allocator.gpu_count(), "GPU index out of range");
+            let stream = std::sync::Arc::clone(allocator.stream(gpu));
+            let mut kernels = chew_kernel::GpuKernels::load(&stream, 768 * 2_048, 2_048)?;
+            let checkpoint = KokoroCheckpoint::open(model_dir.join("kokoro-v1_0.pth"))?;
+            let input = (0..frames * 640)
+                .map(|index| (index as f32 * 0.013).sin() * 0.2)
+                .collect::<Vec<_>>();
+            let output =
+                KokoroBiLstm::load(&checkpoint, "predictor", "module.lstm", 640, 256, &stream)?
+                    .forward(&input, frames, &mut kernels)?;
+            println!(
+                "Kokoro BiLSTM CUDA: frames={}, sum={:.9}, sum_sq={:.9}, first={:?}",
+                frames,
+                output.iter().map(|x| f64::from(*x)).sum::<f64>(),
+                output
+                    .iter()
+                    .map(|x| f64::from(*x) * f64::from(*x))
+                    .sum::<f64>(),
+                &output[..8]
+            );
+        }
+        Command::CudaKokoroProsodySmoke {
+            model_dir,
+            gpu,
+            speed,
+            phonemes,
+        } => {
+            let config = chew_model_kokoro::KokoroConfig::load(&model_dir)?;
+            let tokens = config.tokenize_phonemes(&phonemes)?;
+            let voice = KokoroVoice::load(&model_dir.join("voices/af_heart.pt"), &config)?;
+            let allocator = chew_vram::VramAllocator::init()?;
+            anyhow::ensure!(gpu < allocator.gpu_count(), "GPU index out of range");
+            let stream = std::sync::Arc::clone(allocator.stream(gpu));
+            let mut kernels = chew_kernel::GpuKernels::load(&stream, 768 * 2_048, 2_048)?;
+            let prosody = KokoroProsodyFrontend::load(&model_dir, &stream)?.predict(
+                &tokens.ids,
+                &voice,
+                speed,
+                &mut kernels,
+            )?;
+            println!(
+                "Kokoro prosody CUDA: tokens={}, acoustic_frames={}, durations={:?}, aligned_sum={:.9}, aligned_sum_sq={:.9}",
+                tokens.ids.len(),
+                prosody.acoustic_frames,
+                prosody.durations,
+                prosody.aligned.iter().map(|x| f64::from(*x)).sum::<f64>(),
+                prosody
+                    .aligned
+                    .iter()
+                    .map(|x| f64::from(*x) * f64::from(*x))
+                    .sum::<f64>(),
+            );
         }
         Command::InspectChatterbox { model_dir } => {
             let inspection = inspect_chatterbox_model(&model_dir)

@@ -90,6 +90,7 @@ pub struct OpsKernels {
     silu_act_f16: CudaFunction,
     leaky_relu_f16: CudaFunction,
     elu_f16: CudaFunction,
+    lstm_cell_f16: CudaFunction,
     mish_f16: CudaFunction,
     repeat_interleave_f16: CudaFunction,
     concat_f32_f16_rows: CudaFunction,
@@ -179,6 +180,7 @@ impl OpsKernels {
             silu_act_f16: loader::get_fn(&module, "silu_act_f16")?,
             leaky_relu_f16: loader::get_fn(&module, "leaky_relu_f16")?,
             elu_f16: loader::get_fn(&module, "elu_f16")?,
+            lstm_cell_f16: loader::get_fn(&module, "lstm_cell_f16")?,
             mish_f16: loader::get_fn(&module, "mish_f16")?,
             repeat_interleave_f16: loader::get_fn(&module, "repeat_interleave_f16")?,
             concat_f32_f16_rows: loader::get_fn(&module, "concat_f32_f16_rows")?,
@@ -674,6 +676,48 @@ impl OpsKernels {
             self.fast.fire(
                 &self.elu_f16,
                 (n.div_ceil(threads), 1, 1),
+                (threads, 1, 1),
+                0,
+                &mut args,
+            );
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn lstm_cell_f16(
+        &self,
+        input_gates: &CudaSlice<half::f16>,
+        hidden_gates: &CudaSlice<half::f16>,
+        bias_ih: &CudaSlice<half::f16>,
+        bias_hh: &CudaSlice<half::f16>,
+        hidden: &mut CudaSlice<half::f16>,
+        cell: &mut CudaSlice<f32>,
+        sequence_output: &mut CudaSlice<half::f16>,
+        hidden_size: u32,
+        timestep: u32,
+        output_timestep: u32,
+    ) -> Result<(), KernelError> {
+        let threads = 256u32;
+        let hs = hidden_size as i32;
+        let ts = timestep as i32;
+        let ots = output_timestep as i32;
+        let mut args: [*mut c_void; 10] = [
+            slice_ptr(input_gates),
+            slice_ptr(hidden_gates),
+            slice_ptr(bias_ih),
+            slice_ptr(bias_hh),
+            slice_ptr_mut(hidden),
+            slice_ptr_mut(cell),
+            slice_ptr_mut(sequence_output),
+            scalar_ptr(&hs),
+            scalar_ptr(&ts),
+            scalar_ptr(&ots),
+        ];
+        unsafe {
+            self.fast.fire(
+                &self.lstm_cell_f16,
+                (hidden_size.div_ceil(threads), 1, 1),
                 (threads, 1, 1),
                 0,
                 &mut args,

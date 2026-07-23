@@ -338,6 +338,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "candle-core",
+ "chew-kernel",
+ "cudarc",
+ "half",
  "serde",
  "serde_json",
  "zip",

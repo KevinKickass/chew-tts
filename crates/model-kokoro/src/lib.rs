@@ -5,6 +5,13 @@ use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+mod albert;
+pub use albert::KokoroAlbert;
+mod lstm;
+pub use lstm::KokoroBiLstm;
+mod prosody;
+pub use prosody::{KokoroProsody, KokoroProsodyFrontend, load_default_voice};
+
 pub const CHECKPOINT_GROUPS: [&str; 5] = [
     "bert",
     "bert_encoder",
@@ -212,6 +219,15 @@ impl KokoroCheckpoint {
             .flatten_all()?
             .to_vec1::<f32>()?;
         Ok((shape, values))
+    }
+
+    pub fn tensor_f16(
+        &self,
+        group: &str,
+        name: &str,
+    ) -> anyhow::Result<(Vec<usize>, Vec<half::f16>)> {
+        let (shape, values) = self.tensor_f32(group, name)?;
+        Ok((shape, values.into_iter().map(half::f16::from_f32).collect()))
     }
 
     /// Materialize a small tensor from every checkpoint group. This catches

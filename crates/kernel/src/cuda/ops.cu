@@ -2765,6 +2765,41 @@ __global__ void elu_f16(const __half* __restrict__ x,
     }
 }
 
+// One PyTorch-compatible LSTM cell. Gate order is input, forget, cell, output.
+__global__ void lstm_cell_f16(const __half* __restrict__ input_gates,
+                              const __half* __restrict__ hidden_gates,
+                              const __half* __restrict__ bias_ih,
+                              const __half* __restrict__ bias_hh,
+                              __half* __restrict__ hidden,
+                              float* __restrict__ cell,
+                              __half* __restrict__ sequence_output,
+                              int hidden_size,
+                              int timestep,
+                              int output_timestep) {
+    const int channel = blockIdx.x * blockDim.x + threadIdx.x;
+    if (channel >= hidden_size) return;
+    float gates[4];
+    #pragma unroll
+    for (int gate = 0; gate < 4; ++gate) {
+        const int index = gate * hidden_size + channel;
+        gates[gate] = __half2float(input_gates[
+            timestep * 4 * hidden_size + index])
+            + __half2float(hidden_gates[index])
+            + __half2float(bias_ih[index])
+            + __half2float(bias_hh[index]);
+    }
+    const float input = 1.0f / (1.0f + expf(-gates[0]));
+    const float forget = 1.0f / (1.0f + expf(-gates[1]));
+    const float candidate = tanhf(gates[2]);
+    const float output = 1.0f / (1.0f + expf(-gates[3]));
+    const float new_cell = forget * cell[channel] + input * candidate;
+    const float new_hidden = output * tanhf(new_cell);
+    cell[channel] = new_cell;
+    hidden[channel] = __float2half(new_hidden);
+    sequence_output[output_timestep * hidden_size + channel] =
+        __float2half(new_hidden);
+}
+
 __global__ void mish_f16(const __half* __restrict__ x,
                          __half* __restrict__ out,
                          int n) {
