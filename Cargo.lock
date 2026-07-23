@@ -300,6 +300,8 @@ dependencies = [
  "chew-vram",
  "clap",
  "half",
+ "serde_json",
+ "tokenizers",
  "tracing-subscriber",
 ]
 

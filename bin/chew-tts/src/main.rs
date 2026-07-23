@@ -1,11 +1,14 @@
 use anyhow::Context;
 use chew_model_qwen3_tts::{
-    CodePredictorTransformer, CodecQuantizer, TalkerDecoderLayer, TalkerLayerKvCache,
-    TalkerTransformer, inspect_model, load_f16_tensor,
+    CodePredictorTransformer, CodecQuantizer, TalkerDecoderLayer, TalkerFrontend,
+    TalkerLayerKvCache, TalkerTransformer, inspect_model, load_f16_tensor,
 };
 use clap::{Parser, Subcommand};
 use std::io::Write;
 use std::path::PathBuf;
+use tokenizers::models::bpe::BPE;
+use tokenizers::pre_tokenizers::byte_level::ByteLevel;
+use tokenizers::{AddedToken, Tokenizer};
 
 #[derive(Debug, Parser)]
 #[command(version, about)]
@@ -20,6 +23,13 @@ enum Command {
     Inspect {
         /// Directory containing config.json and Safetensors weights.
         model_dir: PathBuf,
+    },
+    /// Tokenize text with the model's local Qwen2 BPE files.
+    Tokenize {
+        /// Qwen3-TTS model directory.
+        model_dir: PathBuf,
+        /// Text to encode.
+        text: String,
     },
     /// Compile and load Chew's CUDA kernels for the selected GPU.
     CudaSmoke {
@@ -153,6 +163,23 @@ enum Command {
         #[arg(long)]
         wav: PathBuf,
     },
+    /// Validate native talker embeddings, text projection, and codec head.
+    CudaTalkerFrontendSmoke {
+        /// Qwen3-TTS model directory.
+        model_dir: PathBuf,
+        /// Zero-based CUDA device index.
+        #[arg(long, default_value_t = 0)]
+        gpu: usize,
+        /// Comma-separated text token IDs.
+        #[arg(long, default_value = "1,42,1000")]
+        text_ids: String,
+        /// Tokenize this text instead of using --text-ids.
+        #[arg(long)]
+        text: Option<String>,
+        /// Optional raw little-endian f32 projected-text reference.
+        #[arg(long)]
+        reference: Option<PathBuf>,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -190,6 +217,13 @@ fn main() -> anyhow::Result<()> {
                 inspection.weight_files.len(),
                 inspection.total_weight_bytes as f64 / 1024.0_f64.powi(3)
             );
+        }
+        Command::Tokenize { model_dir, text } => {
+            let tokenizer = load_qwen_tokenizer(&model_dir)?;
+            let encoded = tokenizer
+                .encode(text.as_str(), false)
+                .map_err(|error| anyhow::anyhow!("could not encode text: {error}"))?;
+            println!("{:?}", encoded.get_ids());
         }
         Command::CudaSmoke { gpu } => {
             let allocator = chew_vram::VramAllocator::init()?;
@@ -287,7 +321,125 @@ fn main() -> anyhow::Result<()> {
             frames,
             wav,
         } => cuda_predictor_codec_smoke(&model_dir, gpu, semantic_token, frames, &wav)?,
+        Command::CudaTalkerFrontendSmoke {
+            model_dir,
+            gpu,
+            text_ids,
+            text,
+            reference,
+        } => cuda_talker_frontend_smoke(
+            &model_dir,
+            gpu,
+            &text_ids,
+            text.as_deref(),
+            reference.as_deref(),
+        )?,
     }
+    Ok(())
+}
+
+fn load_qwen_tokenizer(model_dir: &std::path::Path) -> anyhow::Result<Tokenizer> {
+    let vocab = model_dir.join("vocab.json");
+    let merges = model_dir.join("merges.txt");
+    let vocab = vocab.to_string_lossy();
+    let merges = merges.to_string_lossy();
+    let model = BPE::from_file(&vocab, &merges)
+        .build()
+        .map_err(|error| anyhow::anyhow!("could not build Qwen BPE: {error}"))?;
+    let mut tokenizer = Tokenizer::new(model);
+    tokenizer.with_pre_tokenizer(Some(ByteLevel::default().add_prefix_space(false)));
+    tokenizer.with_decoder(Some(ByteLevel::default()));
+
+    let config: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(model_dir.join("tokenizer_config.json"))
+            .context("could not read tokenizer_config.json")?,
+    )?;
+    let decoder = config["added_tokens_decoder"]
+        .as_object()
+        .context("tokenizer_config.json has no added_tokens_decoder")?;
+    let mut entries = decoder
+        .iter()
+        .map(|(id, value)| Ok((id.parse::<u32>().context("invalid added-token ID")?, value)))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    entries.sort_by_key(|(id, _)| *id);
+    let added = entries
+        .into_iter()
+        .map(|(_, value)| {
+            AddedToken::from(
+                value["content"].as_str().unwrap_or_default(),
+                value["special"].as_bool().unwrap_or(false),
+            )
+            .single_word(value["single_word"].as_bool().unwrap_or(false))
+            .lstrip(value["lstrip"].as_bool().unwrap_or(false))
+            .rstrip(value["rstrip"].as_bool().unwrap_or(false))
+            .normalized(value["normalized"].as_bool().unwrap_or(false))
+        })
+        .collect::<Vec<_>>();
+    tokenizer.add_tokens(&added);
+    Ok(tokenizer)
+}
+
+fn cuda_talker_frontend_smoke(
+    model_dir: &std::path::Path,
+    gpu: usize,
+    text_ids: &str,
+    text: Option<&str>,
+    reference: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    let inspection = inspect_model(model_dir)?;
+    let config = &inspection.config.talker_config;
+    let text_ids = if let Some(text) = text {
+        load_qwen_tokenizer(model_dir)?
+            .encode(text, false)
+            .map_err(|error| anyhow::anyhow!("could not encode text: {error}"))?
+            .get_ids()
+            .iter()
+            .map(|id| *id as i32)
+            .collect()
+    } else {
+        text_ids
+            .split(',')
+            .map(|value| value.trim().parse::<i32>())
+            .collect::<Result<Vec<_>, _>>()
+            .context("text IDs must be comma-separated integers")?
+    };
+    let allocator = chew_vram::VramAllocator::init()?;
+    if gpu >= allocator.gpu_count() {
+        anyhow::bail!(
+            "GPU index {gpu} is out of range; detected {} device(s)",
+            allocator.gpu_count()
+        );
+    }
+    let free_before = allocator.free_bytes(gpu)?;
+    let stream = allocator.stream(gpu);
+    let mut kernels = chew_kernel::GpuKernels::load(
+        stream,
+        config.text_hidden_size * config.text_hidden_size,
+        config.text_hidden_size,
+    )?;
+    let load_started = std::time::Instant::now();
+    let frontend = TalkerFrontend::load(model_dir, config, stream)?;
+    let free_loaded = allocator.free_bytes(gpu)?;
+    let started = std::time::Instant::now();
+    let projected = frontend.project_text_tokens(&text_ids, &mut kernels)?;
+    let codec = frontend.codec_embeddings(&[0, 42, 2150], &mut kernels)?;
+    let semantic = frontend.semantic_argmax(
+        &projected[projected.len() - config.hidden_size..],
+        &mut kernels,
+    )?;
+    println!(
+        "talker frontend: {:.1} MiB VRAM, load {:.3}s, forward {:.3}ms",
+        free_before.saturating_sub(free_loaded) as f64 / 1024.0_f64.powi(2),
+        load_started.elapsed().as_secs_f64(),
+        started.elapsed().as_secs_f64() * 1000.0,
+    );
+    println!(
+        "text projected[0..8]={:?}, codec[0..8]={:?}, semantic argmax={semantic}",
+        &projected[..8],
+        &codec[..8],
+    );
+    println!("text IDs: {text_ids:?}");
+    compare_reference(&projected, reference, 0.05)?;
     Ok(())
 }
 

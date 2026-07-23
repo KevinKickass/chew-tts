@@ -35,12 +35,15 @@ Implemented:
   history preserved across frame boundaries;
 - mono 24-kHz PCM16 WAV output from the native codec path;
 - direct code-predictor to continuous-codec integration;
+- local Qwen2 byte-level BPE tokenization from `vocab.json` and `merges.txt`;
+- native talker text/codec embeddings, SwiLU text projection, and semantic head;
 - PyTorch parity checks for real Qwen weights, RoPE, GQA, and cached decoding.
 
 Next:
 
 - one CUDA graph for a complete 16-codebook audio frame;
-- talker semantic-token generation from prepared text and voice conditioning;
+- talker prefill and autoregressive semantic-token generation with voice
+  conditioning;
 - speaker and reference-audio encoders for voice cloning;
 - Kokoro as the second model family.
 
@@ -185,6 +188,21 @@ This currently uses deterministic prepared talker hidden states to exercise
 the boundary. On an RTX 3080, predictor plus codec occupy approximately
 589 MiB and generate three distinct acoustic code frames plus 240 ms of valid
 PCM audio end to end.
+
+The local tokenizer matches Hugging Face token IDs without requiring Python or
+network access:
+
+```bash
+CARGO_TARGET_DIR=/tmp/chew-tts-target \
+  cargo run --release -p chew-tts -- \
+  tokenize /models/Qwen3-TTS-12Hz-1.7B-VoiceDesign "Hallo Welt!"
+```
+
+`cuda-talker-frontend-smoke` validates token embeddings, the two-layer SwiLU
+text projection, codec control-token embeddings, and the semantic codec head.
+The frontend occupies approximately 684 MiB on an RTX 3080. Against the
+independent F32 PyTorch path, projected text has a mean absolute delta below
+0.000008 and both paths select the same semantic argmax token.
 
 ## Requirements
 

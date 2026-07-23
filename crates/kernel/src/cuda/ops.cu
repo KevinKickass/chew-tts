@@ -2231,6 +2231,16 @@ __global__ void gelu_erf_f16(const __half* __restrict__ x,
     }
 }
 
+__global__ void silu_act_f16(const __half* __restrict__ x,
+                             __half* __restrict__ out,
+                             int n) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < n) {
+        const float value = __half2float(x[index]);
+        out[index] = __float2half(value / (1.0f + expf(-value)));
+    }
+}
+
 // Channel-wise SnakeBeta activation over channel-first data.
 __global__ void snake_beta_f16(const __half* __restrict__ x,
                                const __half* __restrict__ alpha,
