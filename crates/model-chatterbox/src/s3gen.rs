@@ -1,3 +1,4 @@
+use crate::{ChatterboxConditioning, ChatterboxFlowEstimator};
 use anyhow::{Context, ensure};
 use chew_kernel::GpuKernels;
 use chew_safetensors::MappedSafetensors;
@@ -35,6 +36,13 @@ pub struct ChatterboxS3Encoder {
     final_norm_bias: CudaSlice<f16>,
     projection_weight: CudaSlice<f16>,
     projection_bias: CudaSlice<f16>,
+}
+
+pub struct ChatterboxS3Flow {
+    encoder: ChatterboxS3Encoder,
+    estimator: ChatterboxFlowEstimator,
+    speaker_weight: Vec<f32>,
+    speaker_bias: Vec<f32>,
 }
 
 /// One inference-mode block from S3Gen's UpsampleConformerEncoder.
@@ -545,6 +553,141 @@ fn linear_norm_scale(
         .ops
         .copy_f16_to_f32(&scaled, &mut output, n as u32)?;
     Ok(output)
+}
+
+impl ChatterboxS3Flow {
+    pub fn load(model_dir: &Path, stream: &Arc<CudaStream>) -> anyhow::Result<Self> {
+        let weights = MappedSafetensors::open(model_dir.join("s3gen_v3.safetensors"))?;
+        let (weight_shape, speaker_weight) =
+            weights.tensor_f32("flow.spk_embed_affine_layer.weight")?;
+        let (bias_shape, speaker_bias) = weights.tensor_f32("flow.spk_embed_affine_layer.bias")?;
+        ensure!(
+            weight_shape == [80, 192],
+            "invalid S3Gen speaker projection"
+        );
+        ensure!(bias_shape == [80], "invalid S3Gen speaker bias");
+        Ok(Self {
+            encoder: ChatterboxS3Encoder::load(model_dir, stream)?,
+            estimator: ChatterboxFlowEstimator::load(model_dir, stream)?,
+            speaker_weight,
+            speaker_bias,
+        })
+    }
+
+    /// Generate the new (non-reference) mel frames with the official cosine
+    /// Euler schedule and CFG rate 0.7.
+    pub fn generate_mel(
+        &self,
+        generated_tokens: &[i32],
+        conditioning: &ChatterboxConditioning,
+        steps: usize,
+        seed: u64,
+        kernels: &mut GpuKernels,
+    ) -> anyhow::Result<Vec<f32>> {
+        ensure!(steps > 0, "CFM step count must be non-zero");
+        ensure!(!generated_tokens.is_empty(), "no generated speech tokens");
+        ensure!(
+            generated_tokens
+                .iter()
+                .all(|token| *token >= 0 && (*token as usize) < S3_VOCAB_SIZE),
+            "generated speech token is outside S3Gen vocabulary"
+        );
+        let mut tokens = conditioning.s3_prompt_tokens.clone();
+        tokens.extend_from_slice(generated_tokens);
+        let mean = self.encoder.encode(&tokens, kernels)?;
+        let frames = tokens.len() * 2;
+        let prompt_frames = conditioning.s3_prompt_feature_frames;
+        ensure!(
+            prompt_frames <= frames
+                && conditioning.s3_prompt_features.len() == prompt_frames * S3_MEL_BINS,
+            "invalid S3Gen prompt feature geometry"
+        );
+        let speaker = project_normalized_speaker(
+            &conditioning.s3_embedding,
+            &self.speaker_weight,
+            &self.speaker_bias,
+        )?;
+        let mut condition = vec![0.0f32; frames * S3_MEL_BINS];
+        condition[..conditioning.s3_prompt_features.len()]
+            .copy_from_slice(&conditioning.s3_prompt_features);
+        let mut state = gaussian_noise(frames * S3_MEL_BINS, seed);
+        for step in 0..steps {
+            let t0 = 1.0 - ((step as f32 / steps as f32) * 0.5 * std::f32::consts::PI).cos();
+            let t1 = 1.0 - (((step + 1) as f32 / steps as f32) * 0.5 * std::f32::consts::PI).cos();
+            let mut conditional = Vec::with_capacity(frames * 320);
+            let mut unconditional = Vec::with_capacity(frames * 320);
+            for frame in 0..frames {
+                let range = frame * S3_MEL_BINS..(frame + 1) * S3_MEL_BINS;
+                conditional.extend_from_slice(&state[range.clone()]);
+                conditional.extend_from_slice(&mean[range.clone()]);
+                conditional.extend_from_slice(&speaker);
+                conditional.extend_from_slice(&condition[range.clone()]);
+                unconditional.extend_from_slice(&state[range]);
+                unconditional.extend(std::iter::repeat_n(0.0, 240));
+            }
+            let velocity_cond = self.estimator.forward(&conditional, frames, t0, kernels)?;
+            let velocity_uncond = self
+                .estimator
+                .forward(&unconditional, frames, t0, kernels)?;
+            let dt = t1 - t0;
+            for ((value, cond), uncond) in state.iter_mut().zip(velocity_cond).zip(velocity_uncond)
+            {
+                *value += dt * (1.7 * cond - 0.7 * uncond);
+            }
+        }
+        Ok(state[prompt_frames * S3_MEL_BINS..].to_vec())
+    }
+}
+
+fn project_normalized_speaker(
+    embedding: &[f32],
+    weight: &[f32],
+    bias: &[f32],
+) -> anyhow::Result<Vec<f32>> {
+    ensure!(
+        embedding.len() == 192,
+        "S3Gen speaker embedding must have 192 values"
+    );
+    let norm = embedding
+        .iter()
+        .map(|value| value * value)
+        .sum::<f32>()
+        .sqrt();
+    ensure!(
+        norm > 0.0 && norm.is_finite(),
+        "invalid S3Gen speaker embedding norm"
+    );
+    Ok((0..80)
+        .map(|row| {
+            bias[row]
+                + embedding
+                    .iter()
+                    .enumerate()
+                    .map(|(column, value)| weight[row * 192 + column] * value / norm)
+                    .sum::<f32>()
+        })
+        .collect())
+}
+
+fn gaussian_noise(count: usize, mut state: u64) -> Vec<f32> {
+    let mut output = Vec::with_capacity(count);
+    while output.len() < count {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let u1 = (((state >> 11) as f64 + 1.0) / ((1u64 << 53) as f64 + 1.0)) as f32;
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let u2 = ((state >> 11) as f64 / (1u64 << 53) as f64) as f32;
+        let radius = (-2.0 * u1.ln()).sqrt();
+        let angle = std::f32::consts::TAU * u2;
+        output.push(radius * angle.cos());
+        if output.len() < count {
+            output.push(radius * angle.sin());
+        }
+    }
+    output
 }
 
 fn espnet_relative_positions(seq_len: usize) -> Vec<f16> {

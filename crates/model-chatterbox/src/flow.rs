@@ -20,6 +20,28 @@ pub struct ChatterboxFlowTimeEmbedding {
     linear2_bias: CudaSlice<f16>,
 }
 
+pub struct ChatterboxFlowEstimator {
+    time: ChatterboxFlowTimeEmbedding,
+    down_resnet: ChatterboxFlowResnetBlock,
+    down_transformers: Vec<ChatterboxFlowTransformerBlock>,
+    downsample_weight: CudaSlice<f16>,
+    downsample_bias: CudaSlice<f16>,
+    mid: Vec<(
+        ChatterboxFlowResnetBlock,
+        Vec<ChatterboxFlowTransformerBlock>,
+    )>,
+    up_resnet: ChatterboxFlowResnetBlock,
+    up_transformers: Vec<ChatterboxFlowTransformerBlock>,
+    upsample_weight: CudaSlice<f16>,
+    upsample_bias: CudaSlice<f16>,
+    final_weight: CudaSlice<f16>,
+    final_bias: CudaSlice<f16>,
+    final_norm_weight: CudaSlice<f16>,
+    final_norm_bias: CudaSlice<f16>,
+    projection_weight: CudaSlice<f16>,
+    projection_bias: CudaSlice<f16>,
+}
+
 pub struct ChatterboxFlowResnetBlock {
     input_channels: usize,
     conv1_weight: CudaSlice<f16>,
@@ -99,9 +121,24 @@ impl ChatterboxFlowTransformerBlock {
         let stream = Arc::clone(kernels.ops.stream());
         let n = seq_len * DIM;
         let mut hidden = stream.clone_htod(input)?;
+        self.forward_device(&mut hidden, seq_len, kernels)?;
+        stream.synchronize()?;
+        let mut output = vec![0.0; n];
+        stream.memcpy_dtoh(&hidden, &mut output)?;
+        Ok(output)
+    }
+
+    fn forward_device(
+        &self,
+        hidden: &mut CudaSlice<f32>,
+        seq_len: usize,
+        kernels: &mut GpuKernels,
+    ) -> anyhow::Result<()> {
+        let stream = Arc::clone(kernels.ops.stream());
+        let n = seq_len * DIM;
         let mut norm = stream.alloc_zeros::<f16>(n)?;
         kernels.ops.layer_norm_f32in(
-            &hidden,
+            hidden,
             &self.norm1_weight,
             &self.norm1_bias,
             &mut norm,
@@ -152,12 +189,10 @@ impl ChatterboxFlowTransformerBlock {
         kernels
             .ops
             .add_bias_f16_inplace(&mut delta, &self.out_bias, seq_len as u32, DIM as u32)?;
-        kernels
-            .ops
-            .add_inplace_f32_f16(&mut hidden, &delta, n as u32)?;
+        kernels.ops.add_inplace_f32_f16(hidden, &delta, n as u32)?;
 
         kernels.ops.layer_norm_f32in(
-            &hidden,
+            hidden,
             &self.norm3_weight,
             &self.norm3_bias,
             &mut norm,
@@ -192,13 +227,8 @@ impl ChatterboxFlowTransformerBlock {
         kernels
             .ops
             .add_bias_f16_inplace(&mut delta, &self.ff2_bias, seq_len as u32, DIM as u32)?;
-        kernels
-            .ops
-            .add_inplace_f32_f16(&mut hidden, &delta, n as u32)?;
-        stream.synchronize()?;
-        let mut output = vec![0.0; n];
-        stream.memcpy_dtoh(&hidden, &mut output)?;
-        Ok(output)
+        kernels.ops.add_inplace_f32_f16(hidden, &delta, n as u32)?;
+        Ok(())
     }
 }
 
@@ -228,6 +258,19 @@ impl ChatterboxFlowTimeEmbedding {
     }
 
     pub fn forward(&self, timestep: f32, kernels: &mut GpuKernels) -> anyhow::Result<Vec<f32>> {
+        let stream = Arc::clone(kernels.ops.stream());
+        let output = self.forward_device(timestep, kernels)?;
+        stream.synchronize()?;
+        let mut host = vec![f16::ZERO; FF_DIM];
+        stream.memcpy_dtoh(&output, &mut host)?;
+        Ok(host.into_iter().map(f16::to_f32).collect())
+    }
+
+    fn forward_device(
+        &self,
+        timestep: f32,
+        kernels: &mut GpuKernels,
+    ) -> anyhow::Result<CudaSlice<f16>> {
         let stream = Arc::clone(kernels.ops.stream());
         let half_dim = TIME_INPUT_DIM / 2;
         let exponent_scale = 10_000.0f32.ln() / (half_dim - 1) as f32;
@@ -266,10 +309,7 @@ impl ChatterboxFlowTimeEmbedding {
         kernels
             .ops
             .add_bias_f16_inplace(&mut output, &self.linear2_bias, 1, FF_DIM as u32)?;
-        stream.synchronize()?;
-        let mut host = vec![f16::ZERO; FF_DIM];
-        stream.memcpy_dtoh(&output, &mut host)?;
-        Ok(host.into_iter().map(f16::to_f32).collect())
+        Ok(output)
     }
 }
 
@@ -323,9 +363,35 @@ impl ChatterboxFlowResnetBlock {
             "invalid flow ResNet input"
         );
         let stream = Arc::clone(kernels.ops.stream());
-        let input_f16 = input.iter().copied().map(f16::from_f32).collect::<Vec<_>>();
-        let input_f16 = stream.clone_htod(&input_f16)?;
-        let mut input_cf = stream.alloc_zeros::<f16>(input.len())?;
+        let input = stream.clone_htod(input)?;
+        let time = time_embedding
+            .iter()
+            .copied()
+            .map(f16::from_f32)
+            .collect::<Vec<_>>();
+        let time = stream.clone_htod(&time)?;
+        let output = self.forward_device(&input, seq_len, &time, kernels)?;
+        stream.synchronize()?;
+        let mut host = vec![0.0; seq_len * DIM];
+        stream.memcpy_dtoh(&output, &mut host)?;
+        Ok(host)
+    }
+
+    fn forward_device(
+        &self,
+        input: &CudaSlice<f32>,
+        seq_len: usize,
+        time_embedding: &CudaSlice<f16>,
+        kernels: &mut GpuKernels,
+    ) -> anyhow::Result<CudaSlice<f32>> {
+        let stream = Arc::clone(kernels.ops.stream());
+        let mut input_f16 = stream.alloc_zeros::<f16>(seq_len * self.input_channels)?;
+        kernels.ops.copy_f32_to_f16(
+            input,
+            &mut input_f16.slice_mut(..),
+            (seq_len * self.input_channels) as u32,
+        )?;
+        let mut input_cf = stream.alloc_zeros::<f16>(seq_len * self.input_channels)?;
         kernels.ops.transpose_f16(
             &input_f16,
             &mut input_cf,
@@ -357,18 +423,13 @@ impl ChatterboxFlowResnetBlock {
             kernels,
         )?;
 
-        let time = time_embedding
-            .iter()
-            .copied()
-            .map(f16::from_f32)
-            .collect::<Vec<_>>();
-        let mut time = stream.clone_htod(&time)?;
         let mut time_mish = stream.alloc_zeros::<f16>(FF_DIM)?;
-        kernels.ops.mish_f16(&time, &mut time_mish, FF_DIM as u32)?;
-        std::mem::swap(&mut time, &mut time_mish);
+        kernels
+            .ops
+            .mish_f16(time_embedding, &mut time_mish, FF_DIM as u32)?;
         let mut time_out = stream.alloc_zeros::<f16>(DIM)?;
         kernels.gemv.gemv_f16(
-            &time,
+            &time_mish,
             &self.time_weight,
             &mut time_out,
             DIM as u32,
@@ -431,11 +492,248 @@ impl ChatterboxFlowResnetBlock {
         kernels
             .ops
             .add_f16(&second, &residual, &mut output, (seq_len * DIM) as u32)?;
+        let mut output_f32 = stream.alloc_zeros::<f32>(seq_len * DIM)?;
+        kernels
+            .ops
+            .copy_f16_to_f32(&output, &mut output_f32, (seq_len * DIM) as u32)?;
+        Ok(output_f32)
+    }
+}
+
+impl ChatterboxFlowEstimator {
+    pub fn load(model_dir: &Path, stream: &Arc<CudaStream>) -> anyhow::Result<Self> {
+        let weights = MappedSafetensors::open(model_dir.join("s3gen_v3.safetensors"))?;
+        let load = |name: &str, shape: &[usize]| -> anyhow::Result<CudaSlice<f16>> {
+            let (actual, values) = weights.tensor_f16(name)?;
+            ensure!(
+                actual == shape,
+                "{name}: got {actual:?}, expected {shape:?}"
+            );
+            Ok(stream.clone_htod(&values)?)
+        };
+        let transformer_group = |group: &str, stream: &Arc<CudaStream>| -> anyhow::Result<Vec<_>> {
+            (0..4)
+                .map(|index| {
+                    ChatterboxFlowTransformerBlock::load(
+                        model_dir,
+                        &format!("{group}.{index}"),
+                        stream,
+                    )
+                })
+                .collect()
+        };
+        let mut mid = Vec::with_capacity(12);
+        for index in 0..12 {
+            let base = format!("flow.decoder.estimator.mid_blocks.{index}");
+            mid.push((
+                ChatterboxFlowResnetBlock::load(model_dir, &format!("{base}.0"), stream)?,
+                transformer_group(&format!("{base}.1"), stream)?,
+            ));
+        }
+        Ok(Self {
+            time: ChatterboxFlowTimeEmbedding::load(model_dir, stream)?,
+            down_resnet: ChatterboxFlowResnetBlock::load(
+                model_dir,
+                "flow.decoder.estimator.down_blocks.0.0",
+                stream,
+            )?,
+            down_transformers: transformer_group("flow.decoder.estimator.down_blocks.0.1", stream)?,
+            downsample_weight: load(
+                "flow.decoder.estimator.down_blocks.0.2.weight",
+                &[DIM, DIM, 3],
+            )?,
+            downsample_bias: load("flow.decoder.estimator.down_blocks.0.2.bias", &[DIM])?,
+            mid,
+            up_resnet: ChatterboxFlowResnetBlock::load(
+                model_dir,
+                "flow.decoder.estimator.up_blocks.0.0",
+                stream,
+            )?,
+            up_transformers: transformer_group("flow.decoder.estimator.up_blocks.0.1", stream)?,
+            upsample_weight: load(
+                "flow.decoder.estimator.up_blocks.0.2.weight",
+                &[DIM, DIM, 3],
+            )?,
+            upsample_bias: load("flow.decoder.estimator.up_blocks.0.2.bias", &[DIM])?,
+            final_weight: load(
+                "flow.decoder.estimator.final_block.block.0.weight",
+                &[DIM, DIM, 3],
+            )?,
+            final_bias: load("flow.decoder.estimator.final_block.block.0.bias", &[DIM])?,
+            final_norm_weight: load("flow.decoder.estimator.final_block.block.2.weight", &[DIM])?,
+            final_norm_bias: load("flow.decoder.estimator.final_block.block.2.bias", &[DIM])?,
+            projection_weight: load("flow.decoder.estimator.final_proj.weight", &[80, DIM, 1])?,
+            projection_bias: load("flow.decoder.estimator.final_proj.bias", &[80])?,
+        })
+    }
+
+    /// One conditional-flow velocity evaluation. Input is frame-major
+    /// [frames, 320] = noisy mel, encoder mean, speaker, and prompt condition.
+    pub fn forward(
+        &self,
+        input: &[f32],
+        frames: usize,
+        timestep: f32,
+        kernels: &mut GpuKernels,
+    ) -> anyhow::Result<Vec<f32>> {
+        ensure!(
+            frames > 0 && input.len() == frames * 320,
+            "flow estimator expects [frames, 320]"
+        );
+        let stream = Arc::clone(kernels.ops.stream());
+        let input = stream.clone_htod(input)?;
+        let time = self.time.forward_device(timestep, kernels)?;
+        let mut hidden = self
+            .down_resnet
+            .forward_device(&input, frames, &time, kernels)?;
+        for block in &self.down_transformers {
+            block.forward_device(&mut hidden, frames, kernels)?;
+        }
+        let mut skip = stream.alloc_zeros::<f16>(frames * DIM)?;
+        kernels
+            .ops
+            .copy_f32_to_f16(&hidden, &mut skip.slice_mut(..), (frames * DIM) as u32)?;
+        hidden = causal_conv_frame_major(
+            &hidden,
+            frames,
+            DIM,
+            DIM,
+            &self.downsample_weight,
+            &self.downsample_bias,
+            3,
+            kernels,
+        )?;
+        for (resnet, transformers) in &self.mid {
+            hidden = resnet.forward_device(&hidden, frames, &time, kernels)?;
+            for block in transformers {
+                block.forward_device(&mut hidden, frames, kernels)?;
+            }
+        }
+        let mut joined = stream.alloc_zeros::<f32>(frames * DIM * 2)?;
+        kernels
+            .ops
+            .concat_f32_f16_rows(&hidden, &skip, &mut joined, frames as u32, 256, 256)?;
+        hidden = self
+            .up_resnet
+            .forward_device(&joined, frames, &time, kernels)?;
+        for block in &self.up_transformers {
+            block.forward_device(&mut hidden, frames, kernels)?;
+        }
+        hidden = causal_conv_frame_major(
+            &hidden,
+            frames,
+            DIM,
+            DIM,
+            &self.upsample_weight,
+            &self.upsample_bias,
+            3,
+            kernels,
+        )?;
+        let final_conv = causal_conv_frame_major_f16(
+            &hidden,
+            frames,
+            DIM,
+            DIM,
+            &self.final_weight,
+            &self.final_bias,
+            3,
+            kernels,
+        )?;
+        let final_hidden = norm_mish(
+            &final_conv,
+            frames,
+            &self.final_norm_weight,
+            &self.final_norm_bias,
+            kernels,
+        )?;
+        let mut output = stream.alloc_zeros::<f16>(frames * 80)?;
+        kernels.gemm.matmul_f16(
+            &final_hidden,
+            &self.projection_weight,
+            &mut output,
+            frames as u32,
+            80,
+            DIM as u32,
+        )?;
+        kernels
+            .ops
+            .add_bias_f16_inplace(&mut output, &self.projection_bias, frames as u32, 80)?;
         stream.synchronize()?;
-        let mut host = vec![f16::ZERO; seq_len * DIM];
+        let mut host = vec![f16::ZERO; frames * 80];
         stream.memcpy_dtoh(&output, &mut host)?;
         Ok(host.into_iter().map(f16::to_f32).collect())
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn causal_conv_frame_major(
+    input: &CudaSlice<f32>,
+    frames: usize,
+    in_channels: usize,
+    out_channels: usize,
+    weight: &CudaSlice<f16>,
+    bias: &CudaSlice<f16>,
+    kernel: usize,
+    kernels: &mut GpuKernels,
+) -> anyhow::Result<CudaSlice<f32>> {
+    let f16 = causal_conv_frame_major_f16(
+        input,
+        frames,
+        in_channels,
+        out_channels,
+        weight,
+        bias,
+        kernel,
+        kernels,
+    )?;
+    let stream = Arc::clone(kernels.ops.stream());
+    let mut output = stream.alloc_zeros::<f32>(frames * out_channels)?;
+    kernels
+        .ops
+        .copy_f16_to_f32(&f16, &mut output, (frames * out_channels) as u32)?;
+    Ok(output)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn causal_conv_frame_major_f16(
+    input: &CudaSlice<f32>,
+    frames: usize,
+    in_channels: usize,
+    out_channels: usize,
+    weight: &CudaSlice<f16>,
+    bias: &CudaSlice<f16>,
+    kernel: usize,
+    kernels: &mut GpuKernels,
+) -> anyhow::Result<CudaSlice<f16>> {
+    let stream = Arc::clone(kernels.ops.stream());
+    let mut sequence = stream.alloc_zeros::<f16>(frames * in_channels)?;
+    kernels.ops.copy_f32_to_f16(
+        input,
+        &mut sequence.slice_mut(..),
+        (frames * in_channels) as u32,
+    )?;
+    let mut channels = stream.alloc_zeros::<f16>(frames * in_channels)?;
+    kernels
+        .ops
+        .transpose_f16(&sequence, &mut channels, frames as u32, in_channels as u32)?;
+    let mut convolved = stream.alloc_zeros::<f16>(frames * out_channels)?;
+    kernels.ops.conv1d_causal_f16(
+        &channels,
+        weight,
+        bias,
+        &mut convolved,
+        in_channels as u32,
+        out_channels as u32,
+        frames as u32,
+        kernel as u32,
+        1,
+        1,
+    )?;
+    let mut output = stream.alloc_zeros::<f16>(frames * out_channels)?;
+    kernels
+        .ops
+        .transpose_f16(&convolved, &mut output, out_channels as u32, frames as u32)?;
+    Ok(output)
 }
 
 fn norm_mish(

@@ -2681,6 +2681,23 @@ __global__ void repeat_interleave_f16(const __half* __restrict__ x,
     }
 }
 
+__global__ void concat_f32_f16_rows(const float* __restrict__ left,
+                                    const __half* __restrict__ right,
+                                    float* __restrict__ out,
+                                    int rows,
+                                    int left_dim,
+                                    int right_dim) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    const int width = left_dim + right_dim;
+    if (index < rows * width) {
+        const int row = index / width;
+        const int col = index % width;
+        out[index] = col < left_dim
+            ? left[row * left_dim + col]
+            : __half2float(right[row * right_dim + col - left_dim]);
+    }
+}
+
 // Channel-wise SnakeBeta activation over channel-first data.
 __global__ void snake_beta_f16(const __half* __restrict__ x,
                                const __half* __restrict__ alpha,

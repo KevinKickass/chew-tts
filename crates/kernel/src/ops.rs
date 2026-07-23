@@ -89,6 +89,7 @@ pub struct OpsKernels {
     leaky_relu_f16: CudaFunction,
     mish_f16: CudaFunction,
     repeat_interleave_f16: CudaFunction,
+    concat_f32_f16_rows: CudaFunction,
     snake_beta_f16: CudaFunction,
     clamp_f16: CudaFunction,
 }
@@ -173,6 +174,7 @@ impl OpsKernels {
             leaky_relu_f16: loader::get_fn(&module, "leaky_relu_f16")?,
             mish_f16: loader::get_fn(&module, "mish_f16")?,
             repeat_interleave_f16: loader::get_fn(&module, "repeat_interleave_f16")?,
+            concat_f32_f16_rows: loader::get_fn(&module, "concat_f32_f16_rows")?,
             snake_beta_f16: loader::get_fn(&module, "snake_beta_f16")?,
             clamp_f16: loader::get_fn(&module, "clamp_f16")?,
             _module: module,
@@ -593,6 +595,40 @@ impl OpsKernels {
         unsafe {
             self.fast.fire(
                 &self.repeat_interleave_f16,
+                (n.div_ceil(threads), 1, 1),
+                (threads, 1, 1),
+                0,
+                &mut args,
+            );
+        }
+        Ok(())
+    }
+
+    pub fn concat_f32_f16_rows(
+        &self,
+        left: &CudaSlice<f32>,
+        right: &CudaSlice<half::f16>,
+        out: &mut CudaSlice<f32>,
+        rows: u32,
+        left_dim: u32,
+        right_dim: u32,
+    ) -> Result<(), KernelError> {
+        let n = rows * (left_dim + right_dim);
+        let threads = 256;
+        let rows_i = rows as i32;
+        let left_i = left_dim as i32;
+        let right_i = right_dim as i32;
+        let mut args: [*mut c_void; 6] = [
+            slice_ptr(left),
+            slice_ptr(right),
+            slice_ptr_mut(out),
+            scalar_ptr(&rows_i),
+            scalar_ptr(&left_i),
+            scalar_ptr(&right_i),
+        ];
+        unsafe {
+            self.fast.fire(
+                &self.concat_f32_f16_rows,
                 (n.div_ceil(threads), 1, 1),
                 (threads, 1, 1),
                 0,

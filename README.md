@@ -64,6 +64,9 @@ Implemented:
 - the complete native S3Gen token-conditioning encoder: lookahead convolution,
   6+4 relative-attention Conformer blocks, 2x upsampling, and the 80-bin flow
   projection, checked against the official FP16 PyTorch path on an RTX 3080.
+- the complete GPU-resident S3Gen conditional-flow estimator with causal
+  ResNet blocks, 64 attention/FFN blocks, skip connection, cosine Euler
+  integration, and classifier-free guidance;
 
 Next:
 
@@ -71,7 +74,7 @@ Next:
 - optimized one-pass model loading and GPU-resident sampling;
 - arbitrary compressed reference-audio input in addition to native WAV;
 - Kokoro Albert, duration/prosody, and iSTFTNet CUDA inference;
-- Chatterbox S3Gen conditional-flow decoder and HiFT waveform generator.
+- Chatterbox HiFT mel-to-waveform generator.
 
 ## Why a separate repository?
 
@@ -155,6 +158,11 @@ For 257 input tokens (157 reference tokens plus a representative 100 generated
 tokens), the encoder produces 514 flow-conditioning frames in about 1.15
 seconds wall time on an RTX 3080, including process startup, model loading, and
 NVRTC kernel loading.
+
+The native ten-step CFM path, including both conditional and unconditional CFG
+evaluations, takes about 15 seconds for 100 generated speech tokens (200 new
+mel frames) on the same GPU. This measurement also includes process startup,
+model loading, NVRTC, and the token-conditioning encoder.
 
 ## CUDA validation
 

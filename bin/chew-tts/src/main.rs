@@ -1,10 +1,11 @@
 use anyhow::Context;
 use chew_model_chatterbox::{
-    ChatterboxConditioning, ChatterboxFlowResnetBlock, ChatterboxFlowTimeEmbedding,
-    ChatterboxFlowTransformerBlock, ChatterboxS3ConformerLayer, ChatterboxS3Encoder,
-    ChatterboxT3Frontend, ChatterboxT3Layer, ChatterboxT3Transformer, ChatterboxTokenizer,
-    HIDDEN_SIZE as CHATTERBOX_HIDDEN_SIZE, INTERMEDIATE_SIZE as CHATTERBOX_INTERMEDIATE_SIZE,
-    S3_HIDDEN_SIZE, inspect_model as inspect_chatterbox_model,
+    ChatterboxConditioning, ChatterboxFlowEstimator, ChatterboxFlowResnetBlock,
+    ChatterboxFlowTimeEmbedding, ChatterboxFlowTransformerBlock, ChatterboxS3ConformerLayer,
+    ChatterboxS3Encoder, ChatterboxS3Flow, ChatterboxT3Frontend, ChatterboxT3Layer,
+    ChatterboxT3Transformer, ChatterboxTokenizer, HIDDEN_SIZE as CHATTERBOX_HIDDEN_SIZE,
+    INTERMEDIATE_SIZE as CHATTERBOX_INTERMEDIATE_SIZE, S3_HIDDEN_SIZE,
+    inspect_model as inspect_chatterbox_model,
 };
 use chew_model_kokoro::{KokoroVoice, inspect_model as inspect_kokoro_model};
 use chew_model_qwen3_tts::{
@@ -179,6 +180,26 @@ enum Command {
         gpu: usize,
         #[arg(long, default_value_t = 0.35)]
         timestep: f32,
+    },
+    /// Run one complete native S3Gen conditional-flow velocity evaluation.
+    CudaChatterboxFlowEstimatorSmoke {
+        model_dir: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        gpu: usize,
+        #[arg(long, default_value_t = 8)]
+        frames: usize,
+        #[arg(long, default_value_t = 0.35)]
+        timestep: f32,
+    },
+    /// Run native S3Gen conditioning and CFM Euler sampling to mel frames.
+    CudaChatterboxFlowSmoke {
+        model_dir: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        gpu: usize,
+        #[arg(long, default_value_t = 1)]
+        steps: usize,
+        #[arg(long, default_value_t = 4)]
+        generated_tokens: usize,
     },
     /// Generate native Chatterbox speech tokens through the complete T3 path.
     CudaChatterboxGenerationSmoke {
@@ -846,6 +867,73 @@ fn main() -> anyhow::Result<()> {
             println!(
                 "Chatterbox flow time CUDA: sum={sum:.9}, sum_sq={sum_sq:.9}, first={:?}",
                 &output[..8]
+            );
+        }
+        Command::CudaChatterboxFlowEstimatorSmoke {
+            model_dir,
+            gpu,
+            frames,
+            timestep,
+        } => {
+            anyhow::ensure!(frames > 0, "frame count must be non-zero");
+            let allocator = chew_vram::VramAllocator::init()?;
+            anyhow::ensure!(gpu < allocator.gpu_count(), "GPU index out of range");
+            let stream = std::sync::Arc::clone(allocator.stream(gpu));
+            let mut kernels = chew_kernel::GpuKernels::load(&stream, 1_024 * 1_024, 1_024)?;
+            let input = (0..frames * 320)
+                .map(|i| (i as f32 * 0.013).sin() * 0.2 + 0.01)
+                .collect::<Vec<_>>();
+            let output = ChatterboxFlowEstimator::load(&model_dir, &stream)?.forward(
+                &input,
+                frames,
+                timestep,
+                &mut kernels,
+            )?;
+            let sum = output.iter().map(|x| f64::from(*x)).sum::<f64>();
+            let sum_sq = output
+                .iter()
+                .map(|x| f64::from(*x) * f64::from(*x))
+                .sum::<f64>();
+            println!(
+                "Chatterbox flow estimator CUDA: sum={sum:.9}, sum_sq={sum_sq:.9}, first={:?}",
+                &output[..8]
+            );
+        }
+        Command::CudaChatterboxFlowSmoke {
+            model_dir,
+            gpu,
+            steps,
+            generated_tokens,
+        } => {
+            anyhow::ensure!(
+                generated_tokens > 0,
+                "generated token count must be non-zero"
+            );
+            let allocator = chew_vram::VramAllocator::init()?;
+            anyhow::ensure!(gpu < allocator.gpu_count(), "GPU index out of range");
+            let stream = std::sync::Arc::clone(allocator.stream(gpu));
+            let mut kernels =
+                chew_kernel::GpuKernels::load(&stream, S3_HIDDEN_SIZE * 2_048, 2_048)?;
+            let conditioning = ChatterboxConditioning::load(&model_dir.join("conds.pt"))?;
+            let tokens = (0..generated_tokens)
+                .map(|index| ((index * 977 + 31) % 6_561) as i32)
+                .collect::<Vec<_>>();
+            let mel = ChatterboxS3Flow::load(&model_dir, &stream)?.generate_mel(
+                &tokens,
+                &conditioning,
+                steps,
+                42,
+                &mut kernels,
+            )?;
+            let sum = mel.iter().map(|x| f64::from(*x)).sum::<f64>();
+            let sum_sq = mel
+                .iter()
+                .map(|x| f64::from(*x) * f64::from(*x))
+                .sum::<f64>();
+            println!(
+                "Chatterbox CFM CUDA: frames={}, sum={sum:.9}, sum_sq={sum_sq:.9}, first={:?}",
+                mel.len() / 80,
+                &mel[..8]
             );
         }
         Command::CudaChatterboxGenerationSmoke {
