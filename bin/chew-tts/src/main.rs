@@ -661,6 +661,7 @@ fn cuda_voice_design_smoke(
     let predictor =
         CodePredictorTransformer::load(model_dir, &config.code_predictor_config, stream)?;
     let mut predictor_session = predictor.start_generation_session(stream)?;
+    let mut semantic_session = frontend.start_semantic_sampling_session(max_frames, stream)?;
     let codec = CodecQuantizer::load(model_dir.join("speech_tokenizer"), stream)?;
     let load_elapsed = load_started.elapsed();
     let free_loaded = allocator.free_bytes(gpu)?;
@@ -689,7 +690,8 @@ fn cuda_voice_design_smoke(
     )?;
     let mut last_hidden = normalized[normalized.len() - config.hidden_size..].to_vec();
     let mut generated_semantics = Vec::with_capacity(max_frames);
-    let mut semantic = frontend.semantic_speech_sample(
+    let mut semantic = frontend.semantic_speech_sample_with_session(
+        &mut semantic_session,
         &last_hidden,
         &generated_semantics,
         temperature,
@@ -777,7 +779,8 @@ fn cuda_voice_design_smoke(
             .map(|((semantic, acoustic), text)| semantic + acoustic + text)
             .collect::<Vec<_>>();
         last_hidden = talker.forward_session(&mut session, &next_input, 1, config, &mut kernels)?;
-        semantic = frontend.semantic_speech_sample(
+        semantic = frontend.semantic_speech_sample_with_session(
+            &mut semantic_session,
             &last_hidden,
             &generated_semantics,
             temperature,

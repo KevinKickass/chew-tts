@@ -257,11 +257,12 @@ output is 26 PCM16 levels and only 14 around the chunk boundary. Use
 `--chunk-frames 0` for exact full-sequence decoding.
 
 The current optimized acoustic path sustains roughly 95% GPU utilization on an
-RTX 3080. Exact Top-K 50 sampling stays on the GPU, and Tensor-Core/cuBLAS
+RTX 3080. Exact semantic and acoustic Top-K 50 sampling, including semantic
+token filtering and repetition penalty, stays on the GPU. Tensor-Core/cuBLAS
 convolution lowers the complete 32-frame codec from approximately 726 ms to
 32 ms. A 2.64-second VoiceDesign boundary-stress run now takes approximately
-0.75 seconds total inference (RTF 0.28), including 61 ms of interleaved codec
-work. Repeated runs with the same seed produce byte-identical WAV files.
+0.73 seconds total inference (RTF 0.28), including roughly 60 ms of interleaved
+codec work. Repeated runs with the same seed produce byte-identical WAV files.
 
 ## Requirements
 

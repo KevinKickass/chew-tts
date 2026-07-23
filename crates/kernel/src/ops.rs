@@ -40,6 +40,7 @@ pub struct OpsKernels {
     argmax_f16: CudaFunction,
     sample_top_k: CudaFunction,
     sample_top_k_small: CudaFunction,
+    sample_top_k_small_filtered: CudaFunction,
     mha_fused: CudaFunction,
     mha_naive: CudaFunction,
     mha_naive_full: CudaFunction,
@@ -118,6 +119,10 @@ impl OpsKernels {
             argmax_f16: loader::get_fn(&module, "argmax_f16")?,
             sample_top_k: loader::get_fn(&module, "sample_top_k")?,
             sample_top_k_small: loader::get_fn(&module, "sample_top_k_small")?,
+            sample_top_k_small_filtered: loader::get_fn(
+                &module,
+                "sample_top_k_small_filtered",
+            )?,
             mha_fused: loader::get_fn(&module, "mha_fused")?,
             mha_naive: loader::get_fn(&module, "mha_naive")?,
             mha_naive_full: loader::get_fn(&module, "mha_naive_full")?,
@@ -1404,6 +1409,52 @@ impl OpsKernels {
                 .arg(&temperature)
                 .arg(&tk)
                 .arg(&random_seed)
+                .launch(cfg)
+                .map_err(|e| KernelError::Launch(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Exact filtered sampling for Qwen TTS semantic speech tokens.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sample_top_k_small_filtered(
+        &self,
+        logits: &CudaSlice<half::f16>,
+        previous: &CudaSlice<i32>,
+        out: &mut CudaSlice<i32>,
+        vocab_size: u32,
+        speech_vocab_size: u32,
+        eos_token: u32,
+        previous_count: u32,
+        temperature: f32,
+        repetition_penalty: f32,
+        top_k: u32,
+        random_bits: u32,
+    ) -> Result<(), KernelError> {
+        let cfg = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let vs = vocab_size as i32;
+        let svs = speech_vocab_size as i32;
+        let eos = eos_token as i32;
+        let count = previous_count as i32;
+        let tk = top_k as i32;
+        unsafe {
+            self.stream
+                .launch_builder(&self.sample_top_k_small_filtered)
+                .arg(logits)
+                .arg(previous)
+                .arg(out)
+                .arg(&vs)
+                .arg(&svs)
+                .arg(&eos)
+                .arg(&count)
+                .arg(&temperature)
+                .arg(&repetition_penalty)
+                .arg(&tk)
+                .arg(&random_bits)
                 .launch(cfg)
                 .map_err(|e| KernelError::Launch(e.to_string()))?;
         }

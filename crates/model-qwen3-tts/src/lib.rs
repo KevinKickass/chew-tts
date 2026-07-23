@@ -13,7 +13,7 @@ pub use cuda::{
     TalkerDecoderLayer, TalkerGenerationSession, TalkerLayerKvCache, TalkerLayerScratch,
     TalkerTransformer,
 };
-pub use frontend::{TalkerFrontend, VoiceDesignInputs};
+pub use frontend::{SemanticSamplingSession, TalkerFrontend, VoiceDesignInputs};
 pub use predictor::{CodePredictorGenerationSession, CodePredictorTransformer};
 
 use chew_safetensors::{MappedSafetensors, TensorInfo};

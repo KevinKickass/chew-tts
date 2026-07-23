@@ -6,6 +6,15 @@ use half::f16;
 use std::path::Path;
 use std::sync::Arc;
 
+/// Reusable GPU storage for semantic speech sampling.
+pub struct SemanticSamplingSession {
+    hidden: CudaSlice<f16>,
+    logits: CudaSlice<f16>,
+    previous: CudaSlice<i32>,
+    token: CudaSlice<i32>,
+    max_previous: usize,
+}
+
 /// Native text/codec embeddings and projections surrounding the talker stack.
 pub struct TalkerFrontend {
     text_embedding: CudaSlice<f16>,
@@ -31,6 +40,24 @@ pub struct VoiceDesignInputs {
 }
 
 impl TalkerFrontend {
+    pub fn start_semantic_sampling_session(
+        &self,
+        max_previous: usize,
+        stream: &Arc<CudaStream>,
+    ) -> anyhow::Result<SemanticSamplingSession> {
+        ensure!(
+            max_previous > 0,
+            "semantic sampler must hold at least one token"
+        );
+        Ok(SemanticSamplingSession {
+            hidden: stream.alloc_zeros::<f16>(self.hidden_size)?,
+            logits: stream.alloc_zeros::<f16>(self.codec_vocab_size)?,
+            previous: stream.alloc_zeros::<i32>(max_previous)?,
+            token: stream.alloc_zeros::<i32>(1)?,
+            max_previous,
+        })
+    }
+
     pub fn load(
         model_dir: impl AsRef<Path>,
         config: &TalkerConfig,
@@ -304,6 +331,70 @@ impl TalkerFrontend {
             repetition_penalty,
             seed,
         ))
+    }
+
+    /// Sample one semantic speech token while keeping logits and scratch on GPU.
+    #[allow(clippy::too_many_arguments)]
+    pub fn semantic_speech_sample_with_session(
+        &self,
+        session: &mut SemanticSamplingSession,
+        hidden: &[f32],
+        previous: &[i32],
+        temperature: f32,
+        top_k: usize,
+        repetition_penalty: f32,
+        seed: &mut u64,
+        kernels: &mut GpuKernels,
+    ) -> anyhow::Result<i32> {
+        const SPEECH_VOCAB_SIZE: usize = 2048;
+        const CODEC_EOS: usize = 2150;
+        ensure!(
+            hidden.len() == self.hidden_size,
+            "talker hidden has {} values, expected {}",
+            hidden.len(),
+            self.hidden_size
+        );
+        ensure!(
+            previous.len() <= session.max_previous,
+            "semantic history has {} tokens, session holds {}",
+            previous.len(),
+            session.max_previous
+        );
+        ensure!(top_k <= 64, "GPU semantic sampling supports top-k up to 64");
+        let stream = Arc::clone(kernels.ops.stream());
+        let hidden = hidden
+            .iter()
+            .copied()
+            .map(f16::from_f32)
+            .collect::<Vec<_>>();
+        stream.memcpy_htod(&hidden, &mut session.hidden)?;
+        if !previous.is_empty() {
+            stream.memcpy_htod(previous, &mut session.previous.slice_mut(..previous.len()))?;
+        }
+        kernels.gemv.gemv_f16(
+            &session.hidden,
+            &self.codec_head,
+            &mut session.logits,
+            self.codec_vocab_size as u32,
+            self.hidden_size as u32,
+        )?;
+        kernels.ops.sample_top_k_small_filtered(
+            &session.logits,
+            &session.previous,
+            &mut session.token,
+            self.codec_vocab_size as u32,
+            SPEECH_VOCAB_SIZE as u32,
+            CODEC_EOS as u32,
+            previous.len() as u32,
+            temperature,
+            repetition_penalty,
+            top_k as u32,
+            crate::sampling::next_seed_u32(seed),
+        )?;
+        stream.synchronize()?;
+        let mut token = [0i32];
+        stream.memcpy_dtoh(&session.token, &mut token)?;
+        Ok(token[0])
     }
 
     /// Build the exact Qwen3-TTS VoiceDesign prefill embedding layout.

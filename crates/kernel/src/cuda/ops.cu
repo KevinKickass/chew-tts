@@ -1472,6 +1472,112 @@ __global__ void sample_top_k_small(const __half* __restrict__ logits,
         out[0] = selected_ids[k - 1];
     }
 }
+
+// Exact filtered sampler for Qwen3-TTS semantic speech IDs. Speech tokens
+// [0, speech_vocab_size) and one EOS token are allowed; previous tokens receive
+// the same sign-aware repetition penalty as the reference CPU sampler.
+__global__ void sample_top_k_small_filtered(
+    const __half* __restrict__ logits,
+    const int* __restrict__ previous,
+    int* __restrict__ out,
+    int vocab_size,
+    int speech_vocab_size,
+    int eos_token,
+    int previous_count,
+    float temperature,
+    float repetition_penalty,
+    int top_k_param,
+    unsigned int random_bits) {
+    if (blockIdx.x != 0) return;
+    const int k = min(max(top_k_param, 1), SMALL_SAMPLE_K);
+    float local_values[SMALL_SAMPLE_LOCAL];
+    int local_ids[SMALL_SAMPLE_LOCAL];
+    for (int i = 0; i < SMALL_SAMPLE_LOCAL; i++) {
+        local_values[i] = -1e30f;
+        local_ids[i] = 0;
+    }
+    for (int token = threadIdx.x; token < vocab_size; token += blockDim.x) {
+        if (token >= speech_vocab_size && token != eos_token) continue;
+        float value = __half2float(logits[token]);
+        if (repetition_penalty != 1.0f) {
+            bool repeated = false;
+            for (int i = 0; i < previous_count; i++) {
+                if (previous[i] == token) {
+                    repeated = true;
+                    break;
+                }
+            }
+            if (repeated) {
+                value = value >= 0.0f
+                    ? value / repetition_penalty
+                    : value * repetition_penalty;
+            }
+        }
+        if (value <= local_values[SMALL_SAMPLE_LOCAL - 1]) continue;
+        local_values[SMALL_SAMPLE_LOCAL - 1] = value;
+        local_ids[SMALL_SAMPLE_LOCAL - 1] = token;
+        for (int slot = SMALL_SAMPLE_LOCAL - 2;
+             slot >= 0 && local_values[slot + 1] > local_values[slot];
+             slot--) {
+            const float old_value = local_values[slot];
+            local_values[slot] = local_values[slot + 1];
+            local_values[slot + 1] = old_value;
+            const int old_id = local_ids[slot];
+            local_ids[slot] = local_ids[slot + 1];
+            local_ids[slot + 1] = old_id;
+        }
+    }
+
+    __shared__ float reduce_values[256];
+    __shared__ int reduce_ids[256];
+    __shared__ float selected_values[SMALL_SAMPLE_K];
+    __shared__ int selected_ids[SMALL_SAMPLE_K];
+    __shared__ int selected_owner;
+    int cursor = 0;
+    for (int rank = 0; rank < k; rank++) {
+        reduce_values[threadIdx.x] =
+            cursor < SMALL_SAMPLE_LOCAL ? local_values[cursor] : -1e30f;
+        reduce_ids[threadIdx.x] =
+            cursor < SMALL_SAMPLE_LOCAL ? local_ids[cursor] : 0;
+        __syncthreads();
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride &&
+                reduce_values[threadIdx.x + stride] > reduce_values[threadIdx.x]) {
+                reduce_values[threadIdx.x] = reduce_values[threadIdx.x + stride];
+                reduce_ids[threadIdx.x] = reduce_ids[threadIdx.x + stride];
+            }
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) {
+            selected_values[rank] = reduce_values[0];
+            selected_ids[rank] = reduce_ids[0];
+            selected_owner = reduce_ids[0] & 255;
+        }
+        __syncthreads();
+        if ((int)threadIdx.x == selected_owner) cursor++;
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        const float divisor = fmaxf(temperature, 1e-5f);
+        const float maximum = selected_values[0] / divisor;
+        float total = 0.0f;
+        for (int i = 0; i < k; i++) {
+            selected_values[i] = expf(selected_values[i] / divisor - maximum);
+            total += selected_values[i];
+        }
+        float threshold =
+            ((float)(random_bits >> 8) / (float)(1 << 24)) * total;
+        for (int i = 0; i < k; i++) {
+            if (threshold <= selected_values[i]) {
+                out[0] = selected_ids[i];
+                return;
+            }
+            threshold -= selected_values[i];
+        }
+        out[0] = selected_ids[k - 1];
+    }
+}
 // =============================================================
 // CUDA Graph-compatible kernels
 // =============================================================
