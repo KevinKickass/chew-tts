@@ -136,6 +136,23 @@ enum Command {
         #[arg(long)]
         reference: Option<PathBuf>,
     },
+    /// Generate acoustic codes with the predictor and decode them to WAV.
+    CudaPredictorCodecSmoke {
+        /// Qwen3-TTS model directory containing speech_tokenizer.
+        model_dir: PathBuf,
+        /// Zero-based CUDA device index.
+        #[arg(long, default_value_t = 0)]
+        gpu: usize,
+        /// Semantic codec token supplied by the talker.
+        #[arg(long, default_value_t = 42)]
+        semantic_token: i32,
+        /// Number of continuous codec frames to generate.
+        #[arg(long, default_value_t = 3)]
+        frames: usize,
+        /// PCM16 WAV output path.
+        #[arg(long)]
+        wav: PathBuf,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -263,7 +280,85 @@ fn main() -> anyhow::Result<()> {
             wav.as_deref(),
             reference.as_deref(),
         )?,
+        Command::CudaPredictorCodecSmoke {
+            model_dir,
+            gpu,
+            semantic_token,
+            frames,
+            wav,
+        } => cuda_predictor_codec_smoke(&model_dir, gpu, semantic_token, frames, &wav)?,
     }
+    Ok(())
+}
+
+fn cuda_predictor_codec_smoke(
+    model_dir: &std::path::Path,
+    gpu: usize,
+    semantic_token: i32,
+    frames: usize,
+    wav: &std::path::Path,
+) -> anyhow::Result<()> {
+    if frames == 0 {
+        anyhow::bail!("frames must be non-zero");
+    }
+    let inspection = inspect_model(model_dir)?;
+    let config = &inspection.config.talker_config.code_predictor_config;
+    let allocator = chew_vram::VramAllocator::init()?;
+    if gpu >= allocator.gpu_count() {
+        anyhow::bail!(
+            "GPU index {gpu} is out of range; detected {} device(s)",
+            allocator.gpu_count()
+        );
+    }
+    let free_before = allocator.free_bytes(gpu)?;
+    let stream = allocator.stream(gpu);
+    let mut kernels = chew_kernel::GpuKernels::load(
+        stream,
+        config.intermediate_size * config.hidden_size,
+        config.intermediate_size,
+    )?;
+    let predictor = CodePredictorTransformer::load(model_dir, config, stream)?;
+    let codec = CodecQuantizer::load(model_dir.join("speech_tokenizer"), stream)?;
+    let free_loaded = allocator.free_bytes(gpu)?;
+
+    let started = std::time::Instant::now();
+    let mut codec_frames = Vec::with_capacity(frames);
+    for frame in 0..frames {
+        let frame_started = std::time::Instant::now();
+        let talker_hidden = (0..inspection.config.talker_config.hidden_size)
+            .map(|index| {
+                let position = index + frame * inspection.config.talker_config.hidden_size;
+                ((position as f32 + 1.0) * 0.013).sin() * 0.125
+            })
+            .collect::<Vec<_>>();
+        let acoustic = predictor.generate_acoustic_codes_argmax(
+            &talker_hidden,
+            semantic_token,
+            &mut kernels,
+        )?;
+        let mut codes = Vec::with_capacity(16);
+        codes.push(semantic_token);
+        codes.extend(acoustic);
+        println!(
+            "frame {frame}: {codes:?} ({:.3}ms)",
+            frame_started.elapsed().as_secs_f64() * 1000.0
+        );
+        codec_frames.push(codes);
+    }
+    let predictor_elapsed = started.elapsed();
+    let decode_started = std::time::Instant::now();
+    let audio = codec.decode_frames_audio(&codec_frames, &mut kernels)?;
+    let decode_elapsed = decode_started.elapsed();
+    write_pcm16_wav(wav, &audio, 24_000)?;
+    println!(
+        "{} frame(s), {:.3}s audio: predictor {:.3}ms, codec {:.3}ms, {:.1} MiB VRAM, {}",
+        frames,
+        audio.len() as f64 / 24_000.0,
+        predictor_elapsed.as_secs_f64() * 1000.0,
+        decode_elapsed.as_secs_f64() * 1000.0,
+        free_before.saturating_sub(free_loaded) as f64 / 1024.0_f64.powi(2),
+        wav.display()
+    );
     Ok(())
 }
 

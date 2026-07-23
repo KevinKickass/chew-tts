@@ -34,12 +34,13 @@ Implemented:
 - joint multi-frame decoding with causal transformer attention and convolution
   history preserved across frame boundaries;
 - mono 24-kHz PCM16 WAV output from the native codec path;
+- direct code-predictor to continuous-codec integration;
 - PyTorch parity checks for real Qwen weights, RoPE, GQA, and cached decoding.
 
 Next:
 
 - one CUDA graph for a complete 16-codebook audio frame;
-- integration of generated talker/predictor code frames with the codec;
+- talker semantic-token generation from prepared text and voice conditioning;
 - speaker and reference-audio encoders for voice cloning;
 - Kokoro as the second model family.
 
@@ -169,6 +170,21 @@ instead of joining independently decoded 80-ms chunks. Three frames take
 approximately 69 ms warm for 240 ms of output on an RTX 3080 (codec RTF 0.29).
 All 5,760 samples match the independent F32 path with a mean absolute delta
 below 0.00018 and a maximum delta below 0.00085.
+
+Run the predictor-to-codec integration without manually supplying acoustic
+codebooks:
+
+```bash
+CARGO_TARGET_DIR=/tmp/chew-tts-target \
+  cargo run --release -p chew-tts -- \
+  cuda-predictor-codec-smoke /models/Qwen3-TTS-12Hz-1.7B-VoiceDesign \
+  --gpu 0 --semantic-token 42 --frames 3 --wav /tmp/predictor-codec.wav
+```
+
+This currently uses deterministic prepared talker hidden states to exercise
+the boundary. On an RTX 3080, predictor plus codec occupy approximately
+589 MiB and generate three distinct acoustic code frames plus 240 ms of valid
+PCM audio end to end.
 
 ## Requirements
 
