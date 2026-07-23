@@ -19,6 +19,8 @@ use tracing::{error, info};
 
 const SAMPLE_RATE: u32 = 24_000;
 const DEFAULT_INSTRUCTION: &str = "A natural, clear studio voice.";
+const MAX_SYNTHESIS_SEGMENT_CHARS: usize = 700;
+const SEGMENT_GAP_SAMPLES: usize = 1_200;
 
 struct Job {
     request: SynthesisRequest,
@@ -215,16 +217,76 @@ async fn shutdown_signal() {
 
 fn gpu_worker(mut engine: VoiceDesignEngine, mut jobs: mpsc::Receiver<Job>) {
     while let Some(job) = jobs.blocking_recv() {
-        let result = engine
-            .synthesize(&job.request)
-            .map(|output| GeneratedAudio {
-                frames: output.generated_frames,
-                inference_ms: output.inference_elapsed().as_secs_f64() * 1_000.0,
-                samples: output.samples,
-            })
-            .map_err(|error| format!("{error:#}"));
+        let result = synthesize_segmented(&mut engine, &job.request);
         let _ = job.response.send(result);
     }
+}
+
+fn synthesize_segmented(
+    engine: &mut VoiceDesignEngine,
+    request: &SynthesisRequest,
+) -> Result<GeneratedAudio, String> {
+    let segments = split_synthesis_text(&request.text, MAX_SYNTHESIS_SEGMENT_CHARS);
+    let mut audio = GeneratedAudio {
+        samples: Vec::new(),
+        frames: 0,
+        inference_ms: 0.0,
+    };
+    for (index, text) in segments.iter().enumerate() {
+        let mut segment = request.clone();
+        segment.text.clone_from(text);
+        segment.seed = segment.seed.wrapping_add(index as u64);
+        let output = engine.synthesize(&segment).map_err(|error| {
+            format!("segment {}/{} failed: {error:#}", index + 1, segments.len())
+        })?;
+        if index > 0 {
+            audio
+                .samples
+                .extend(std::iter::repeat_n(0.0, SEGMENT_GAP_SAMPLES));
+        }
+        audio.frames += output.generated_frames;
+        audio.inference_ms += output.inference_elapsed().as_secs_f64() * 1_000.0;
+        audio.samples.extend(output.samples);
+    }
+    Ok(audio)
+}
+
+fn split_synthesis_text(text: &str, max_chars: usize) -> Vec<String> {
+    debug_assert!(max_chars > 0);
+    let chars = text.chars().collect::<Vec<_>>();
+    let mut segments = Vec::new();
+    let mut start = 0;
+    while start < chars.len() {
+        let hard_end = (start + max_chars).min(chars.len());
+        if hard_end == chars.len() {
+            let tail = chars[start..].iter().collect::<String>();
+            if !tail.trim().is_empty() {
+                segments.push(tail.trim().to_owned());
+            }
+            break;
+        }
+
+        let preferred_start = start + max_chars / 2;
+        let sentence_end = (preferred_start..hard_end).rev().find_map(|index| {
+            matches!(chars[index], '.' | '!' | '?' | '…' | '\n').then_some(index + 1)
+        });
+        let word_end = (preferred_start..hard_end)
+            .rev()
+            .find_map(|index| chars[index].is_whitespace().then_some(index));
+        let end = sentence_end.or(word_end).unwrap_or(hard_end);
+        let segment = chars[start..end].iter().collect::<String>();
+        if !segment.trim().is_empty() {
+            segments.push(segment.trim().to_owned());
+        }
+        start = end;
+        while start < chars.len() && chars[start].is_whitespace() {
+            start += 1;
+        }
+    }
+    if segments.is_empty() && !text.trim().is_empty() {
+        segments.push(text.trim().to_owned());
+    }
+    segments
 }
 
 async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -740,5 +802,41 @@ mod tests {
         assert_eq!(request.reference_text.as_deref(), Some("Guten Abend."));
         assert_eq!(request.speed, 1.1);
         assert!(request.model.is_none());
+    }
+
+    #[test]
+    fn splits_long_synthesis_at_sentence_boundaries() {
+        let sentence = "Das ist ein vollständiger Testsatz. ";
+        let text = sentence.repeat(180);
+        assert_eq!(text.chars().count(), 6_480);
+        let segments = split_synthesis_text(&text, 700);
+        assert!(segments.len() > 1);
+        assert!(
+            segments
+                .iter()
+                .all(|segment| segment.chars().count() <= 700)
+        );
+        assert!(
+            segments[..segments.len() - 1]
+                .iter()
+                .all(|segment| segment.ends_with('.'))
+        );
+        assert_eq!(
+            segments.join(" "),
+            text.split_whitespace().collect::<Vec<_>>().join(" ")
+        );
+    }
+
+    #[test]
+    fn splits_unbroken_unicode_without_losing_text() {
+        let text = "ä".repeat(4_096);
+        let segments = split_synthesis_text(&text, 700);
+        assert_eq!(segments.len(), 6);
+        assert!(
+            segments
+                .iter()
+                .all(|segment| segment.chars().count() <= 700)
+        );
+        assert_eq!(segments.concat(), text);
     }
 }
