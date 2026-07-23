@@ -1,11 +1,8 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/gguf",
     "crates/vram",
     "crates/kernel",
-    "crates/engine",
-    "crates/server",
     "crates/tts-core",
     "crates/safetensors",
     "crates/model-qwen3-tts",
@@ -21,10 +18,8 @@ license = "MIT"
 
 [workspace.dependencies]
 # Internal crates
-chew-gguf = { path = "crates/gguf" }
 chew-vram = { path = "crates/vram" }
 chew-kernel = { path = "crates/kernel" }
-chew-engine = { path = "crates/engine" }
 chew-tts-core = { path = "crates/tts-core" }
 chew-safetensors = { path = "crates/safetensors" }
 chew-model-qwen3-tts = { path = "crates/model-qwen3-tts" }

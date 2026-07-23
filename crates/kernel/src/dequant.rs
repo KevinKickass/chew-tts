@@ -64,7 +64,7 @@ impl DequantKernels {
         src: &CudaSlice<u8>,
         dst: &mut CudaSlice<half::f16>,
         n_elements: u32,
-        quant_type: chew_gguf::GgmlType,
+        quant_type: crate::GgmlType,
     ) -> Result<(), KernelError> {
         let (kernel, cfg, n) = self.prepare_dequant(n_elements, quant_type)?;
         unsafe {
@@ -85,7 +85,7 @@ impl DequantKernels {
         src: &CudaView<'_, u8>,
         dst: &mut CudaSlice<half::f16>,
         n_elements: u32,
-        quant_type: chew_gguf::GgmlType,
+        quant_type: crate::GgmlType,
     ) -> Result<(), KernelError> {
         let (kernel, cfg, n) = self.prepare_dequant(n_elements, quant_type)?;
         unsafe {
@@ -106,7 +106,7 @@ impl DequantKernels {
         src: &CudaView<'_, u8>,
         dst: &mut CudaViewMut<'_, half::f16>,
         n_elements: u32,
-        quant_type: chew_gguf::GgmlType,
+        quant_type: crate::GgmlType,
     ) -> Result<(), KernelError> {
         let (kernel, cfg, n) = self.prepare_dequant(n_elements, quant_type)?;
         unsafe {
@@ -124,7 +124,7 @@ impl DequantKernels {
     fn prepare_dequant(
         &self,
         n_elements: u32,
-        quant_type: chew_gguf::GgmlType,
+        quant_type: crate::GgmlType,
     ) -> Result<(&CudaFunction, LaunchConfig, i32), KernelError> {
         let threads = 256u32;
         let blocks = (n_elements + threads - 1) / threads;
@@ -135,22 +135,22 @@ impl DequantKernels {
         };
 
         let kernel = match quant_type {
-            chew_gguf::GgmlType::Q8_0 => &self.q8_0,
-            chew_gguf::GgmlType::Q4_0 => &self.q4_0,
-            chew_gguf::GgmlType::Q5_0 => &self.q5_0,
-            chew_gguf::GgmlType::Q5_1 => &self.q5_1,
-            chew_gguf::GgmlType::Q4_K => &self.q4_k,
-            chew_gguf::GgmlType::Q5_K => &self.q5_k,
-            chew_gguf::GgmlType::Q6_K => &self.q6_k,
-            chew_gguf::GgmlType::Q2_K => &self.q2_k,
-            chew_gguf::GgmlType::Q3_K => &self.q3_k,
-            chew_gguf::GgmlType::BF16 => &self.bf16_fn,
-            chew_gguf::GgmlType::IQ2_S => &self.iq2_s,
-            chew_gguf::GgmlType::IQ3_XXS => &self.iq3_xxs,
-            chew_gguf::GgmlType::IQ3_S => &self.iq3_s,
-            chew_gguf::GgmlType::IQ4_XS => &self.iq4_xs,
-            chew_gguf::GgmlType::F16 => &self.f16_fn,
-            chew_gguf::GgmlType::F32 => &self.f32_fn,
+            crate::GgmlType::Q8_0 => &self.q8_0,
+            crate::GgmlType::Q4_0 => &self.q4_0,
+            crate::GgmlType::Q5_0 => &self.q5_0,
+            crate::GgmlType::Q5_1 => &self.q5_1,
+            crate::GgmlType::Q4_K => &self.q4_k,
+            crate::GgmlType::Q5_K => &self.q5_k,
+            crate::GgmlType::Q6_K => &self.q6_k,
+            crate::GgmlType::Q2_K => &self.q2_k,
+            crate::GgmlType::Q3_K => &self.q3_k,
+            crate::GgmlType::BF16 => &self.bf16_fn,
+            crate::GgmlType::IQ2_S => &self.iq2_s,
+            crate::GgmlType::IQ3_XXS => &self.iq3_xxs,
+            crate::GgmlType::IQ3_S => &self.iq3_s,
+            crate::GgmlType::IQ4_XS => &self.iq4_xs,
+            crate::GgmlType::F16 => &self.f16_fn,
+            crate::GgmlType::F32 => &self.f32_fn,
             other => {
                 return Err(KernelError::Launch(format!(
                     "no GPU dequant kernel for {other}"

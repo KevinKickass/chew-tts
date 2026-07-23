@@ -109,12 +109,12 @@ impl GemvKernels {
         out: &mut CudaSlice<half::f16>,
         n: u32,
         k: u32,
-        quant_type: chew_gguf::GgmlType,
+        quant_type: crate::GgmlType,
     ) -> Result<bool, KernelError> {
         let kernel = match quant_type {
-            chew_gguf::GgmlType::Q4_K => &self.q4_k,
-            chew_gguf::GgmlType::Q6_K => &self.q6_k,
-            chew_gguf::GgmlType::Q8_0 => &self.q8_0,
+            crate::GgmlType::Q4_K => &self.q4_k,
+            crate::GgmlType::Q6_K => &self.q6_k,
+            crate::GgmlType::Q8_0 => &self.q8_0,
             _ => return Ok(false),
         };
 
@@ -144,12 +144,12 @@ impl GemvKernels {
         out: &mut CudaSlice<half::f16>,
         n: u32,
         k: u32,
-        quant_type: chew_gguf::GgmlType,
+        quant_type: crate::GgmlType,
     ) -> Result<bool, KernelError> {
         let kernel = match quant_type {
-            chew_gguf::GgmlType::Q4_K => &self.q4_k,
-            chew_gguf::GgmlType::Q6_K => &self.q6_k,
-            chew_gguf::GgmlType::Q8_0 => &self.q8_0,
+            crate::GgmlType::Q4_K => &self.q4_k,
+            crate::GgmlType::Q6_K => &self.q6_k,
+            crate::GgmlType::Q8_0 => &self.q8_0,
             _ => return Ok(false),
         };
 
@@ -181,9 +181,9 @@ impl GemvKernels {
         out_up: &mut CudaSlice<half::f16>,
         n: u32,
         k: u32,
-        quant_type: chew_gguf::GgmlType,
+        quant_type: crate::GgmlType,
     ) -> Result<bool, KernelError> {
-        if quant_type != chew_gguf::GgmlType::Q4_K {
+        if quant_type != crate::GgmlType::Q4_K {
             return Ok(false);
         }
 
