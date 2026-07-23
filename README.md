@@ -25,7 +25,8 @@ Implemented:
 - GPU-resident execution of all 28 talker layers without host round-trips;
 - a native dense F16 decode GEMV path;
 - GPU-resident execution of the five-layer Qwen code predictor;
-- complete 15-codebook acoustic generation with GPU embeddings and argmax;
+- complete 15-codebook acoustic generation with GPU embeddings, deterministic
+  argmax, and temperature/top-k sampling;
 - native decoding of all 16 codec codebooks into the 512-channel latent;
 - the codec's causal pre-convolution and eight-layer transformer on CUDA;
 - both 2x causal ConvNeXt codec upsampling stages;
@@ -37,13 +38,14 @@ Implemented:
 - direct code-predictor to continuous-codec integration;
 - local Qwen2 byte-level BPE tokenization from `vocab.json` and `merges.txt`;
 - native talker text/codec embeddings, SwiLU text projection, and semantic head;
+- exact VoiceDesign ChatML/control-token prefill, persistent talker KV cache,
+  autoregressive semantic/acoustic generation, and end-to-end WAV output;
 - PyTorch parity checks for real Qwen weights, RoPE, GQA, and cached decoding.
 
 Next:
 
 - one CUDA graph for a complete 16-codebook audio frame;
-- talker prefill and autoregressive semantic-token generation with voice
-  conditioning;
+- optimized one-pass model loading and GPU-resident sampling;
 - speaker and reference-audio encoders for voice cloning;
 - Kokoro as the second model family.
 
@@ -203,6 +205,28 @@ text projection, codec control-token embeddings, and the semantic codec head.
 The frontend occupies approximately 684 MiB on an RTX 3080. Against the
 independent F32 PyTorch path, projected text has a mean absolute delta below
 0.000008 and both paths select the same semantic argmax token.
+
+Run the complete native VoiceDesign path:
+
+```bash
+CARGO_TARGET_DIR=/tmp/chew-tts-target \
+  cargo run --release -p chew-tts -- \
+  cuda-voice-design-smoke /models/Qwen3-TTS-12Hz-1.7B-VoiceDesign \
+  --gpu 0 \
+  --language german \
+  --text "Guten Abend, schön dass du da bist." \
+  --instruction "A quiet, breathy German female whisper." \
+  --frames 12 \
+  --seed 42 \
+  --wav /tmp/voice-design.wav
+```
+
+The command uses the model's production sampling defaults: temperature 0.9,
+top-k 50, and semantic repetition penalty 1.05. On an RTX 3080, the first
+correctness-oriented implementation occupies approximately 3.9 GiB of VRAM
+and generates 0.96 seconds of sampled audio in approximately 0.77 seconds
+(RTF 0.80). Model loading is not included in that number and is not optimized
+yet.
 
 ## Requirements
 

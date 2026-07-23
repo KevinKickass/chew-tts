@@ -21,6 +21,15 @@ pub struct TalkerFrontend {
     codec_vocab_size: usize,
 }
 
+/// Prepared VoiceDesign prompt plus the text states consumed during generation.
+pub struct VoiceDesignInputs {
+    pub prefill: Vec<f32>,
+    pub prefill_tokens: usize,
+    pub trailing_text: Vec<f32>,
+    pub trailing_tokens: usize,
+    pub text_pad: Vec<f32>,
+}
+
 impl TalkerFrontend {
     pub fn load(
         model_dir: impl AsRef<Path>,
@@ -196,5 +205,179 @@ impl TalkerFrontend {
         let mut host = [0i32];
         stream.memcpy_dtoh(&token, &mut host)?;
         Ok(host[0])
+    }
+
+    /// Project one hidden state and select a speech token or codec EOS.
+    ///
+    /// Qwen's semantic head also contains control IDs. During generation those
+    /// IDs are suppressed: valid output is 0..2048 or EOS 2150.
+    pub fn semantic_speech_argmax(
+        &self,
+        hidden: &[f32],
+        kernels: &mut GpuKernels,
+    ) -> anyhow::Result<i32> {
+        const SPEECH_VOCAB_SIZE: usize = 2048;
+        const CODEC_EOS: usize = 2150;
+        ensure!(
+            hidden.len() == self.hidden_size,
+            "talker hidden has {} values, expected {}",
+            hidden.len(),
+            self.hidden_size
+        );
+        ensure!(
+            self.codec_vocab_size > CODEC_EOS,
+            "codec vocabulary does not contain EOS {CODEC_EOS}"
+        );
+        let stream = Arc::clone(kernels.ops.stream());
+        let hidden = hidden
+            .iter()
+            .copied()
+            .map(f16::from_f32)
+            .collect::<Vec<_>>();
+        let hidden = stream.clone_htod(&hidden)?;
+        let mut logits = stream.alloc_zeros::<f16>(self.codec_vocab_size)?;
+        kernels.gemv.gemv_f16(
+            &hidden,
+            &self.codec_head,
+            &mut logits,
+            self.codec_vocab_size as u32,
+            self.hidden_size as u32,
+        )?;
+        stream.synchronize()?;
+        let mut host = vec![f16::ZERO; self.codec_vocab_size];
+        stream.memcpy_dtoh(&logits, &mut host)?;
+        let mut best_token = CODEC_EOS;
+        let mut best_logit = host[CODEC_EOS].to_f32();
+        for (token, logit) in host.iter().take(SPEECH_VOCAB_SIZE).enumerate() {
+            let logit = logit.to_f32();
+            if logit > best_logit {
+                best_logit = logit;
+                best_token = token;
+            }
+        }
+        Ok(best_token as i32)
+    }
+
+    /// Sample one semantic speech token using Qwen's suppression rules.
+    pub fn semantic_speech_sample(
+        &self,
+        hidden: &[f32],
+        previous: &[i32],
+        temperature: f32,
+        top_k: usize,
+        repetition_penalty: f32,
+        seed: &mut u64,
+        kernels: &mut GpuKernels,
+    ) -> anyhow::Result<i32> {
+        const SPEECH_VOCAB_SIZE: usize = 2048;
+        const CODEC_EOS: usize = 2150;
+        ensure!(
+            hidden.len() == self.hidden_size,
+            "talker hidden has {} values, expected {}",
+            hidden.len(),
+            self.hidden_size
+        );
+        let stream = Arc::clone(kernels.ops.stream());
+        let hidden = hidden
+            .iter()
+            .copied()
+            .map(f16::from_f32)
+            .collect::<Vec<_>>();
+        let hidden = stream.clone_htod(&hidden)?;
+        let mut logits = stream.alloc_zeros::<f16>(self.codec_vocab_size)?;
+        kernels.gemv.gemv_f16(
+            &hidden,
+            &self.codec_head,
+            &mut logits,
+            self.codec_vocab_size as u32,
+            self.hidden_size as u32,
+        )?;
+        stream.synchronize()?;
+        let mut host = vec![f16::ZERO; self.codec_vocab_size];
+        stream.memcpy_dtoh(&logits, &mut host)?;
+        Ok(crate::sampling::sample_top_k(
+            &host,
+            |token| token < SPEECH_VOCAB_SIZE || token == CODEC_EOS,
+            temperature,
+            top_k,
+            previous,
+            repetition_penalty,
+            seed,
+        ))
+    }
+
+    /// Build the exact Qwen3-TTS VoiceDesign prefill embedding layout.
+    pub fn build_voice_design_inputs(
+        &self,
+        text_ids: &[i32],
+        instruction_ids: &[i32],
+        language_codec_id: i32,
+        kernels: &mut GpuKernels,
+    ) -> anyhow::Result<VoiceDesignInputs> {
+        const IM_START: i32 = 151_644;
+        const ASSISTANT: i32 = 77_091;
+        const NEWLINE: i32 = 198;
+        const TTS_PAD: i32 = 151_671;
+        const TTS_BOS: i32 = 151_672;
+        const TTS_EOS: i32 = 151_673;
+        const CODEC_PAD: i32 = 2_148;
+        const CODEC_BOS: i32 = 2_149;
+        const CODEC_THINK: i32 = 2_154;
+        const CODEC_THINK_BOS: i32 = 2_156;
+        const CODEC_THINK_EOS: i32 = 2_157;
+
+        ensure!(!text_ids.is_empty(), "VoiceDesign text must not be empty");
+        ensure!(
+            !instruction_ids.is_empty(),
+            "VoiceDesign instruction must not be empty"
+        );
+
+        let instruction = self.project_text_tokens(instruction_ids, kernels)?;
+        let role = self.project_text_tokens(&[IM_START, ASSISTANT, NEWLINE], kernels)?;
+        let control_text =
+            self.project_text_tokens(&[TTS_PAD, TTS_PAD, TTS_PAD, TTS_PAD, TTS_BOS], kernels)?;
+        let control_codec = self.codec_embeddings(
+            &[
+                CODEC_THINK,
+                CODEC_THINK_BOS,
+                language_codec_id,
+                CODEC_THINK_EOS,
+                CODEC_PAD,
+            ],
+            kernels,
+        )?;
+        let first_text = self.project_text_tokens(&text_ids[..1], kernels)?;
+        let codec_bos = self.codec_embeddings(&[CODEC_BOS], kernels)?;
+
+        let mut prefill = Vec::with_capacity(instruction.len() + role.len() + 6 * self.hidden_size);
+        prefill.extend(instruction);
+        prefill.extend(role);
+        prefill.extend(
+            control_text
+                .iter()
+                .zip(control_codec)
+                .map(|(text, codec)| text + codec),
+        );
+        prefill.extend(
+            first_text
+                .iter()
+                .zip(codec_bos)
+                .map(|(text, codec)| text + codec),
+        );
+        let prefill_tokens = prefill.len() / self.hidden_size;
+
+        let mut trailing_ids = text_ids[1..].to_vec();
+        trailing_ids.push(TTS_EOS);
+        let trailing_tokens = trailing_ids.len();
+        let trailing_text = self.project_text_tokens(&trailing_ids, kernels)?;
+        let text_pad = self.project_text_tokens(&[TTS_PAD], kernels)?;
+
+        Ok(VoiceDesignInputs {
+            prefill,
+            prefill_tokens,
+            trailing_text,
+            trailing_tokens,
+            text_pad,
+        })
     }
 }

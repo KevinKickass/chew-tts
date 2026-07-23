@@ -3,6 +3,7 @@ mod config;
 mod cuda;
 mod frontend;
 mod predictor;
+mod sampling;
 
 pub use codec::CodecQuantizer;
 pub use config::{
@@ -12,7 +13,7 @@ pub use cuda::{
     TalkerDecoderLayer, TalkerGenerationSession, TalkerLayerKvCache, TalkerLayerScratch,
     TalkerTransformer,
 };
-pub use frontend::TalkerFrontend;
+pub use frontend::{TalkerFrontend, VoiceDesignInputs};
 pub use predictor::CodePredictorTransformer;
 
 use chew_safetensors::{MappedSafetensors, TensorInfo};

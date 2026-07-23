@@ -162,6 +162,34 @@ impl CodePredictorTransformer {
         semantic_token: i32,
         kernels: &mut GpuKernels,
     ) -> anyhow::Result<Vec<i32>> {
+        self.generate_acoustic_codes(talker_hidden, semantic_token, None, kernels)
+    }
+
+    /// Sample the 15 acoustic codebooks with the model's subtalker settings.
+    pub fn generate_acoustic_codes_sampled(
+        &self,
+        talker_hidden: &[f32],
+        semantic_token: i32,
+        temperature: f32,
+        top_k: usize,
+        seed: &mut u64,
+        kernels: &mut GpuKernels,
+    ) -> anyhow::Result<Vec<i32>> {
+        self.generate_acoustic_codes(
+            talker_hidden,
+            semantic_token,
+            Some((temperature, top_k, seed)),
+            kernels,
+        )
+    }
+
+    fn generate_acoustic_codes(
+        &self,
+        talker_hidden: &[f32],
+        semantic_token: i32,
+        mut sampling: Option<(f32, usize, &mut u64)>,
+        kernels: &mut GpuKernels,
+    ) -> anyhow::Result<Vec<i32>> {
         const CODEC_EMBED_DIM: usize = 2048;
         let hidden_dim = self.geometry.hidden_size;
         let vocab_size = self.geometry.vocab_size;
@@ -260,9 +288,15 @@ impl CodePredictorTransformer {
             vocab_size as u32,
             hidden_dim as u32,
         )?;
-        kernels
-            .ops
-            .argmax_f16(&logits, &mut current_code, vocab_size as u32)?;
+        select_acoustic_code(
+            &logits,
+            &mut current_code,
+            vocab_size,
+            sampling
+                .as_mut()
+                .map(|(temperature, top_k, seed)| (*temperature, *top_k, &mut **seed)),
+            kernels,
+        )?;
         stream.memcpy_dtod(&current_code, &mut all_codes.slice_mut(0..1))?;
 
         let mut code_embed = stream.alloc_zeros::<f16>(CODEC_EMBED_DIM)?;
@@ -315,9 +349,15 @@ impl CodePredictorTransformer {
                 vocab_size as u32,
                 hidden_dim as u32,
             )?;
-            kernels
-                .ops
-                .argmax_f16(&logits, &mut current_code, vocab_size as u32)?;
+            select_acoustic_code(
+                &logits,
+                &mut current_code,
+                vocab_size,
+                sampling
+                    .as_mut()
+                    .map(|(temperature, top_k, seed)| (*temperature, *top_k, &mut **seed)),
+                kernels,
+            )?;
             stream.memcpy_dtod(&current_code, &mut all_codes.slice_mut(group..group + 1))?;
         }
         stream.synchronize()?;
@@ -325,6 +365,66 @@ impl CodePredictorTransformer {
         stream.memcpy_dtoh(&all_codes, &mut codes)?;
         Ok(codes)
     }
+
+    /// Sum the 15 group-specific acoustic embeddings for one codec frame.
+    pub fn acoustic_embeddings_sum(
+        &self,
+        codes: &[i32],
+        kernels: &mut GpuKernels,
+    ) -> anyhow::Result<Vec<f32>> {
+        const CODEC_EMBED_DIM: usize = 2048;
+        ensure!(
+            codes.len() == self.codec_embeddings.len(),
+            "expected {} acoustic codes, got {}",
+            self.codec_embeddings.len(),
+            codes.len()
+        );
+        for code in codes {
+            ensure!(
+                *code >= 0 && (*code as usize) < self.geometry.vocab_size,
+                "acoustic code {code} is outside 0..{}",
+                self.geometry.vocab_size
+            );
+        }
+
+        let stream = Arc::clone(kernels.ops.stream());
+        let mut sum = stream.alloc_zeros::<f32>(CODEC_EMBED_DIM)?;
+        let mut embedding = stream.alloc_zeros::<f16>(CODEC_EMBED_DIM)?;
+        for (code, table) in codes.iter().zip(&self.codec_embeddings) {
+            let id = stream.clone_htod(&[*code])?;
+            kernels
+                .ops
+                .gather_rows_f16(table, &id, &mut embedding, 1, CODEC_EMBED_DIM as u32)?;
+            kernels
+                .ops
+                .add_inplace_f32_f16(&mut sum, &embedding, CODEC_EMBED_DIM as u32)?;
+        }
+        stream.synchronize()?;
+        let mut host = vec![0.0f32; CODEC_EMBED_DIM];
+        stream.memcpy_dtoh(&sum, &mut host)?;
+        Ok(host)
+    }
+}
+
+fn select_acoustic_code(
+    logits: &CudaSlice<f16>,
+    token: &mut CudaSlice<i32>,
+    vocab_size: usize,
+    sampling: Option<(f32, usize, &mut u64)>,
+    kernels: &mut GpuKernels,
+) -> anyhow::Result<()> {
+    if let Some((temperature, top_k, seed)) = sampling {
+        let stream = Arc::clone(kernels.ops.stream());
+        stream.synchronize()?;
+        let mut host = vec![f16::ZERO; vocab_size];
+        stream.memcpy_dtoh(logits, &mut host)?;
+        let selected =
+            crate::sampling::sample_top_k(&host, |_| true, temperature, top_k, &[], 1.0, seed);
+        stream.memcpy_htod(&[selected], token)?;
+    } else {
+        kernels.ops.argmax_f16(logits, token, vocab_size as u32)?;
+    }
+    Ok(())
 }
 
 fn predictor_geometry(config: &CodePredictorConfig) -> TalkerConfig {

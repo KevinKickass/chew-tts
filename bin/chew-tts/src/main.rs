@@ -183,6 +183,38 @@ enum Command {
         #[arg(long)]
         reference: Option<PathBuf>,
     },
+    /// Generate VoiceDesign codec frames and decode them to a WAV file.
+    CudaVoiceDesignSmoke {
+        /// Qwen3-TTS VoiceDesign model directory.
+        model_dir: PathBuf,
+        /// Zero-based CUDA device index.
+        #[arg(long, default_value_t = 0)]
+        gpu: usize,
+        /// Text to speak.
+        #[arg(long)]
+        text: String,
+        /// Natural-language voice description.
+        #[arg(long)]
+        instruction: String,
+        /// Language name from the model config.
+        #[arg(long, default_value = "german")]
+        language: String,
+        /// Maximum number of 80-ms codec frames.
+        #[arg(long, default_value_t = 12)]
+        frames: usize,
+        /// Deterministic sampling seed.
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+        /// Semantic and acoustic sampling temperature.
+        #[arg(long, default_value_t = 0.9)]
+        temperature: f32,
+        /// Semantic and acoustic top-k.
+        #[arg(long, default_value_t = 50)]
+        top_k: usize,
+        /// PCM16 WAV output path.
+        #[arg(long)]
+        wav: PathBuf,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -337,6 +369,29 @@ fn main() -> anyhow::Result<()> {
             &text_ids,
             text.as_deref(),
             reference.as_deref(),
+        )?,
+        Command::CudaVoiceDesignSmoke {
+            model_dir,
+            gpu,
+            text,
+            instruction,
+            language,
+            frames,
+            seed,
+            temperature,
+            top_k,
+            wav,
+        } => cuda_voice_design_smoke(
+            &model_dir,
+            gpu,
+            &text,
+            &instruction,
+            &language,
+            frames,
+            seed,
+            temperature,
+            top_k,
+            &wav,
         )?,
     }
     Ok(())
@@ -514,6 +569,193 @@ fn cuda_predictor_codec_smoke(
         decode_elapsed.as_secs_f64() * 1000.0,
         free_before.saturating_sub(free_loaded) as f64 / 1024.0_f64.powi(2),
         wav.display()
+    );
+    Ok(())
+}
+
+fn cuda_voice_design_smoke(
+    model_dir: &std::path::Path,
+    gpu: usize,
+    text: &str,
+    instruction: &str,
+    language: &str,
+    frames: usize,
+    mut seed: u64,
+    temperature: f32,
+    top_k: usize,
+    wav: &std::path::Path,
+) -> anyhow::Result<()> {
+    if frames == 0 {
+        anyhow::bail!("frames must be non-zero");
+    }
+    let inspection = inspect_model(model_dir)?;
+    let config = &inspection.config.talker_config;
+    let language_key = language.to_ascii_lowercase();
+    let language_codec_id = config
+        .codec_language_id
+        .get(&language_key)
+        .copied()
+        .with_context(|| {
+            let mut supported = config.codec_language_id.keys().cloned().collect::<Vec<_>>();
+            supported.sort();
+            format!("unsupported language {language:?}; supported: {supported:?}")
+        })? as i32;
+
+    let tokenizer = load_qwen_tokenizer(model_dir)?;
+    let encode = |value: &str| -> anyhow::Result<Vec<i32>> {
+        Ok(tokenizer
+            .encode(value, false)
+            .map_err(|error| anyhow::anyhow!("could not encode text: {error}"))?
+            .get_ids()
+            .iter()
+            .map(|id| *id as i32)
+            .collect())
+    };
+    let text_ids = encode(text)?;
+    let instruction_ids = encode(&format!("<|im_start|>user\n{instruction}<|im_end|>\n"))?;
+
+    let allocator = chew_vram::VramAllocator::init()?;
+    if gpu >= allocator.gpu_count() {
+        anyhow::bail!(
+            "GPU index {gpu} is out of range; detected {} device(s)",
+            allocator.gpu_count()
+        );
+    }
+    let free_before = allocator.free_bytes(gpu)?;
+    let stream = allocator.stream(gpu);
+    let max_matrix = (config.intermediate_size * config.hidden_size)
+        .max(config.text_hidden_size * config.text_hidden_size);
+    let max_vector = config.intermediate_size.max(config.text_hidden_size);
+    let mut kernels = chew_kernel::GpuKernels::load(stream, max_matrix, max_vector)?;
+
+    let load_started = std::time::Instant::now();
+    let talker = TalkerTransformer::load(model_dir, config, stream)?;
+    let frontend = TalkerFrontend::load(model_dir, config, stream)?;
+    let predictor =
+        CodePredictorTransformer::load(model_dir, &config.code_predictor_config, stream)?;
+    let codec = CodecQuantizer::load(model_dir.join("speech_tokenizer"), stream)?;
+    let load_elapsed = load_started.elapsed();
+    let free_loaded = allocator.free_bytes(gpu)?;
+
+    let prompt_started = std::time::Instant::now();
+    let inputs = frontend.build_voice_design_inputs(
+        &text_ids,
+        &instruction_ids,
+        language_codec_id,
+        &mut kernels,
+    )?;
+    let max_seq_len = inputs.prefill_tokens + frames;
+    if max_seq_len > config.max_position_embeddings {
+        anyhow::bail!(
+            "prompt plus generation is {max_seq_len} tokens, model limit is {}",
+            config.max_position_embeddings
+        );
+    }
+    let mut session = talker.start_session(max_seq_len, inputs.prefill_tokens, config, stream)?;
+    let normalized = talker.forward_session(
+        &mut session,
+        &inputs.prefill,
+        inputs.prefill_tokens,
+        config,
+        &mut kernels,
+    )?;
+    let mut last_hidden = normalized[normalized.len() - config.hidden_size..].to_vec();
+    let mut generated_semantics = Vec::with_capacity(frames);
+    let mut semantic = frontend.semantic_speech_sample(
+        &last_hidden,
+        &generated_semantics,
+        temperature,
+        top_k,
+        1.05,
+        &mut seed,
+        &mut kernels,
+    )?;
+    generated_semantics.push(semantic);
+    let prompt_elapsed = prompt_started.elapsed();
+
+    let generation_started = std::time::Instant::now();
+    let mut codec_frames = Vec::with_capacity(frames);
+    for frame_index in 0..frames {
+        if semantic == 2_150 {
+            println!("codec EOS at frame {frame_index}");
+            break;
+        }
+        let frame_started = std::time::Instant::now();
+        let acoustic = predictor.generate_acoustic_codes_sampled(
+            &last_hidden,
+            semantic,
+            temperature,
+            top_k,
+            &mut seed,
+            &mut kernels,
+        )?;
+        let mut codes = Vec::with_capacity(config.num_code_groups);
+        codes.push(semantic);
+        codes.extend_from_slice(&acoustic);
+        codec_frames.push(codes);
+        println!(
+            "frame {frame_index}: semantic {semantic}, acoustics {:?}, {:.3}ms",
+            &acoustic[..3.min(acoustic.len())],
+            frame_started.elapsed().as_secs_f64() * 1000.0
+        );
+
+        if frame_index + 1 == frames {
+            break;
+        }
+        let semantic_embedding = frontend.codec_embeddings(&[semantic], &mut kernels)?;
+        let acoustic_embedding = predictor.acoustic_embeddings_sum(&acoustic, &mut kernels)?;
+        let text_embedding = if frame_index < inputs.trailing_tokens {
+            let start = frame_index * config.hidden_size;
+            &inputs.trailing_text[start..start + config.hidden_size]
+        } else {
+            &inputs.text_pad
+        };
+        let next_input = semantic_embedding
+            .iter()
+            .zip(acoustic_embedding)
+            .zip(text_embedding)
+            .map(|((semantic, acoustic), text)| semantic + acoustic + text)
+            .collect::<Vec<_>>();
+        last_hidden = talker.forward_session(&mut session, &next_input, 1, config, &mut kernels)?;
+        semantic = frontend.semantic_speech_sample(
+            &last_hidden,
+            &generated_semantics,
+            temperature,
+            top_k,
+            1.05,
+            &mut seed,
+            &mut kernels,
+        )?;
+        generated_semantics.push(semantic);
+    }
+    let generation_elapsed = generation_started.elapsed();
+    if codec_frames.is_empty() {
+        anyhow::bail!("model emitted EOS before producing audio");
+    }
+
+    let decode_started = std::time::Instant::now();
+    let audio = codec.decode_frames_audio(&codec_frames, &mut kernels)?;
+    let decode_elapsed = decode_started.elapsed();
+    write_pcm16_wav(wav, &audio, 24_000)?;
+    let audio_seconds = audio.len() as f64 / 24_000.0;
+    let inference_seconds = prompt_elapsed.as_secs_f64()
+        + generation_elapsed.as_secs_f64()
+        + decode_elapsed.as_secs_f64();
+    println!(
+        "VoiceDesign: {} frame(s), {:.3}s audio, {:.3}s inference, RTF {:.3}",
+        codec_frames.len(),
+        audio_seconds,
+        inference_seconds,
+        inference_seconds / audio_seconds,
+    );
+    println!(
+        "load {:.3}s, prompt {:.3}s, generation {:.3}s, codec {:.3}s, {:.1} MiB VRAM, {}",
+        load_elapsed.as_secs_f64(),
+        prompt_elapsed.as_secs_f64(),
+        generation_elapsed.as_secs_f64(),
+        decode_elapsed.as_secs_f64(),
+        free_before.saturating_sub(free_loaded) as f64 / 1024.0_f64.powi(2),
+        wav.display(),
     );
     Ok(())
 }
