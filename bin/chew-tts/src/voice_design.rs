@@ -192,12 +192,20 @@ impl VoiceDesignEngine {
                 .collect())
         };
         let text_ids = encode(&request.text)?;
-        let instruction_ids = request
-            .instruction
-            .as_deref()
-            .filter(|instruction| !instruction.trim().is_empty())
-            .map(|instruction| encode(&format!("<|im_start|>user\n{instruction}<|im_end|>\n")))
-            .transpose()?;
+        // Qwen Base supports speaker-only and ICL voice cloning, but its
+        // official voice-clone API has no instruction lane. Feeding one into
+        // the shared talker prompt makes Base treat it as text to continue and
+        // can cause the instruction to be spoken before the target.
+        let instruction_ids = if self.model_type == ModelType::Base {
+            None
+        } else {
+            request
+                .instruction
+                .as_deref()
+                .filter(|instruction| !instruction.trim().is_empty())
+                .map(|instruction| encode(&format!("<|im_start|>user\n{instruction}<|im_end|>\n")))
+                .transpose()?
+        };
         ensure!(
             self.model_type != ModelType::VoiceDesign || instruction_ids.is_some(),
             "instruction must not be empty for a VoiceDesign model"
@@ -338,9 +346,18 @@ impl VoiceDesignEngine {
         let prompt_elapsed = prompt_started.elapsed();
 
         let generation_started = Instant::now();
-        let mut pending = Vec::with_capacity(request.chunk_frames.max(1));
+        // ICL decoding needs the reference codec frames as left context. The
+        // official implementation decodes reference + generated frames in one
+        // pass and removes the reference portion afterwards.
+        let chunk_frames = if wants_icl { 0 } else { request.chunk_frames };
+        let reference_frames = if wants_icl {
+            base_codes.as_ref().map_or(0, Vec::len)
+        } else {
+            0
+        };
+        let mut pending = Vec::with_capacity(chunk_frames.max(1));
         let mut transformed_context = Vec::with_capacity(1024 * request.chunk_context);
-        let mut codec_session = if request.chunk_frames > 0 {
+        let mut codec_session = if chunk_frames > 0 {
             Some(
                 self.codec
                     .start_transformer_session(request.max_frames, &self.stream)?,
@@ -348,8 +365,12 @@ impl VoiceDesignEngine {
         } else {
             None
         };
-        let mut all_frames = if request.chunk_frames == 0 {
-            Vec::with_capacity(request.max_frames)
+        let mut all_frames = if chunk_frames == 0 {
+            let mut frames = Vec::with_capacity(reference_frames + request.max_frames);
+            if let Some(reference) = base_codes.as_ref().filter(|_| wants_icl) {
+                frames.extend(reference.iter().cloned());
+            }
+            frames
         } else {
             Vec::new()
         };
@@ -374,13 +395,13 @@ impl VoiceDesignEngine {
             let mut codes = Vec::with_capacity(self.config.num_code_groups);
             codes.push(semantic);
             codes.extend_from_slice(&acoustic);
-            if request.chunk_frames == 0 {
+            if chunk_frames == 0 {
                 all_frames.push(codes);
             } else {
                 pending.push(codes);
             }
             generated_frames += 1;
-            if request.chunk_frames > 0 && pending.len() >= request.chunk_frames {
+            if chunk_frames > 0 && pending.len() >= chunk_frames {
                 codec_elapsed += decode_codec_chunk(
                     &self.codec,
                     &mut pending,
@@ -439,10 +460,17 @@ impl VoiceDesignEngine {
         );
 
         let decode_started = Instant::now();
-        if request.chunk_frames == 0 {
+        if chunk_frames == 0 {
             samples = self
                 .codec
                 .decode_frames_audio(&all_frames, &mut self.kernels)?;
+            if reference_frames > 0 {
+                let cut = reference_frames
+                    .saturating_mul(samples.len())
+                    .checked_div(all_frames.len())
+                    .unwrap_or_default();
+                samples.drain(..cut.min(samples.len()));
+            }
             codec_elapsed = decode_started.elapsed();
         } else if !pending.is_empty() {
             codec_elapsed += decode_codec_chunk(
