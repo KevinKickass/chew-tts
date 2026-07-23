@@ -10,6 +10,9 @@ use tokenizers::models::bpe::BPE;
 use tokenizers::pre_tokenizers::byte_level::ByteLevel;
 use tokenizers::{AddedToken, Tokenizer};
 
+mod server;
+mod voice_design;
+
 #[derive(Debug, Parser)]
 #[command(version, about)]
 struct Cli {
@@ -19,6 +22,26 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Run a persistent OpenAI-compatible VoiceDesign HTTP server.
+    Serve {
+        /// Qwen3-TTS VoiceDesign model directory.
+        model_dir: PathBuf,
+        /// Zero-based CUDA device index.
+        #[arg(long, default_value_t = 0)]
+        gpu: usize,
+        /// Listen address.
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// Listen port.
+        #[arg(long, default_value_t = 18001)]
+        port: u16,
+        /// Per-request codec-frame safety limit and session capacity.
+        #[arg(long, default_value_t = 2048)]
+        max_frames: usize,
+        /// Maximum number of waiting HTTP requests.
+        #[arg(long, default_value_t = 16)]
+        queue_capacity: usize,
+    },
     /// Validate a Qwen3-TTS model and print its inference geometry.
     Inspect {
         /// Directory containing config.json and Safetensors weights.
@@ -233,6 +256,24 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
     match Cli::parse().command {
+        Command::Serve {
+            model_dir,
+            gpu,
+            host,
+            port,
+            max_frames,
+            queue_capacity,
+        } => tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?
+            .block_on(server::run(
+                model_dir,
+                gpu,
+                host,
+                port,
+                max_frames,
+                queue_capacity,
+            ))?,
         Command::Inspect { model_dir } => {
             let inspection = inspect_model(&model_dir)
                 .with_context(|| format!("could not inspect {}", model_dir.display()))?;

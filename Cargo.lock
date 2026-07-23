@@ -295,13 +295,18 @@ name = "chew-tts"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "chew-kernel",
  "chew-model-qwen3-tts",
  "chew-vram",
  "clap",
+ "cudarc",
  "half",
+ "serde",
  "serde_json",
  "tokenizers",
+ "tokio",
+ "tracing",
  "tracing-subscriber",
 ]
 

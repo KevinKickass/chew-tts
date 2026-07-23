@@ -270,6 +270,50 @@ model EOS normally, and produces 22.32 seconds of audio in approximately
 A separate 256-frame safety-limit run writes a valid 20.48-second WAV and
 returns an explicit truncation error instead of silently accepting it.
 
+## HTTP server
+
+Run the persistent VoiceDesign worker:
+
+```bash
+CARGO_TARGET_DIR=/tmp/chew-tts-target \
+  cargo run --release -p chew-tts -- \
+  serve /models/Qwen3-TTS-12Hz-1.7B-VoiceDesign \
+  --gpu 0 --host 127.0.0.1 --port 18001
+```
+
+The server loads the model once, owns CUDA from a dedicated worker thread, and
+places concurrent requests in a bounded queue. It exposes:
+
+- `POST /v1/audio/speech` (OpenAI-compatible synchronous speech);
+- `GET /v1/models`;
+- `GET /health`;
+- `POST /internal/audio/raw` (24-kHz mono float32 for SimpleLLM/Fleet).
+
+VoiceDesign uses the optional `instruct` field. `instruction` and OpenAI's
+`instructions` are accepted as aliases; if none is present, `voice` may
+contain a free-form voice description. Supported `response_format` values are
+`wav`, `pcm`, `mp3`, `opus`, `aac`, and `flac`. Compressed formats and
+non-default `speed` use FFmpeg.
+
+```bash
+curl http://127.0.0.1:18001/v1/audio/speech \
+  -H 'content-type: application/json' \
+  -d '{
+    "model": "tts-voice-design",
+    "input": "Guten Abend. Schön, dass du da bist.",
+    "voice": "alloy",
+    "language": "de",
+    "instruct": "A quiet, warm and natural German female voice.",
+    "response_format": "mp3"
+  }' \
+  --output speech.mp3
+```
+
+Responses include `server-timing`, `x-sllm-audio-duration-ms`, and
+`x-sllm-generation-frames`. On an RTX 3080, two sequential HTTP validation
+requests completed without model reload; the WAV response was byte-identical
+to the validated CLI output.
+
 ## Requirements
 
 - NVIDIA GPU with compute capability 7.0 or newer
