@@ -42,13 +42,17 @@ Implemented:
 - native talker text/codec embeddings, SwiLU text projection, and semantic head;
 - exact VoiceDesign ChatML/control-token prefill, persistent talker KV cache,
   autoregressive semantic/acoustic generation, and end-to-end WAV output;
+- native CustomVoice speaker selection with optional instructions;
+- native WAV decoding, 24-kHz resampling, Slaney log-mel preprocessing, and a
+  CUDA ECAPA-TDNN speaker encoder for Base x-vector voice cloning;
 - PyTorch parity checks for real Qwen weights, RoPE, GQA, and cached decoding.
 
 Next:
 
 - one CUDA graph for a complete 16-codebook audio frame;
 - optimized one-pass model loading and GPU-resident sampling;
-- speaker and reference-audio encoders for voice cloning;
+- Base ICL prompting with reference text and speech-tokenizer codes;
+- arbitrary compressed reference-audio input in addition to native WAV;
 - Kokoro as the second model family.
 
 ## Why a separate repository?
@@ -272,7 +276,7 @@ returns an explicit truncation error instead of silently accepting it.
 
 ## HTTP server
 
-Run the persistent VoiceDesign worker:
+Run a persistent worker for a VoiceDesign, CustomVoice, or Base checkpoint:
 
 ```bash
 CARGO_TARGET_DIR=/tmp/chew-tts-target \
@@ -291,9 +295,18 @@ places concurrent requests in a bounded queue. It exposes:
 
 VoiceDesign uses the optional `instruct` field. `instruction` and OpenAI's
 `instructions` are accepted as aliases; if none is present, `voice` may
-contain a free-form voice description. Supported `response_format` values are
-`wav`, `pcm`, `mp3`, `opus`, `aac`, and `flac`. Compressed formats and
-non-default `speed` use FFmpeg.
+contain a free-form voice description. CustomVoice accepts Qwen speaker names
+(`serena`, `vivian`, `uncle_fu`, `ryan`, `aiden`, `ono_anna`, `sohee`,
+`eric`, and `dylan`) and maps the common OpenAI voice names onto them.
+
+Base x-vector cloning accepts the non-OpenAI `reference_audio` extension as a
+base64 WAV or WAV data URL. An instruction can be supplied at the same time.
+Reference extraction is completely native and takes approximately 0.13
+seconds for a 8.7-second clip on an RTX 3080. `reference_text` is reserved for
+the not-yet-complete ICL path and currently returns an explicit error.
+
+Supported `response_format` values are `wav`, `pcm`, `mp3`, `opus`, `aac`,
+and `flac`. Compressed formats and non-default `speed` use FFmpeg.
 
 ```bash
 curl http://127.0.0.1:18001/v1/audio/speech \

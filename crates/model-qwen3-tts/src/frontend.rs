@@ -405,6 +405,25 @@ impl TalkerFrontend {
         language_codec_id: i32,
         kernels: &mut GpuKernels,
     ) -> anyhow::Result<VoiceDesignInputs> {
+        self.build_conditioned_inputs(
+            text_ids,
+            Some(instruction_ids),
+            language_codec_id,
+            None,
+            kernels,
+        )
+    }
+
+    /// Build the common streaming prompt used by VoiceDesign, CustomVoice,
+    /// and speaker-embedding-only Base generation.
+    pub fn build_conditioned_inputs(
+        &self,
+        text_ids: &[i32],
+        instruction_ids: Option<&[i32]>,
+        language_codec_id: i32,
+        speaker_embedding: Option<&[f32]>,
+        kernels: &mut GpuKernels,
+    ) -> anyhow::Result<VoiceDesignInputs> {
         const IM_START: i32 = 151_644;
         const ASSISTANT: i32 = 77_091;
         const NEWLINE: i32 = 198;
@@ -417,26 +436,40 @@ impl TalkerFrontend {
         const CODEC_THINK_BOS: i32 = 2_156;
         const CODEC_THINK_EOS: i32 = 2_157;
 
-        ensure!(!text_ids.is_empty(), "VoiceDesign text must not be empty");
-        ensure!(
-            !instruction_ids.is_empty(),
-            "VoiceDesign instruction must not be empty"
-        );
+        ensure!(!text_ids.is_empty(), "TTS text must not be empty");
+        if let Some(instruction) = instruction_ids {
+            ensure!(!instruction.is_empty(), "TTS instruction must not be empty");
+        }
+        if let Some(speaker) = speaker_embedding {
+            ensure!(
+                speaker.len() == self.hidden_size,
+                "speaker embedding has {} values, expected {}",
+                speaker.len(),
+                self.hidden_size
+            );
+        }
 
-        let instruction = self.project_text_tokens(instruction_ids, kernels)?;
+        let instruction = instruction_ids
+            .map(|ids| self.project_text_tokens(ids, kernels))
+            .transpose()?
+            .unwrap_or_default();
         let role = self.project_text_tokens(&[IM_START, ASSISTANT, NEWLINE], kernels)?;
-        let control_text =
-            self.project_text_tokens(&[TTS_PAD, TTS_PAD, TTS_PAD, TTS_PAD, TTS_BOS], kernels)?;
-        let control_codec = self.codec_embeddings(
+        let mut control_text_ids = vec![TTS_PAD; if speaker_embedding.is_some() { 5 } else { 4 }];
+        control_text_ids.push(TTS_BOS);
+        let control_text = self.project_text_tokens(&control_text_ids, kernels)?;
+        let mut control_codec = self.codec_embeddings(
             &[
                 CODEC_THINK,
                 CODEC_THINK_BOS,
                 language_codec_id,
                 CODEC_THINK_EOS,
-                CODEC_PAD,
             ],
             kernels,
         )?;
+        if let Some(speaker) = speaker_embedding {
+            control_codec.extend_from_slice(speaker);
+        }
+        control_codec.extend(self.codec_embeddings(&[CODEC_PAD], kernels)?);
         let first_text = self.project_text_tokens(&text_ids[..1], kernels)?;
         let codec_bos = self.codec_embeddings(&[CODEC_BOS], kernels)?;
 

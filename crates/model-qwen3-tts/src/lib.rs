@@ -4,6 +4,7 @@ mod cuda;
 mod frontend;
 mod predictor;
 mod sampling;
+mod speaker_encoder;
 
 pub use codec::{CodecQuantizer, CodecTransformerSession};
 pub use config::{
@@ -15,6 +16,7 @@ pub use cuda::{
 };
 pub use frontend::{SemanticSamplingSession, TalkerFrontend, VoiceDesignInputs};
 pub use predictor::{CodePredictorGenerationSession, CodePredictorTransformer};
+pub use speaker_encoder::SpeakerEncoder;
 
 use chew_safetensors::{MappedSafetensors, TensorInfo};
 use std::collections::HashMap;

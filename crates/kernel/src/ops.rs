@@ -119,10 +119,7 @@ impl OpsKernels {
             argmax_f16: loader::get_fn(&module, "argmax_f16")?,
             sample_top_k: loader::get_fn(&module, "sample_top_k")?,
             sample_top_k_small: loader::get_fn(&module, "sample_top_k_small")?,
-            sample_top_k_small_filtered: loader::get_fn(
-                &module,
-                "sample_top_k_small_filtered",
-            )?,
+            sample_top_k_small_filtered: loader::get_fn(&module, "sample_top_k_small_filtered")?,
             mha_fused: loader::get_fn(&module, "mha_fused")?,
             mha_naive: loader::get_fn(&module, "mha_naive")?,
             mha_naive_full: loader::get_fn(&module, "mha_naive_full")?,
@@ -162,10 +159,7 @@ impl OpsKernels {
                 &module,
                 "scatter_conv_transpose_phase_f16",
             )?,
-            conv_transpose1d_causal_f16: loader::get_fn(
-                &module,
-                "conv_transpose1d_causal_f16",
-            )?,
+            conv_transpose1d_causal_f16: loader::get_fn(&module, "conv_transpose1d_causal_f16")?,
             transpose_f16: loader::get_fn(&module, "transpose_f16")?,
             gelu_erf_f16: loader::get_fn(&module, "gelu_erf_f16")?,
             silu_act_f16: loader::get_fn(&module, "silu_act_f16")?,
@@ -439,11 +433,7 @@ impl OpsKernels {
     ) -> Result<(), KernelError> {
         let threads = 256;
         let n_i = n as i32;
-        let mut args: [*mut c_void; 3] = [
-            slice_ptr(x),
-            slice_ptr_mut(out),
-            scalar_ptr(&n_i),
-        ];
+        let mut args: [*mut c_void; 3] = [slice_ptr(x), slice_ptr_mut(out), scalar_ptr(&n_i)];
         unsafe {
             self.fast.fire(
                 &self.gelu_erf_f16,
@@ -465,11 +455,7 @@ impl OpsKernels {
     ) -> Result<(), KernelError> {
         let threads = 256;
         let n_i = n as i32;
-        let mut args: [*mut c_void; 3] = [
-            slice_ptr(x),
-            slice_ptr_mut(out),
-            scalar_ptr(&n_i),
-        ];
+        let mut args: [*mut c_void; 3] = [slice_ptr(x), slice_ptr_mut(out), scalar_ptr(&n_i)];
         unsafe {
             self.fast.fire(
                 &self.silu_act_f16,
@@ -2526,7 +2512,8 @@ impl OpsKernels {
             slice_ptr_mut(sampled),
         ];
         unsafe {
-            self.fast.fire(&self.eb_reduce, (c_len, 1, 1), (256, 1, 1), 0, &mut args);
+            self.fast
+                .fire(&self.eb_reduce, (c_len, 1, 1), (256, 1, 1), 0, &mut args);
         }
         Ok(())
     }
@@ -2541,10 +2528,20 @@ impl OpsKernels {
         dim: u32,
     ) -> Result<(), KernelError> {
         let dimi = dim as i32;
-        let mut args: [*mut c_void; 4] =
-            [slice_ptr(src), slice_ptr(idx), slice_ptr_mut(dst), scalar_ptr(&dimi)];
+        let mut args: [*mut c_void; 4] = [
+            slice_ptr(src),
+            slice_ptr(idx),
+            slice_ptr_mut(dst),
+            scalar_ptr(&dimi),
+        ];
         unsafe {
-            self.fast.fire(&self.gather_rows_f16, (n_rows, 1, 1), (256, 1, 1), 0, &mut args);
+            self.fast.fire(
+                &self.gather_rows_f16,
+                (n_rows, 1, 1),
+                (256, 1, 1),
+                0,
+                &mut args,
+            );
         }
         Ok(())
     }
@@ -2569,8 +2566,13 @@ impl OpsKernels {
             scalar_ptr(&dimi),
         ];
         unsafe {
-            self.fast
-                .fire(&self.scatter_add_rows_f16, (n_rows, 1, 1), (256, 1, 1), 0, &mut args);
+            self.fast.fire(
+                &self.scatter_add_rows_f16,
+                (n_rows, 1, 1),
+                (256, 1, 1),
+                0,
+                &mut args,
+            );
         }
         Ok(())
     }

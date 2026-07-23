@@ -1,7 +1,8 @@
 use anyhow::Context;
 use chew_model_qwen3_tts::{
-    CodePredictorTransformer, CodecQuantizer, CodecTransformerSession, TalkerDecoderLayer,
-    TalkerFrontend, TalkerLayerKvCache, TalkerTransformer, inspect_model, load_f16_tensor,
+    CodePredictorTransformer, CodecQuantizer, CodecTransformerSession, SpeakerEncoder,
+    TalkerDecoderLayer, TalkerFrontend, TalkerLayerKvCache, TalkerTransformer, inspect_model,
+    load_f16_tensor,
 };
 use clap::{Parser, Subcommand};
 use std::io::{Seek, SeekFrom, Write};
@@ -10,6 +11,7 @@ use tokenizers::models::bpe::BPE;
 use tokenizers::pre_tokenizers::byte_level::ByteLevel;
 use tokenizers::{AddedToken, Tokenizer};
 
+mod audio_input;
 mod server;
 mod voice_design;
 
@@ -206,6 +208,26 @@ enum Command {
         #[arg(long)]
         text: Option<String>,
         /// Optional raw little-endian f32 projected-text reference.
+        #[arg(long)]
+        reference: Option<PathBuf>,
+    },
+    /// Validate native WAV/mel preprocessing and the Base speaker encoder.
+    CudaSpeakerSmoke {
+        /// Qwen3-TTS Base model directory.
+        model_dir: PathBuf,
+        /// Reference WAV.
+        #[arg(long)]
+        wav: PathBuf,
+        /// Zero-based CUDA device index.
+        #[arg(long, default_value_t = 0)]
+        gpu: usize,
+        /// Write the 2048-value little-endian f32 embedding.
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// Write the channel-last speaker mel as little-endian f32.
+        #[arg(long)]
+        mel_output: Option<PathBuf>,
+        /// Compare against a raw little-endian f32 reference embedding.
         #[arg(long)]
         reference: Option<PathBuf>,
     },
@@ -422,6 +444,21 @@ fn main() -> anyhow::Result<()> {
             text.as_deref(),
             reference.as_deref(),
         )?,
+        Command::CudaSpeakerSmoke {
+            model_dir,
+            wav,
+            gpu,
+            output,
+            mel_output,
+            reference,
+        } => cuda_speaker_smoke(
+            &model_dir,
+            &wav,
+            gpu,
+            output.as_deref(),
+            mel_output.as_deref(),
+            reference.as_deref(),
+        )?,
         Command::CudaVoiceDesignSmoke {
             model_dir,
             gpu,
@@ -450,6 +487,61 @@ fn main() -> anyhow::Result<()> {
             &wav,
         )?,
     }
+    Ok(())
+}
+
+fn cuda_speaker_smoke(
+    model_dir: &std::path::Path,
+    wav: &std::path::Path,
+    gpu: usize,
+    output: Option<&std::path::Path>,
+    mel_output: Option<&std::path::Path>,
+    reference: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    let bytes = std::fs::read(wav).with_context(|| format!("could not read {}", wav.display()))?;
+    let (samples, sample_rate) = audio_input::decode_wav(&bytes)?;
+    let samples = audio_input::resample(&samples, sample_rate, 24_000);
+    let (mel, frames) = audio_input::speaker_mel(&samples)?;
+    if let Some(output) = mel_output {
+        let mut bytes = Vec::with_capacity(mel.len() * 4);
+        for value in &mel {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        std::fs::write(output, bytes)
+            .with_context(|| format!("could not write {}", output.display()))?;
+    }
+    let allocator = chew_vram::VramAllocator::init()?;
+    anyhow::ensure!(
+        gpu < allocator.gpu_count(),
+        "GPU index {gpu} is out of range; detected {} device(s)",
+        allocator.gpu_count()
+    );
+    let stream = allocator.stream(gpu);
+    let inspection = inspect_model(model_dir)?;
+    let config = &inspection.config.talker_config;
+    let max_matrix = (config.intermediate_size * config.hidden_size)
+        .max(config.text_hidden_size * config.text_hidden_size);
+    let max_vector = config.intermediate_size.max(config.text_hidden_size);
+    let mut kernels = chew_kernel::GpuKernels::load(stream, max_matrix, max_vector)?;
+    let encoder = SpeakerEncoder::load(model_dir, stream)?;
+    let started = std::time::Instant::now();
+    let embedding = encoder.encode_mel(&mel, frames, &mut kernels)?;
+    let elapsed = started.elapsed();
+    if let Some(output) = output {
+        let mut bytes = Vec::with_capacity(embedding.len() * 4);
+        for value in &embedding {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        std::fs::write(output, bytes)
+            .with_context(|| format!("could not write {}", output.display()))?;
+    }
+    compare_reference(&embedding, reference, 0.08)?;
+    println!(
+        "speaker embedding: {} mel frame(s), {} values, {:.3}s",
+        frames,
+        embedding.len(),
+        elapsed.as_secs_f64()
+    );
     Ok(())
 }
 

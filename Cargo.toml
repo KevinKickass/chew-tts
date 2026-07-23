@@ -62,3 +62,6 @@ parking_lot = "0.12"
 dashmap = "6"
 uuid = { version = "1", features = ["v4"] }
 clap = { version = "4", features = ["derive"] }
+base64 = "0.22"
+hound = "3.5"
+rustfft = "6.2"

@@ -3,12 +3,14 @@ mod gemm;
 mod gemv;
 mod loader;
 mod ops;
+mod speaker;
 
 pub use dequant::DequantKernels;
 pub use gemm::Gemm;
 pub use gemv::GemvKernels;
 pub use loader::KernelError;
 pub use ops::OpsKernels;
+pub use speaker::SpeakerKernels;
 
 use cudarc::driver::CudaStream;
 use std::sync::Arc;

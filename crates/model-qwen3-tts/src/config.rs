@@ -60,6 +60,8 @@ pub struct TalkerConfig {
     pub code_predictor_config: CodePredictorConfig,
     #[serde(default)]
     pub codec_language_id: HashMap<String, u32>,
+    #[serde(default)]
+    pub spk_id: HashMap<String, u32>,
 }
 
 impl TalkerConfig {
@@ -75,6 +77,13 @@ impl TalkerConfig {
         }
         if self.code_predictor_config.num_code_groups != self.num_code_groups {
             return Err("talker and code predictor disagree on code groups".into());
+        }
+        if self
+            .spk_id
+            .values()
+            .any(|id| *id as usize >= self.vocab_size)
+        {
+            return Err("speaker ID is outside the codec vocabulary".into());
         }
         self.code_predictor_config.validate()
     }

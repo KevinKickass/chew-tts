@@ -571,5 +571,6 @@ fn predictor_geometry(config: &CodePredictorConfig) -> TalkerConfig {
         rms_norm_eps: config.rms_norm_eps,
         code_predictor_config: config.clone(),
         codec_language_id: HashMap::new(),
+        spk_id: HashMap::new(),
     }
 }

@@ -4,6 +4,7 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use base64::Engine;
 use serde::Deserialize;
 use serde_json::json;
 use std::path::PathBuf;
@@ -63,6 +64,10 @@ struct SpeechRequest {
     seed: u64,
     #[serde(default)]
     max_frames: Option<usize>,
+    #[serde(default, alias = "reference_audio_base64", alias = "ref_audio")]
+    reference_audio: Option<String>,
+    #[serde(default, alias = "ref_text")]
+    reference_text: Option<String>,
 }
 
 fn default_model() -> String {
@@ -107,7 +112,11 @@ pub async fn run(
             let engine = VoiceDesignEngine::load(&model_dir, gpu, max_frames);
             match engine {
                 Ok(engine) => {
-                    let metadata = (engine.load_elapsed, engine.vram_bytes);
+                    let metadata = (
+                        engine.load_elapsed,
+                        engine.vram_bytes,
+                        engine.model_id().to_owned(),
+                    );
                     if ready_tx.send(Ok(metadata)).is_ok() {
                         gpu_worker(engine, receiver);
                     }
@@ -117,14 +126,14 @@ pub async fn run(
                 }
             }
         })?;
-    let (load_elapsed, vram_bytes) = ready_rx
+    let (load_elapsed, vram_bytes, model) = ready_rx
         .recv()
         .map_err(|_| anyhow::anyhow!("GPU worker exited during startup"))?
         .map_err(anyhow::Error::msg)?;
 
     let state = Arc::new(AppState {
         jobs,
-        model: "tts-voice-design".into(),
+        model,
         max_frames,
         vram_bytes,
     });
@@ -268,10 +277,12 @@ async fn submit(state: &Arc<AppState>, request: SpeechRequest) -> Result<Generat
             "speed must be between 0.25 and 4.0",
         ));
     }
-    if !matches!(
-        request.model.as_str(),
-        "tts-voice-design" | "qwen3-tts-voice-design" | "qwen3-tts"
-    ) {
+    if request.model != state.model
+        && !matches!(
+            request.model.as_str(),
+            "qwen3-tts-voice-design" | "qwen3-tts-customvoice" | "qwen3-tts"
+        )
+    {
         return Err(error_response(
             StatusCode::BAD_REQUEST,
             &format!("unsupported model {:?}", request.model),
@@ -281,17 +292,29 @@ async fn submit(state: &Arc<AppState>, request: SpeechRequest) -> Result<Generat
         .instruct
         .or(request.instruction)
         .or(request.instructions)
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| {
+        .filter(|value| !value.trim().is_empty());
+    let instruction = if state.model == "tts-voice-design" {
+        Some(instruction.unwrap_or_else(|| {
             if request.voice.eq_ignore_ascii_case("alloy") {
                 DEFAULT_INSTRUCTION.into()
             } else {
                 request.voice.clone()
             }
-        });
+        }))
+    } else {
+        instruction
+    };
     let synthesis = SynthesisRequest {
         text: request.input,
+        voice: request.voice,
         instruction,
+        reference_audio_wav: match request.reference_audio {
+            Some(encoded) => match decode_reference_audio(&encoded) {
+                Ok(bytes) => Some(bytes),
+                Err(message) => return Err(error_response(StatusCode::BAD_REQUEST, &message)),
+            },
+            None => None,
+        },
         language: normalize_language(&request.language),
         max_frames: request.max_frames.unwrap_or(state.max_frames),
         seed: request.seed,
@@ -300,6 +323,12 @@ async fn submit(state: &Arc<AppState>, request: SpeechRequest) -> Result<Generat
         chunk_frames: 32,
         chunk_context: 4,
     };
+    if request.reference_text.is_some() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "reference_text ICL mode is not implemented yet; omit it for speaker-embedding mode",
+        ));
+    }
     let (response_tx, response_rx) = oneshot::channel();
     state
         .jobs
@@ -336,6 +365,21 @@ async fn submit(state: &Arc<AppState>, request: SpeechRequest) -> Result<Generat
             "TTS worker exited",
         )),
     }
+}
+
+fn decode_reference_audio(encoded: &str) -> Result<Vec<u8>, String> {
+    const MAX_REFERENCE_BYTES: usize = 32 * 1024 * 1024;
+    let payload = encoded
+        .split_once(',')
+        .filter(|(prefix, _)| prefix.starts_with("data:"))
+        .map_or(encoded, |(_, payload)| payload);
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(payload)
+        .map_err(|error| format!("reference_audio is not valid base64: {error}"))?;
+    if decoded.len() > MAX_REFERENCE_BYTES {
+        return Err("reference_audio exceeds 32 MiB".into());
+    }
+    Ok(decoded)
 }
 
 fn normalize_language(language: &str) -> String {

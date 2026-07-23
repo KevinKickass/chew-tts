@@ -1,8 +1,9 @@
+use crate::audio_input::{decode_wav, resample, speaker_mel};
 use anyhow::{Context, ensure};
 use chew_model_qwen3_tts::{
     CodePredictorGenerationSession, CodePredictorTransformer, CodecQuantizer,
-    CodecTransformerSession, SemanticSamplingSession, TalkerConfig, TalkerFrontend,
-    TalkerTransformer, inspect_model,
+    CodecTransformerSession, ModelType, SemanticSamplingSession, SpeakerEncoder, TalkerConfig,
+    TalkerFrontend, TalkerTransformer, inspect_model,
 };
 use cudarc::driver::CudaStream;
 use std::path::Path;
@@ -13,6 +14,7 @@ use tokenizers::pre_tokenizers::byte_level::ByteLevel;
 use tokenizers::{AddedToken, Tokenizer};
 
 pub struct VoiceDesignEngine {
+    model_type: ModelType,
     config: TalkerConfig,
     tokenizer: Tokenizer,
     stream: Arc<CudaStream>,
@@ -23,6 +25,7 @@ pub struct VoiceDesignEngine {
     predictor_session: CodePredictorGenerationSession,
     semantic_session: SemanticSamplingSession,
     codec: CodecQuantizer,
+    speaker_encoder: Option<SpeakerEncoder>,
     max_frames: usize,
     pub load_elapsed: Duration,
     pub vram_bytes: u64,
@@ -31,7 +34,9 @@ pub struct VoiceDesignEngine {
 #[derive(Debug, Clone)]
 pub struct SynthesisRequest {
     pub text: String,
-    pub instruction: String,
+    pub voice: String,
+    pub instruction: Option<String>,
+    pub reference_audio_wav: Option<Vec<u8>>,
     pub language: String,
     pub max_frames: usize,
     pub seed: u64,
@@ -59,6 +64,7 @@ impl VoiceDesignEngine {
     pub fn load(model_dir: &Path, gpu: usize, max_frames: usize) -> anyhow::Result<Self> {
         ensure!(max_frames > 0, "maximum frame count must be non-zero");
         let inspection = inspect_model(model_dir)?;
+        let model_type = inspection.config.tts_model_type;
         let config = inspection.config.talker_config;
         let tokenizer = load_qwen_tokenizer(model_dir)?;
         let allocator = chew_vram::VramAllocator::init()?;
@@ -82,12 +88,18 @@ impl VoiceDesignEngine {
         let predictor_session = predictor.start_generation_session(&stream)?;
         let semantic_session = frontend.start_semantic_sampling_session(max_frames, &stream)?;
         let codec = CodecQuantizer::load(model_dir.join("speech_tokenizer"), &stream)?;
+        let speaker_encoder = if model_type == ModelType::Base {
+            Some(SpeakerEncoder::load(model_dir, &stream)?)
+        } else {
+            None
+        };
         let load_elapsed = started.elapsed();
         let free_loaded = allocator.free_bytes(gpu)?;
 
         // Compile/load kernels before the server reports readiness.
         kernels.ops.stream().synchronize()?;
         Ok(Self {
+            model_type,
             config,
             tokenizer,
             stream,
@@ -98,18 +110,23 @@ impl VoiceDesignEngine {
             predictor_session,
             semantic_session,
             codec,
+            speaker_encoder,
             max_frames,
             load_elapsed,
             vram_bytes: free_before.saturating_sub(free_loaded),
         })
     }
 
+    pub fn model_id(&self) -> &'static str {
+        match self.model_type {
+            ModelType::Base => "tts-multilingual-base",
+            ModelType::CustomVoice => "tts-multilingual",
+            ModelType::VoiceDesign => "tts-voice-design",
+        }
+    }
+
     pub fn synthesize(&mut self, request: &SynthesisRequest) -> anyhow::Result<SynthesisOutput> {
         ensure!(!request.text.trim().is_empty(), "text must not be empty");
-        ensure!(
-            !request.instruction.trim().is_empty(),
-            "instruction must not be empty"
-        );
         ensure!(
             request.max_frames > 0 && request.max_frames <= self.max_frames,
             "max_frames must be between 1 and {}",
@@ -153,17 +170,57 @@ impl VoiceDesignEngine {
                 .collect())
         };
         let text_ids = encode(&request.text)?;
-        let instruction_ids = encode(&format!(
-            "<|im_start|>user\n{}<|im_end|>\n",
-            request.instruction
-        ))?;
+        let instruction_ids = request
+            .instruction
+            .as_deref()
+            .filter(|instruction| !instruction.trim().is_empty())
+            .map(|instruction| encode(&format!("<|im_start|>user\n{instruction}<|im_end|>\n")))
+            .transpose()?;
+        ensure!(
+            self.model_type != ModelType::VoiceDesign || instruction_ids.is_some(),
+            "instruction must not be empty for a VoiceDesign model"
+        );
+        let speaker_embedding = match self.model_type {
+            ModelType::CustomVoice => {
+                let speaker = normalize_speaker_name(&request.voice);
+                let speaker_id = self.config.spk_id.get(&speaker).copied().with_context(|| {
+                    let mut supported = self.config.spk_id.keys().cloned().collect::<Vec<_>>();
+                    supported.sort();
+                    format!(
+                        "unsupported voice {:?}; supported: {supported:?}",
+                        request.voice
+                    )
+                })?;
+                Some(
+                    self.frontend
+                        .codec_embeddings(&[speaker_id as i32], &mut self.kernels)?,
+                )
+            }
+            ModelType::Base => {
+                let wav = request
+                    .reference_audio_wav
+                    .as_deref()
+                    .context("reference_audio is required for a Base model")?;
+                let (samples, sample_rate) = decode_wav(wav)?;
+                let samples = resample(&samples, sample_rate, 24_000);
+                let (mel, frames) = speaker_mel(&samples)?;
+                Some(
+                    self.speaker_encoder
+                        .as_ref()
+                        .context("Base speaker encoder was not loaded")?
+                        .encode_mel(&mel, frames, &mut self.kernels)?,
+                )
+            }
+            ModelType::VoiceDesign => None,
+        };
         let mut seed = request.seed;
 
         let prompt_started = Instant::now();
-        let inputs = self.frontend.build_voice_design_inputs(
+        let inputs = self.frontend.build_conditioned_inputs(
             &text_ids,
-            &instruction_ids,
+            instruction_ids.as_deref(),
             language_codec_id,
+            speaker_embedding.as_deref(),
             &mut self.kernels,
         )?;
         let max_seq_len = inputs.prefill_tokens + request.max_frames;
@@ -332,6 +389,19 @@ impl VoiceDesignEngine {
             generation_elapsed,
             codec_elapsed,
         })
+    }
+}
+
+fn normalize_speaker_name(voice: &str) -> String {
+    let normalized = voice.trim().to_ascii_lowercase().replace('-', "_");
+    match normalized.as_str() {
+        "alloy" => "ryan".into(),
+        "echo" => "aiden".into(),
+        "fable" => "eric".into(),
+        "onyx" => "uncle_fu".into(),
+        "nova" => "serena".into(),
+        "shimmer" => "vivian".into(),
+        _ => normalized,
     }
 }
 
