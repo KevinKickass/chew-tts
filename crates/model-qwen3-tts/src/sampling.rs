@@ -46,6 +46,10 @@ pub(crate) fn sample_top_k(
 }
 
 fn random_unit(seed: &mut u64) -> f32 {
+    ((next_seed_u32(seed) >> 8) as f32) / ((1u32 << 24) as f32)
+}
+
+pub(crate) fn next_seed_u32(seed: &mut u64) -> u32 {
     if *seed == 0 {
         *seed = 0x9e37_79b9_7f4a_7c15;
     }
@@ -53,7 +57,7 @@ fn random_unit(seed: &mut u64) -> f32 {
     *seed ^= *seed << 25;
     *seed ^= *seed >> 27;
     let value = seed.wrapping_mul(0x2545_f491_4f6c_dd1d);
-    ((value >> 40) as f32) / ((1u32 << 24) as f32)
+    (value >> 32) as u32
 }
 
 #[cfg(test)]

@@ -39,6 +39,7 @@ pub struct OpsKernels {
     fused_rope_kv: CudaFunction,
     argmax_f16: CudaFunction,
     sample_top_k: CudaFunction,
+    sample_top_k_small: CudaFunction,
     mha_fused: CudaFunction,
     mha_naive: CudaFunction,
     mha_naive_full: CudaFunction,
@@ -113,6 +114,7 @@ impl OpsKernels {
             fused_rope_kv: loader::get_fn(&module, "fused_rope_kv")?,
             argmax_f16: loader::get_fn(&module, "argmax_f16")?,
             sample_top_k: loader::get_fn(&module, "sample_top_k")?,
+            sample_top_k_small: loader::get_fn(&module, "sample_top_k_small")?,
             mha_fused: loader::get_fn(&module, "mha_fused")?,
             mha_naive: loader::get_fn(&module, "mha_naive")?,
             mha_naive_full: loader::get_fn(&module, "mha_naive_full")?,
@@ -1227,6 +1229,41 @@ impl OpsKernels {
                 .arg(&temperature)
                 .arg(&tk)
                 .arg(&top_p)
+                .arg(&random_seed)
+                .launch(cfg)
+                .map_err(|e| KernelError::Launch(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Exact single-block sampling for vocabularies up to a few thousand IDs.
+    ///
+    /// Unlike the large-vocabulary approximation, this retains every global
+    /// top-k candidate and supports the Qwen TTS default of k=50.
+    pub fn sample_top_k_small(
+        &self,
+        logits: &CudaSlice<half::f16>,
+        out: &mut CudaSlice<i32>,
+        vocab_size: u32,
+        temperature: f32,
+        top_k: u32,
+        random_seed: u32,
+    ) -> Result<(), KernelError> {
+        let cfg = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let vs = vocab_size as i32;
+        let tk = top_k as i32;
+        unsafe {
+            self.stream
+                .launch_builder(&self.sample_top_k_small)
+                .arg(logits)
+                .arg(out)
+                .arg(&vs)
+                .arg(&temperature)
+                .arg(&tk)
                 .arg(&random_seed)
                 .launch(cfg)
                 .map_err(|e| KernelError::Launch(e.to_string()))?;

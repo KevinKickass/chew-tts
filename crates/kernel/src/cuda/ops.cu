@@ -1381,6 +1381,97 @@ __global__ void sample_top_k(const __half* __restrict__ logits,
         out[0] = gi[0];
     }
 }
+
+// Exact sampler for vocabularies up to 3,072 entries such as Qwen3-TTS.
+// Each of 256 threads owns at most 12 strided logits. Local candidates are
+// sorted in registers; repeated block reductions then merge the exact global
+// top-k without downloading logits or approximating the candidate set.
+#define SMALL_SAMPLE_K 64
+#define SMALL_SAMPLE_LOCAL 12
+__global__ void sample_top_k_small(const __half* __restrict__ logits,
+                                   int* __restrict__ out,
+                                   int vocab_size,
+                                   float temperature,
+                                   int top_k_param,
+                                   unsigned int random_seed) {
+    if (blockIdx.x != 0) return;
+    const int k = min(max(top_k_param, 1), SMALL_SAMPLE_K);
+    float local_values[SMALL_SAMPLE_LOCAL];
+    int local_ids[SMALL_SAMPLE_LOCAL];
+    for (int i = 0; i < SMALL_SAMPLE_LOCAL; i++) {
+        local_values[i] = -1e30f;
+        local_ids[i] = 0;
+    }
+    for (int token = threadIdx.x; token < vocab_size; token += blockDim.x) {
+        const float value = __half2float(logits[token]);
+        if (value <= local_values[SMALL_SAMPLE_LOCAL - 1]) continue;
+        local_values[SMALL_SAMPLE_LOCAL - 1] = value;
+        local_ids[SMALL_SAMPLE_LOCAL - 1] = token;
+        for (int slot = SMALL_SAMPLE_LOCAL - 2;
+             slot >= 0 && local_values[slot + 1] > local_values[slot];
+             slot--) {
+            const float old_value = local_values[slot];
+            local_values[slot] = local_values[slot + 1];
+            local_values[slot + 1] = old_value;
+            const int old_id = local_ids[slot];
+            local_ids[slot] = local_ids[slot + 1];
+            local_ids[slot + 1] = old_id;
+        }
+    }
+
+    __shared__ float reduce_values[256];
+    __shared__ int reduce_ids[256];
+    __shared__ float selected_values[SMALL_SAMPLE_K];
+    __shared__ int selected_ids[SMALL_SAMPLE_K];
+    __shared__ int selected_owner;
+    int cursor = 0;
+    for (int rank = 0; rank < k; rank++) {
+        reduce_values[threadIdx.x] =
+            cursor < SMALL_SAMPLE_LOCAL ? local_values[cursor] : -1e30f;
+        reduce_ids[threadIdx.x] =
+            cursor < SMALL_SAMPLE_LOCAL ? local_ids[cursor] : 0;
+        __syncthreads();
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride &&
+                reduce_values[threadIdx.x + stride] > reduce_values[threadIdx.x]) {
+                reduce_values[threadIdx.x] = reduce_values[threadIdx.x + stride];
+                reduce_ids[threadIdx.x] = reduce_ids[threadIdx.x + stride];
+            }
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) {
+            selected_values[rank] = reduce_values[0];
+            selected_ids[rank] = reduce_ids[0];
+            selected_owner = reduce_ids[0] & 255;
+        }
+        __syncthreads();
+        if ((int)threadIdx.x == selected_owner) cursor++;
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        const float divisor = temperature > 0.0f ? temperature : 1.0f;
+        const float maximum = selected_values[0] / divisor;
+        float total = 0.0f;
+        for (int i = 0; i < k; i++) {
+            selected_values[i] = expf(selected_values[i] / divisor - maximum);
+            total += selected_values[i];
+        }
+        unsigned int random = random_seed ? random_seed : 0x9e3779b9u;
+        random ^= random << 13;
+        random ^= random >> 17;
+        random ^= random << 5;
+        float threshold = ((float)(random >> 8) / (float)(1 << 24)) * total;
+        for (int i = 0; i < k; i++) {
+            if (threshold <= selected_values[i]) {
+                out[0] = selected_ids[i];
+                return;
+            }
+            threshold -= selected_values[i];
+        }
+        out[0] = selected_ids[k - 1];
+    }
+}
 // =============================================================
 // CUDA Graph-compatible kernels
 // =============================================================

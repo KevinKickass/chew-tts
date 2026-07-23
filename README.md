@@ -27,6 +27,8 @@ Implemented:
 - GPU-resident execution of the five-layer Qwen code predictor;
 - complete 15-codebook acoustic generation with GPU embeddings, deterministic
   argmax, and temperature/top-k sampling;
+- reusable predictor KV/scratch sessions and exact GPU-resident Top-K sampling
+  for the 2,048-token acoustic vocabulary;
 - native decoding of all 16 codec codebooks into the 512-channel latent;
 - the codec's causal pre-convolution and eight-layer transformer on CUDA;
 - both 2x causal ConvNeXt codec upsampling stages;
@@ -246,6 +248,12 @@ VoiceDesign validation sample, chunked output differs from full-sequence
 decoding by only 0.72 PCM16 levels on average (26 maximum) and remains faster
 than real time at RTF 0.83. Use `--chunk-frames 0` for exact full-sequence
 decoding.
+
+The current optimized acoustic path sustains roughly 95% GPU utilization on an
+RTX 3080. Moving exact Top-K 50 sampling onto the GPU reduced a 2.48-second
+VoiceDesign validation run to approximately 1.35 seconds total inference
+(RTF 0.54), while repeated runs with the same seed produce byte-identical WAV
+files.
 
 ## Requirements
 

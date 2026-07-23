@@ -655,6 +655,7 @@ fn cuda_voice_design_smoke(
     let frontend = TalkerFrontend::load(model_dir, config, stream)?;
     let predictor =
         CodePredictorTransformer::load(model_dir, &config.code_predictor_config, stream)?;
+    let mut predictor_session = predictor.start_generation_session(stream)?;
     let codec = CodecQuantizer::load(model_dir.join("speech_tokenizer"), stream)?;
     let load_elapsed = load_started.elapsed();
     let free_loaded = allocator.free_bytes(gpu)?;
@@ -715,7 +716,8 @@ fn cuda_voice_design_smoke(
             break;
         }
         let frame_started = std::time::Instant::now();
-        let acoustic = predictor.generate_acoustic_codes_sampled(
+        let acoustic = predictor.generate_acoustic_codes_sampled_with_session(
+            &mut predictor_session,
             &last_hidden,
             semantic,
             temperature,
@@ -1089,6 +1091,7 @@ fn cuda_predictor_smoke(
     )?;
     let load_started = std::time::Instant::now();
     let predictor = CodePredictorTransformer::load(model_dir, config, stream)?;
+    let mut predictor_session = predictor.start_generation_session(stream)?;
     let load_elapsed = load_started.elapsed();
     let free_loaded = allocator.free_bytes(gpu)?;
 
@@ -1107,7 +1110,8 @@ fn cuda_predictor_smoke(
         );
         for repeat in 0..repeats {
             let frame_started = std::time::Instant::now();
-            let codes = predictor.generate_acoustic_codes_argmax(
+            let codes = predictor.generate_acoustic_codes_argmax_with_session(
+                &mut predictor_session,
                 &talker_hidden,
                 semantic_token,
                 &mut kernels,

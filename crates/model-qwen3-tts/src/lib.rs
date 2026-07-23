@@ -14,7 +14,7 @@ pub use cuda::{
     TalkerTransformer,
 };
 pub use frontend::{TalkerFrontend, VoiceDesignInputs};
-pub use predictor::CodePredictorTransformer;
+pub use predictor::{CodePredictorGenerationSession, CodePredictorTransformer};
 
 use chew_safetensors::{MappedSafetensors, TensorInfo};
 use std::collections::HashMap;

@@ -20,6 +20,23 @@ pub struct CodePredictorTransformer {
     geometry: TalkerConfig,
 }
 
+/// Reusable GPU allocations for one code-predictor worker.
+pub struct CodePredictorGenerationSession {
+    caches: Vec<TalkerLayerKvCache>,
+    scratch: TalkerLayerScratch,
+    talker_hidden: CudaSlice<f16>,
+    semantic_id: CudaSlice<i32>,
+    semantic_embed: CudaSlice<f16>,
+    predictor_input: CudaSlice<f16>,
+    projected: CudaSlice<f16>,
+    hidden: CudaSlice<f32>,
+    norm_token: CudaSlice<f16>,
+    logits: CudaSlice<f16>,
+    current_code: CudaSlice<i32>,
+    all_codes: CudaSlice<i32>,
+    code_embed: CudaSlice<f16>,
+}
+
 impl CodePredictorTransformer {
     pub fn load(
         model_dir: impl AsRef<Path>,
@@ -103,6 +120,32 @@ impl CodePredictorTransformer {
         self.layers.len()
     }
 
+    pub fn start_generation_session(
+        &self,
+        stream: &Arc<CudaStream>,
+    ) -> anyhow::Result<CodePredictorGenerationSession> {
+        const CODEC_EMBED_DIM: usize = 2048;
+        let hidden = self.geometry.hidden_size;
+        let groups = self.geometry.num_code_groups - 1;
+        Ok(CodePredictorGenerationSession {
+            caches: (0..self.layers.len())
+                .map(|_| TalkerLayerKvCache::allocate(17, &self.geometry, stream))
+                .collect::<anyhow::Result<Vec<_>>>()?,
+            scratch: TalkerLayerScratch::allocate(2, &self.geometry, stream)?,
+            talker_hidden: stream.alloc_zeros::<f16>(CODEC_EMBED_DIM)?,
+            semantic_id: stream.alloc_zeros::<i32>(1)?,
+            semantic_embed: stream.alloc_zeros::<f16>(CODEC_EMBED_DIM)?,
+            predictor_input: stream.alloc_zeros::<f16>(2 * CODEC_EMBED_DIM)?,
+            projected: stream.alloc_zeros::<f16>(2 * hidden)?,
+            hidden: stream.alloc_zeros::<f32>(2 * hidden)?,
+            norm_token: stream.alloc_zeros::<f16>(hidden)?,
+            logits: stream.alloc_zeros::<f16>(self.geometry.vocab_size)?,
+            current_code: stream.alloc_zeros::<i32>(1)?,
+            all_codes: stream.alloc_zeros::<i32>(groups)?,
+            code_embed: stream.alloc_zeros::<f16>(CODEC_EMBED_DIM)?,
+        })
+    }
+
     /// Execute one prepared code-predictor sequence.
     pub fn forward_hidden(
         &self,
@@ -162,7 +205,9 @@ impl CodePredictorTransformer {
         semantic_token: i32,
         kernels: &mut GpuKernels,
     ) -> anyhow::Result<Vec<i32>> {
-        self.generate_acoustic_codes(talker_hidden, semantic_token, None, kernels)
+        let stream = Arc::clone(kernels.ops.stream());
+        let mut session = self.start_generation_session(&stream)?;
+        self.generate_acoustic_codes(&mut session, talker_hidden, semantic_token, None, kernels)
     }
 
     /// Sample the 15 acoustic codebooks with the model's subtalker settings.
@@ -175,7 +220,31 @@ impl CodePredictorTransformer {
         seed: &mut u64,
         kernels: &mut GpuKernels,
     ) -> anyhow::Result<Vec<i32>> {
+        let stream = Arc::clone(kernels.ops.stream());
+        let mut session = self.start_generation_session(&stream)?;
+        self.generate_acoustic_codes_sampled_with_session(
+            &mut session,
+            talker_hidden,
+            semantic_token,
+            temperature,
+            top_k,
+            seed,
+            kernels,
+        )
+    }
+
+    pub fn generate_acoustic_codes_sampled_with_session(
+        &self,
+        session: &mut CodePredictorGenerationSession,
+        talker_hidden: &[f32],
+        semantic_token: i32,
+        temperature: f32,
+        top_k: usize,
+        seed: &mut u64,
+        kernels: &mut GpuKernels,
+    ) -> anyhow::Result<Vec<i32>> {
         self.generate_acoustic_codes(
+            session,
             talker_hidden,
             semantic_token,
             Some((temperature, top_k, seed)),
@@ -183,8 +252,19 @@ impl CodePredictorTransformer {
         )
     }
 
+    pub fn generate_acoustic_codes_argmax_with_session(
+        &self,
+        session: &mut CodePredictorGenerationSession,
+        talker_hidden: &[f32],
+        semantic_token: i32,
+        kernels: &mut GpuKernels,
+    ) -> anyhow::Result<Vec<i32>> {
+        self.generate_acoustic_codes(session, talker_hidden, semantic_token, None, kernels)
+    }
+
     fn generate_acoustic_codes(
         &self,
+        session: &mut CodePredictorGenerationSession,
         talker_hidden: &[f32],
         semantic_token: i32,
         mut sampling: Option<(f32, usize, &mut u64)>,
@@ -210,159 +290,159 @@ impl CodePredictorTransformer {
             .copied()
             .map(f16::from_f32)
             .collect::<Vec<_>>();
-        let talker_hidden_gpu = stream.clone_htod(&talker_hidden_f16)?;
-        let semantic_id = stream.clone_htod(&[semantic_token])?;
-        let mut semantic_embed = stream.alloc_zeros::<f16>(CODEC_EMBED_DIM)?;
+        stream.memcpy_htod(&talker_hidden_f16, &mut session.talker_hidden)?;
+        stream.memcpy_htod(&[semantic_token], &mut session.semantic_id)?;
         kernels.ops.gather_rows_f16(
             &self.talker_codec_embedding,
-            &semantic_id,
-            &mut semantic_embed,
+            &session.semantic_id,
+            &mut session.semantic_embed,
             1,
             CODEC_EMBED_DIM as u32,
         )?;
 
-        let mut predictor_input = stream.alloc_zeros::<f16>(2 * CODEC_EMBED_DIM)?;
         stream.memcpy_dtod(
-            &talker_hidden_gpu,
-            &mut predictor_input.slice_mut(..CODEC_EMBED_DIM),
+            &session.talker_hidden,
+            &mut session.predictor_input.slice_mut(..CODEC_EMBED_DIM),
         )?;
         stream.memcpy_dtod(
-            &semantic_embed,
-            &mut predictor_input.slice_mut(CODEC_EMBED_DIM..),
+            &session.semantic_embed,
+            &mut session.predictor_input.slice_mut(CODEC_EMBED_DIM..),
         )?;
-        let mut projected = stream.alloc_zeros::<f16>(2 * hidden_dim)?;
         kernels.gemm.matmul_f16(
-            &predictor_input,
+            &session.predictor_input,
             &self.projection_weight,
-            &mut projected,
+            &mut session.projected,
             2,
             hidden_dim as u32,
             CODEC_EMBED_DIM as u32,
         )?;
         kernels.ops.add_bias_f16_inplace(
-            &mut projected,
+            &mut session.projected,
             &self.projection_bias,
             2,
             hidden_dim as u32,
         )?;
 
-        let mut hidden = stream.alloc_zeros::<f32>(2 * hidden_dim)?;
-        kernels
-            .ops
-            .copy_f16_to_f32(&projected, &mut hidden, (2 * hidden_dim) as u32)?;
-        let mut scratch = TalkerLayerScratch::allocate(2, &self.geometry, &stream)?;
-        let mut caches = (0..self.layers.len())
-            .map(|_| TalkerLayerKvCache::allocate(17, &self.geometry, &stream))
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        for (layer, cache) in self.layers.iter().zip(&mut caches) {
+        kernels.ops.copy_f16_to_f32(
+            &session.projected,
+            &mut session.hidden,
+            (2 * hidden_dim) as u32,
+        )?;
+        for cache in &mut session.caches {
+            cache.reset();
+        }
+        for (layer, cache) in self.layers.iter().zip(&mut session.caches) {
             layer.forward_cached_device(
-                &mut hidden,
+                &mut session.hidden,
                 2,
                 &self.geometry,
                 kernels,
                 cache,
-                &mut scratch,
+                &mut session.scratch,
             )?;
         }
         kernels.ops.rms_norm_f32in(
-            &hidden,
+            &session.hidden,
             &self.final_norm,
-            &mut scratch.norm,
+            &mut session.scratch.norm,
             2,
             hidden_dim as u32,
             self.geometry.rms_norm_eps as f32,
         )?;
 
-        let mut norm_token = stream.alloc_zeros::<f16>(hidden_dim)?;
         stream.memcpy_dtod(
-            &scratch.norm.slice(hidden_dim..2 * hidden_dim),
-            &mut norm_token,
+            &session.scratch.norm.slice(hidden_dim..2 * hidden_dim),
+            &mut session.norm_token,
         )?;
-        let mut logits = stream.alloc_zeros::<f16>(vocab_size)?;
-        let mut current_code = stream.alloc_zeros::<i32>(1)?;
-        let mut all_codes = stream.alloc_zeros::<i32>(groups)?;
         kernels.gemv.gemv_f16(
-            &norm_token,
+            &session.norm_token,
             &self.lm_heads[0],
-            &mut logits,
+            &mut session.logits,
             vocab_size as u32,
             hidden_dim as u32,
         )?;
         select_acoustic_code(
-            &logits,
-            &mut current_code,
+            &session.logits,
+            &mut session.current_code,
             vocab_size,
             sampling
                 .as_mut()
                 .map(|(temperature, top_k, seed)| (*temperature, *top_k, &mut **seed)),
             kernels,
         )?;
-        stream.memcpy_dtod(&current_code, &mut all_codes.slice_mut(0..1))?;
+        stream.memcpy_dtod(
+            &session.current_code,
+            &mut session.all_codes.slice_mut(0..1),
+        )?;
 
-        let mut code_embed = stream.alloc_zeros::<f16>(CODEC_EMBED_DIM)?;
         for group in 1..groups {
             kernels.ops.gather_rows_f16(
                 &self.codec_embeddings[group - 1],
-                &current_code,
-                &mut code_embed,
+                &session.current_code,
+                &mut session.code_embed,
                 1,
                 CODEC_EMBED_DIM as u32,
             )?;
             kernels.gemv.gemv_f16(
-                &code_embed,
+                &session.code_embed,
                 &self.projection_weight,
-                &mut projected,
+                &mut session.projected,
                 hidden_dim as u32,
                 CODEC_EMBED_DIM as u32,
             )?;
             kernels.ops.add_bias_f16_inplace(
-                &mut projected,
+                &mut session.projected,
                 &self.projection_bias,
                 1,
                 hidden_dim as u32,
             )?;
-            kernels
-                .ops
-                .copy_f16_to_f32(&projected, &mut hidden, hidden_dim as u32)?;
-            for (layer, cache) in self.layers.iter().zip(&mut caches) {
+            kernels.ops.copy_f16_to_f32(
+                &session.projected,
+                &mut session.hidden,
+                hidden_dim as u32,
+            )?;
+            for (layer, cache) in self.layers.iter().zip(&mut session.caches) {
                 layer.forward_cached_device(
-                    &mut hidden,
+                    &mut session.hidden,
                     1,
                     &self.geometry,
                     kernels,
                     cache,
-                    &mut scratch,
+                    &mut session.scratch,
                 )?;
             }
             kernels.ops.rms_norm_f32in(
-                &hidden,
+                &session.hidden,
                 &self.final_norm,
-                &mut scratch.norm,
+                &mut session.scratch.norm,
                 1,
                 hidden_dim as u32,
                 self.geometry.rms_norm_eps as f32,
             )?;
             kernels.gemv.gemv_f16(
-                &scratch.norm,
+                &session.scratch.norm,
                 &self.lm_heads[group],
-                &mut logits,
+                &mut session.logits,
                 vocab_size as u32,
                 hidden_dim as u32,
             )?;
             select_acoustic_code(
-                &logits,
-                &mut current_code,
+                &session.logits,
+                &mut session.current_code,
                 vocab_size,
                 sampling
                     .as_mut()
                     .map(|(temperature, top_k, seed)| (*temperature, *top_k, &mut **seed)),
                 kernels,
             )?;
-            stream.memcpy_dtod(&current_code, &mut all_codes.slice_mut(group..group + 1))?;
+            stream.memcpy_dtod(
+                &session.current_code,
+                &mut session.all_codes.slice_mut(group..group + 1),
+            )?;
         }
         stream.synchronize()?;
         let mut codes = vec![0i32; groups];
-        stream.memcpy_dtoh(&all_codes, &mut codes)?;
+        stream.memcpy_dtoh(&session.all_codes, &mut codes)?;
         Ok(codes)
     }
 
@@ -414,13 +494,18 @@ fn select_acoustic_code(
     kernels: &mut GpuKernels,
 ) -> anyhow::Result<()> {
     if let Some((temperature, top_k, seed)) = sampling {
-        let stream = Arc::clone(kernels.ops.stream());
-        stream.synchronize()?;
-        let mut host = vec![f16::ZERO; vocab_size];
-        stream.memcpy_dtoh(logits, &mut host)?;
-        let selected =
-            crate::sampling::sample_top_k(&host, |_| true, temperature, top_k, &[], 1.0, seed);
-        stream.memcpy_htod(&[selected], token)?;
+        ensure!(
+            top_k <= 64,
+            "GPU acoustic sampling supports top-k up to 64, got {top_k}"
+        );
+        kernels.ops.sample_top_k_small(
+            logits,
+            token,
+            vocab_size as u32,
+            temperature,
+            top_k as u32,
+            crate::sampling::next_seed_u32(seed),
+        )?;
     } else {
         kernels.ops.argmax_f16(logits, token, vocab_size as u32)?;
     }
