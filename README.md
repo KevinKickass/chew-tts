@@ -264,6 +264,12 @@ convolution lowers the complete 32-frame codec from approximately 726 ms to
 0.73 seconds total inference (RTF 0.28), including roughly 60 ms of interleaved
 codec work. Repeated runs with the same seed produce byte-identical WAV files.
 
+A 279-frame stability run crosses eight 32-frame chunk boundaries, reaches
+model EOS normally, and produces 22.32 seconds of audio in approximately
+5.42 seconds (RTF 0.24). The process remains at roughly 3.95 GiB of VRAM.
+A separate 256-frame safety-limit run writes a valid 20.48-second WAV and
+returns an explicit truncation error instead of silently accepting it.
+
 ## Requirements
 
 - NVIDIA GPU with compute capability 7.0 or newer
