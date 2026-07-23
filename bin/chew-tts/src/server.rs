@@ -11,7 +11,7 @@ use serde::Deserialize;
 use serde_json::json;
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -158,8 +158,10 @@ pub async fn run(
     port: u16,
     max_frames: usize,
     queue_capacity: usize,
+    workers: usize,
 ) -> anyhow::Result<()> {
-    let (state, load_elapsed) = start_engine(model_dir, gpu, max_frames, queue_capacity).await?;
+    let (state, load_elapsed) =
+        start_engine(model_dir, gpu, max_frames, queue_capacity, workers).await?;
     let app = Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(models))
@@ -173,6 +175,7 @@ pub async fn run(
         load_seconds = load_elapsed.as_secs_f64(),
         vram_mib = state.vram_bytes as f64 / 1024.0_f64.powi(2),
         protocol = "http",
+        workers,
         "Chew TTS ready"
     );
     axum::serve(listener, app)
@@ -191,8 +194,10 @@ pub async fn run_fleet(
     port: u16,
     max_frames: usize,
     queue_capacity: usize,
+    workers: usize,
 ) -> anyhow::Result<()> {
-    let (state, load_elapsed) = start_engine(model_dir, gpu, max_frames, queue_capacity).await?;
+    let (state, load_elapsed) =
+        start_engine(model_dir, gpu, max_frames, queue_capacity, workers).await?;
     let listener = TcpListener::bind((host.as_str(), port)).await?;
     info!(
         host,
@@ -200,6 +205,7 @@ pub async fn run_fleet(
         load_seconds = load_elapsed.as_secs_f64(),
         vram_mib = state.vram_bytes as f64 / 1024.0_f64.powi(2),
         protocol = "fleet-tcp",
+        workers,
         "Chew TTS ready"
     );
     loop {
@@ -224,30 +230,55 @@ async fn start_engine(
     gpu: usize,
     max_frames: usize,
     queue_capacity: usize,
+    workers: usize,
 ) -> anyhow::Result<(Arc<AppState>, std::time::Duration)> {
     anyhow::ensure!(queue_capacity > 0, "queue capacity must be non-zero");
+    anyhow::ensure!(
+        (1..=8).contains(&workers),
+        "workers must be between 1 and 8"
+    );
     let (jobs, receiver) = mpsc::channel(queue_capacity);
-    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
-    std::thread::Builder::new()
-        .name("chew-tts-gpu".into())
-        .spawn(move || {
-            let engine = TtsEngine::load(&model_dir, gpu, max_frames);
-            match engine {
-                Ok(engine) => {
-                    let metadata = engine.metadata();
-                    if ready_tx.send(Ok(metadata)).is_ok() {
-                        gpu_worker(engine, receiver);
+    let receiver = Arc::new(Mutex::new(receiver));
+    let mut load_elapsed = std::time::Duration::ZERO;
+    let mut vram_bytes = 0u64;
+    let mut model = None::<String>;
+    // Initialize sequentially so each worker's NVML delta is meaningful.
+    for worker in 0..workers {
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let model_dir = model_dir.clone();
+        let receiver = Arc::clone(&receiver);
+        std::thread::Builder::new()
+            .name(format!("chew-tts-gpu-{worker}"))
+            .spawn(move || {
+                let engine = TtsEngine::load(&model_dir, gpu, max_frames);
+                match engine {
+                    Ok(engine) => {
+                        let metadata = engine.metadata();
+                        if ready_tx.send(Ok(metadata)).is_ok() {
+                            gpu_worker(engine, receiver);
+                        }
+                    }
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(format!("{error:#}")));
                     }
                 }
-                Err(error) => {
-                    let _ = ready_tx.send(Err(format!("{error:#}")));
-                }
-            }
-        })?;
-    let (load_elapsed, vram_bytes, model) = ready_rx
-        .recv()
-        .map_err(|_| anyhow::anyhow!("GPU worker exited during startup"))?
-        .map_err(anyhow::Error::msg)?;
+            })?;
+        let (worker_elapsed, worker_vram, worker_model) = ready_rx
+            .recv()
+            .map_err(|_| anyhow::anyhow!("GPU worker {worker} exited during startup"))?
+            .map_err(anyhow::Error::msg)?;
+        if let Some(model) = &model {
+            anyhow::ensure!(
+                model == &worker_model,
+                "GPU workers loaded different models"
+            );
+        } else {
+            model = Some(worker_model);
+        }
+        load_elapsed += worker_elapsed;
+        vram_bytes = vram_bytes.saturating_add(worker_vram);
+    }
+    let model = model.expect("workers is non-zero");
 
     Ok((
         Arc::new(AppState {
@@ -266,8 +297,15 @@ async fn shutdown_signal() {
     }
 }
 
-fn gpu_worker(mut engine: TtsEngine, mut jobs: mpsc::Receiver<Job>) {
-    while let Some(job) = jobs.blocking_recv() {
+fn gpu_worker(mut engine: TtsEngine, jobs: Arc<Mutex<mpsc::Receiver<Job>>>) {
+    loop {
+        let job = jobs
+            .lock()
+            .expect("TTS queue mutex poisoned")
+            .blocking_recv();
+        let Some(job) = job else {
+            break;
+        };
         let result = synthesize_segmented(&mut engine, &job.request);
         let _ = job.response.send(result);
     }

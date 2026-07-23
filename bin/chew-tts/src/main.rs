@@ -58,6 +58,9 @@ enum Command {
         /// Maximum number of waiting HTTP requests.
         #[arg(long, default_value_t = 16)]
         queue_capacity: usize,
+        /// Persistent model instances consuming the shared request queue.
+        #[arg(long, default_value_t = 1)]
+        workers: usize,
     },
     /// Run Fleet's raw JSON-over-TCP protocol and return f32le/24 kHz audio.
     FleetServe {
@@ -78,6 +81,9 @@ enum Command {
         /// Maximum number of waiting synthesis requests.
         #[arg(long, default_value_t = 16)]
         queue_capacity: usize,
+        /// Persistent model instances consuming the shared request queue.
+        #[arg(long, default_value_t = 1)]
+        workers: usize,
     },
     /// Validate a Qwen3-TTS model and print its inference geometry.
     Inspect {
@@ -545,6 +551,7 @@ fn main() -> anyhow::Result<()> {
             port,
             max_frames,
             queue_capacity,
+            workers,
         } => tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?
@@ -555,6 +562,7 @@ fn main() -> anyhow::Result<()> {
                 port,
                 max_frames,
                 queue_capacity,
+                workers,
             ))?,
         Command::FleetServe {
             model_dir,
@@ -563,6 +571,7 @@ fn main() -> anyhow::Result<()> {
             port,
             max_frames,
             queue_capacity,
+            workers,
         } => tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?
@@ -573,6 +582,7 @@ fn main() -> anyhow::Result<()> {
                 port,
                 max_frames,
                 queue_capacity,
+                workers,
             ))?,
         Command::Inspect { model_dir } => {
             let inspection = inspect_model(&model_dir)
