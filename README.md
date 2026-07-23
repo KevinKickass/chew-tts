@@ -11,7 +11,8 @@ without carrying an LLM API or llama.cpp dependency.
 
 ## Status
 
-Qwen3-TTS support is under active development.
+Qwen3-TTS is end-to-end usable. Native Kokoro and Chatterbox Multilingual V3
+support is under active development.
 
 Implemented:
 
@@ -50,13 +51,23 @@ Implemented:
 - an eight-entry SHA-256 reference cache for speaker embeddings, waveforms,
   and ICL codec frames;
 - PyTorch parity checks for real Qwen weights, RoPE, GQA, and cached decoding.
+- sentence-aware long-request segmentation, allowing the advertised 4,096
+  characters without weakening the per-segment codec-frame safety limit;
+- native Kokoro config, PyTorch checkpoint, phoneme-token, and `.pt` voice-pack
+  loading with real-storage validation;
+- native Chatterbox Multilingual V3 T3, S3Gen, and voice-encoder artifact
+  validation;
+- GPU-resident execution of all 30 Chatterbox T3 Llama layers and final norm,
+  checked against the official PyTorch weights on an RTX 3080.
 
 Next:
 
 - one CUDA graph for a complete 16-codebook audio frame;
 - optimized one-pass model loading and GPU-resident sampling;
 - arbitrary compressed reference-audio input in addition to native WAV;
-- Kokoro as the second model family.
+- Kokoro Albert, duration/prosody, and iSTFTNet CUDA inference;
+- Chatterbox T3 multi-token KV cache, conditioning/tokenization, and S3Gen
+  speech decoding.
 
 ## Why a separate repository?
 
@@ -80,6 +91,8 @@ crates/
   tts-core/             common request, audio, and capability types
   safetensors/          mmap Safetensors access
   model-qwen3-tts/      Qwen configuration and inference
+  model-kokoro/         Kokoro checkpoint, voice, and inference path
+  model-chatterbox/     Chatterbox Multilingual V3 T3 and S3Gen path
   kernel/               inherited CUDA/NVRTC kernels
   vram/                 inherited VRAM ownership and budgeting
 ```
@@ -102,6 +115,29 @@ Qwen3-TTS 1b7 Base
 talker: 28 layers, hidden 2048, 16 Q heads / 8 KV heads
 code predictor: 5 layers, hidden 1024, 15 acoustic steps/frame
 weights: 480 tensors in 1 file(s), 3.59 GiB
+```
+
+Inspect Kokoro and validate an official voice pack:
+
+```bash
+cargo run --release -p chew-tts -- \
+  inspect-kokoro /models/Kokoro-82M \
+  --voice /models/Kokoro-82M/voices/af_heart.pt \
+  --phonemes 'həlˈoʊ wɜɹld!'
+```
+
+Inspect all Chatterbox Multilingual V3 components:
+
+```bash
+cargo run --release -p chew-tts -- \
+  inspect-chatterbox /models/chatterbox-v3
+```
+
+Run the native Chatterbox T3 CUDA stack:
+
+```bash
+cargo run --release -p chew-tts -- \
+  cuda-chatterbox-layer-smoke /models/chatterbox-v3 --gpu 0 --stack
 ```
 
 ## CUDA validation
@@ -313,6 +349,13 @@ short validation request this reduced wall time from 0.59 to 0.38 seconds.
 A longer Base ICL stability run reached EOS after 291 codec frames and produced
 23.28 seconds of cleanly framed audio in 5.81 seconds wall time (RTF 0.25).
 Reference WAVs are limited to 60 seconds and decoded payloads to 32 MiB.
+
+Inputs up to 4,096 characters are split at sentence boundaries into bounded
+synthesis sessions and concatenated before the requested encoding step. The
+2,048-frame limit remains a safety cap for each segment. A local Base 1.7B
+regression test generated 223.9 seconds of valid WAV from exactly 4,096
+characters in 53.96 seconds on an RTX 3080 instead of failing at the old
+single-session frame limit.
 
 Supported `response_format` values are `wav`, `pcm`, `mp3`, `opus`, `aac`,
 and `flac`. Compressed formats and non-default `speed` use FFmpeg.
