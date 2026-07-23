@@ -211,6 +211,12 @@ enum Command {
         /// Semantic and acoustic top-k.
         #[arg(long, default_value_t = 50)]
         top_k: usize,
+        /// Decode after this many frames; zero keeps exact full-sequence decoding.
+        #[arg(long, default_value_t = 32)]
+        chunk_frames: usize,
+        /// Previous frames retained as causal context for chunked decoding.
+        #[arg(long, default_value_t = 64)]
+        chunk_context: usize,
         /// PCM16 WAV output path.
         #[arg(long)]
         wav: PathBuf,
@@ -380,6 +386,8 @@ fn main() -> anyhow::Result<()> {
             seed,
             temperature,
             top_k,
+            chunk_frames,
+            chunk_context,
             wav,
         } => cuda_voice_design_smoke(
             &model_dir,
@@ -391,6 +399,8 @@ fn main() -> anyhow::Result<()> {
             seed,
             temperature,
             top_k,
+            chunk_frames,
+            chunk_context,
             &wav,
         )?,
     }
@@ -588,6 +598,8 @@ fn cuda_voice_design_smoke(
     mut seed: u64,
     temperature: f32,
     top_k: usize,
+    chunk_frames: usize,
+    chunk_context: usize,
     wav: &std::path::Path,
 ) -> anyhow::Result<()> {
     if max_frames == 0 {
@@ -684,7 +696,15 @@ fn cuda_voice_design_smoke(
     let prompt_elapsed = prompt_started.elapsed();
 
     let generation_started = std::time::Instant::now();
-    let mut codec_frames = Vec::with_capacity(max_frames.min(1024));
+    let mut codec_frames = Vec::with_capacity(if chunk_frames == 0 {
+        max_frames.min(1024)
+    } else {
+        chunk_frames
+    });
+    let mut codec_context = Vec::with_capacity(chunk_context);
+    let mut streamed_audio = Vec::new();
+    let mut codec_elapsed = std::time::Duration::ZERO;
+    let mut generated_frames = 0usize;
     for frame_index in 0..max_frames {
         if semantic == 2_150 {
             println!("codec EOS at frame {frame_index}");
@@ -703,11 +723,22 @@ fn cuda_voice_design_smoke(
         codes.push(semantic);
         codes.extend_from_slice(&acoustic);
         codec_frames.push(codes);
+        generated_frames += 1;
         println!(
             "frame {frame_index}: semantic {semantic}, acoustics {:?}, {:.3}ms",
             &acoustic[..3.min(acoustic.len())],
             frame_started.elapsed().as_secs_f64() * 1000.0
         );
+        if chunk_frames > 0 && codec_frames.len() >= chunk_frames {
+            codec_elapsed += decode_codec_chunk(
+                &codec,
+                &mut codec_frames,
+                &mut codec_context,
+                chunk_context,
+                &mut streamed_audio,
+                &mut kernels,
+            )?;
+        }
 
         let semantic_embedding = frontend.codec_embeddings(&[semantic], &mut kernels)?;
         let acoustic_embedding = predictor.acoustic_embeddings_sum(&acoustic, &mut kernels)?;
@@ -735,15 +766,33 @@ fn cuda_voice_design_smoke(
         )?;
         generated_semantics.push(semantic);
     }
-    let generation_elapsed = generation_started.elapsed();
-    if codec_frames.is_empty() {
+    let generation_elapsed = generation_started.elapsed().saturating_sub(codec_elapsed);
+    if generated_frames == 0 {
         anyhow::bail!("model emitted EOS before producing audio");
     }
-    let truncated = semantic != 2_150 && codec_frames.len() == max_frames;
+    let truncated = semantic != 2_150 && generated_frames == max_frames;
 
     let decode_started = std::time::Instant::now();
-    let audio = codec.decode_frames_audio(&codec_frames, &mut kernels)?;
-    let decode_elapsed = decode_started.elapsed();
+    let audio = if chunk_frames == 0 {
+        codec.decode_frames_audio(&codec_frames, &mut kernels)?
+    } else {
+        if !codec_frames.is_empty() {
+            codec_elapsed += decode_codec_chunk(
+                &codec,
+                &mut codec_frames,
+                &mut codec_context,
+                chunk_context,
+                &mut streamed_audio,
+                &mut kernels,
+            )?;
+        }
+        streamed_audio
+    };
+    let decode_elapsed = if chunk_frames == 0 {
+        decode_started.elapsed()
+    } else {
+        codec_elapsed
+    };
     write_pcm16_wav(wav, &audio, 24_000)?;
     let audio_seconds = audio.len() as f64 / 24_000.0;
     let inference_seconds = prompt_elapsed.as_secs_f64()
@@ -751,7 +800,7 @@ fn cuda_voice_design_smoke(
         + decode_elapsed.as_secs_f64();
     println!(
         "VoiceDesign: {} frame(s), {:.3}s audio, {:.3}s inference, RTF {:.3}",
-        codec_frames.len(),
+        generated_frames,
         audio_seconds,
         inference_seconds,
         inference_seconds / audio_seconds,
@@ -773,6 +822,34 @@ fn cuda_voice_design_smoke(
         );
     }
     Ok(())
+}
+
+fn decode_codec_chunk(
+    codec: &CodecQuantizer,
+    pending: &mut Vec<Vec<i32>>,
+    context: &mut Vec<Vec<i32>>,
+    context_frames: usize,
+    output: &mut Vec<f32>,
+    kernels: &mut chew_kernel::GpuKernels,
+) -> anyhow::Result<std::time::Duration> {
+    if pending.is_empty() {
+        return Ok(std::time::Duration::ZERO);
+    }
+    const SAMPLES_PER_FRAME: usize = 1920;
+    let prefix_frames = context.len();
+    let mut decode_frames = Vec::with_capacity(prefix_frames + pending.len());
+    decode_frames.extend(context.iter().cloned());
+    decode_frames.append(pending);
+
+    let started = std::time::Instant::now();
+    let decoded = codec.decode_frames_audio(&decode_frames, kernels)?;
+    let elapsed = started.elapsed();
+    output.extend_from_slice(&decoded[prefix_frames * SAMPLES_PER_FRAME..]);
+
+    let keep = context_frames.min(decode_frames.len());
+    context.clear();
+    context.extend_from_slice(&decode_frames[decode_frames.len() - keep..]);
+    Ok(elapsed)
 }
 
 fn cuda_codec_latent_smoke(

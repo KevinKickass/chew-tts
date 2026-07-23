@@ -216,13 +216,15 @@ CARGO_TARGET_DIR=/tmp/chew-tts-target \
   --language german \
   --text "Guten Abend, schön dass du da bist." \
   --instruction "A quiet, breathy German female whisper." \
-  --frames 12 \
+  --max-frames 2048 \
   --seed 42 \
   --wav /tmp/voice-design.wav
 ```
 
 The command uses the model's production sampling defaults: temperature 0.9,
-top-k 50, and semantic repetition penalty 1.05. On an RTX 3080, the first
+top-k 50, and semantic repetition penalty 1.05. Generation normally ends at
+codec EOS; `--max-frames` is only a safety limit and reports an error instead
+of silently presenting truncated audio. On an RTX 3080, the first
 correctness-oriented implementation occupies approximately 3.9 GiB of VRAM
 and generates 0.96 seconds of sampled audio in approximately 0.77 seconds
 (RTF 0.80). The optimized binary maps and uploads the complete model in
@@ -234,6 +236,14 @@ A 48-frame stability run produces 3.84 seconds of continuous audio in
 approximately 2.14 seconds (RTF 0.56). Convolution kernels place the audio
 timeline on CUDA's large X grid dimension, so output is not limited by the
 65,535-block Y dimension once a waveform exceeds roughly 2.7 seconds.
+
+By default, generated codes are drained through a bounded 32-frame codec
+buffer with 64 previous frames of causal context. This caps the codec working
+set at 96 frames and enables early audio delivery. For the 6.88-second
+VoiceDesign validation sample, chunked output differs from full-sequence
+decoding by only 0.72 PCM16 levels on average (26 maximum) and remains faster
+than real time at RTF 0.83. Use `--chunk-frames 0` for exact full-sequence
+decoding.
 
 ## Requirements
 
