@@ -4,8 +4,10 @@ use chew_safetensors::{MappedSafetensors, TensorInfo};
 use std::path::{Path, PathBuf};
 
 mod cuda;
+mod tokenizer;
 
 pub use cuda::{ChatterboxT3Layer, ChatterboxT3Transformer};
+pub use tokenizer::{ChatterboxTokenizer, normalize_multilingual_text};
 
 pub const TEXT_VOCAB_SIZE: usize = 2_454;
 pub const SPEECH_VOCAB_SIZE: usize = 8_194;

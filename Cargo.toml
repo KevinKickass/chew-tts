@@ -49,6 +49,7 @@ safetensors = "0.6"
 
 # Tokenizer
 tokenizers = "0.22"
+unicode-normalization = "0.1"
 
 # Error handling
 thiserror = "2"

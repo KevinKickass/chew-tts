@@ -1,7 +1,8 @@
 use anyhow::Context;
 use chew_model_chatterbox::{
-    ChatterboxT3Layer, ChatterboxT3Transformer, HIDDEN_SIZE as CHATTERBOX_HIDDEN_SIZE,
-    INTERMEDIATE_SIZE as CHATTERBOX_INTERMEDIATE_SIZE, inspect_model as inspect_chatterbox_model,
+    ChatterboxT3Layer, ChatterboxT3Transformer, ChatterboxTokenizer,
+    HIDDEN_SIZE as CHATTERBOX_HIDDEN_SIZE, INTERMEDIATE_SIZE as CHATTERBOX_INTERMEDIATE_SIZE,
+    inspect_model as inspect_chatterbox_model,
 };
 use chew_model_kokoro::{KokoroVoice, inspect_model as inspect_kokoro_model};
 use chew_model_qwen3_tts::{
@@ -90,6 +91,15 @@ enum Command {
         /// Directory containing t3_mtl23ls_v3, S3Gen, and ve weights.
         model_dir: PathBuf,
     },
+    /// Tokenize multilingual text with Chatterbox's local grapheme BPE.
+    TokenizeChatterbox {
+        /// Directory containing grapheme_mtl_merged_expanded_v1.json.
+        model_dir: PathBuf,
+        /// ISO language code such as de or en.
+        language: String,
+        /// Text to encode.
+        text: String,
+    },
     /// Run one complete Chatterbox V3 T3 decoder layer on local CUDA.
     CudaChatterboxLayerSmoke {
         /// Directory containing t3_mtl23ls_v3.safetensors.
@@ -103,6 +113,15 @@ enum Command {
         /// Run the complete 30-layer transformer and final norm.
         #[arg(long)]
         stack: bool,
+        /// Number of prepared hidden-state tokens.
+        #[arg(long, default_value_t = 1)]
+        seq_len: usize,
+        /// Prefill this many tokens, then append the rest one at a time.
+        #[arg(long)]
+        decode_split: Option<usize>,
+        /// Compare a split cached decode against one-pass prefill.
+        #[arg(long)]
+        compare_cache: bool,
     },
     /// Tokenize text with the model's local Qwen2 BPE files.
     Tokenize {
@@ -501,11 +520,22 @@ fn main() -> anyhow::Result<()> {
                 inspection.total_weight_bytes as f64 / 1024.0_f64.powi(3),
             );
         }
+        Command::TokenizeChatterbox {
+            model_dir,
+            language,
+            text,
+        } => {
+            let tokenizer = ChatterboxTokenizer::load(&model_dir)?;
+            println!("{:?}", tokenizer.encode(&text, &language)?);
+        }
         Command::CudaChatterboxLayerSmoke {
             model_dir,
             gpu,
             layer,
             stack,
+            seq_len,
+            decode_split,
+            compare_cache,
         } => {
             let allocator = chew_vram::VramAllocator::init()?;
             anyhow::ensure!(
@@ -519,13 +549,64 @@ fn main() -> anyhow::Result<()> {
                 CHATTERBOX_HIDDEN_SIZE * CHATTERBOX_INTERMEDIATE_SIZE,
                 CHATTERBOX_INTERMEDIATE_SIZE,
             )?;
-            let hidden = (0..CHATTERBOX_HIDDEN_SIZE)
+            let hidden = (0..seq_len * CHATTERBOX_HIDDEN_SIZE)
                 .map(|index| ((index as f32 * 0.013).sin() * 0.2) + 0.01)
                 .collect::<Vec<_>>();
             let output = if stack {
-                ChatterboxT3Transformer::load(&model_dir, &stream)?
-                    .forward_first_token(&hidden, &mut kernels)?
+                let transformer = ChatterboxT3Transformer::load(&model_dir, &stream)?;
+                let max_batch = decode_split.unwrap_or(seq_len).max(1);
+                let mut session = transformer.start_session(seq_len, max_batch, &stream)?;
+                if let Some(split) = decode_split {
+                    anyhow::ensure!(
+                        split > 0 && split < seq_len,
+                        "decode split must be inside 1..seq_len"
+                    );
+                    let mut output = transformer.forward_session(
+                        &mut session,
+                        &hidden[..split * CHATTERBOX_HIDDEN_SIZE],
+                        split,
+                        &mut kernels,
+                    )?;
+                    for token in split..seq_len {
+                        output.extend(transformer.forward_session(
+                            &mut session,
+                            &hidden[token * CHATTERBOX_HIDDEN_SIZE
+                                ..(token + 1) * CHATTERBOX_HIDDEN_SIZE],
+                            1,
+                            &mut kernels,
+                        )?);
+                    }
+                    if compare_cache {
+                        let mut full_session =
+                            transformer.start_session(seq_len, seq_len, &stream)?;
+                        let full = transformer.forward_session(
+                            &mut full_session,
+                            &hidden,
+                            seq_len,
+                            &mut kernels,
+                        )?;
+                        let mut max_delta = 0.0f32;
+                        let mut sum_delta = 0.0f64;
+                        for (cached, full) in output.iter().zip(&full) {
+                            let delta = (cached - full).abs();
+                            max_delta = max_delta.max(delta);
+                            sum_delta += f64::from(delta);
+                        }
+                        println!(
+                            "cache parity: mean_abs={:.9}, max_abs={max_delta:.9}",
+                            sum_delta / output.len() as f64
+                        );
+                    }
+                    output
+                } else {
+                    anyhow::ensure!(!compare_cache, "--compare-cache requires --decode-split");
+                    transformer.forward_session(&mut session, &hidden, seq_len, &mut kernels)?
+                }
             } else {
+                anyhow::ensure!(
+                    seq_len == 1 && decode_split.is_none() && !compare_cache,
+                    "multi-token validation requires --stack"
+                );
                 ChatterboxT3Layer::load(&model_dir, layer, &stream)?
                     .forward_first_token(&hidden, &mut kernels)?
             };
