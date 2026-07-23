@@ -115,21 +115,7 @@ impl ChatterboxF0Predictor {
         let mut channels = MEL_BINS;
         for layer in &self.layers {
             ensure!(layer.in_channels == channels, "invalid F0 layer chain");
-            let mut convolved = stream.alloc_zeros::<f16>(layer.out_channels * frames)?;
-            kernels.ops.conv1d_general_f16(
-                &hidden,
-                &layer.weight,
-                &layer.bias,
-                &mut convolved,
-                layer.in_channels as u32,
-                layer.out_channels as u32,
-                frames as u32,
-                frames as u32,
-                layer.kernel as u32,
-                1,
-                1,
-                1,
-            )?;
+            let convolved = run_conv(&hidden, frames, layer, 1, 1, 1, kernels)?;
             let mut activated = stream.alloc_zeros::<f16>(layer.out_channels * frames)?;
             kernels.ops.elu_f16(
                 &convolved,
@@ -639,20 +625,40 @@ fn run_conv(
 ) -> anyhow::Result<CudaSlice<f16>> {
     let output_len = conv_output_len(input_len, conv.kernel, stride, padding, dilation);
     let stream = Arc::clone(kernels.ops.stream());
-    let mut output = stream.alloc_zeros::<f16>(conv.out_channels * output_len)?;
-    kernels.ops.conv1d_general_f16(
+    let width = conv.in_channels * conv.kernel;
+    let mut unfolded = stream.alloc_zeros::<f16>(output_len * width)?;
+    kernels.ops.unfold_conv1d_f16(
         input,
-        &conv.weight,
-        &conv.bias,
-        &mut output,
+        &mut unfolded,
         conv.in_channels as u32,
-        conv.out_channels as u32,
         input_len as u32,
         output_len as u32,
         conv.kernel as u32,
         stride as u32,
         padding as u32,
         dilation as u32,
+    )?;
+    let mut rows = stream.alloc_zeros::<f16>(output_len * conv.out_channels)?;
+    kernels.gemm.matmul_f16(
+        &unfolded,
+        &conv.weight,
+        &mut rows,
+        output_len as u32,
+        conv.out_channels as u32,
+        width as u32,
+    )?;
+    kernels.ops.add_bias_f16_inplace(
+        &mut rows,
+        &conv.bias,
+        output_len as u32,
+        conv.out_channels as u32,
+    )?;
+    let mut output = stream.alloc_zeros::<f16>(conv.out_channels * output_len)?;
+    kernels.ops.transpose_f16(
+        &rows,
+        &mut output,
+        output_len as u32,
+        conv.out_channels as u32,
     )?;
     Ok(output)
 }

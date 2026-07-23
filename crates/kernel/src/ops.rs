@@ -79,6 +79,7 @@ pub struct OpsKernels {
     logit_softcap_inplace: CudaFunction,
     rope_neox: CudaFunction,
     rope_neox_freqs: CudaFunction,
+    rope_neox_freqs_batched: CudaFunction,
     rope_neox_graph: CudaFunction,
     post_norm_add: CudaFunction,
     mul_f16: CudaFunction,
@@ -190,6 +191,7 @@ impl OpsKernels {
             logit_softcap_inplace: loader::get_fn(&module, "logit_softcap_inplace")?,
             rope_neox: loader::get_fn(&module, "rope_neox")?,
             rope_neox_freqs: loader::get_fn(&module, "rope_neox_freqs")?,
+            rope_neox_freqs_batched: loader::get_fn(&module, "rope_neox_freqs_batched")?,
             rope_neox_graph: loader::get_fn(&module, "rope_neox_graph")?,
             post_norm_add: loader::get_fn(&module, "post_norm_add")?,
             mul_f16: loader::get_fn(&module, "mul_f16")?,
@@ -2566,6 +2568,43 @@ impl OpsKernels {
                 (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2),
                 (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2),
                 cfg.shared_mem_bytes,
+                &mut args,
+            );
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_neox_freqs_batched(
+        &self,
+        x: &mut CudaSlice<half::f16>,
+        freq_factors: &CudaSlice<f32>,
+        total_rows: u32,
+        sequence_len: u32,
+        n_heads: u32,
+        head_dim: u32,
+        pos: u32,
+        theta_base: f32,
+    ) -> Result<(), KernelError> {
+        let head_dim_i32 = head_dim as i32;
+        let n_heads_i32 = n_heads as i32;
+        let sequence_len_i32 = sequence_len as i32;
+        let pos_i32 = pos as i32;
+        let mut args: [*mut c_void; 7] = [
+            slice_ptr_mut(x),
+            slice_ptr(freq_factors),
+            scalar_ptr(&head_dim_i32),
+            scalar_ptr(&n_heads_i32),
+            scalar_ptr(&sequence_len_i32),
+            scalar_ptr(&pos_i32),
+            scalar_ptr(&theta_base),
+        ];
+        unsafe {
+            self.fast.fire(
+                &self.rope_neox_freqs_batched,
+                (total_rows, n_heads, 1),
+                (head_dim / 2, 1, 1),
+                0,
                 &mut args,
             );
         }

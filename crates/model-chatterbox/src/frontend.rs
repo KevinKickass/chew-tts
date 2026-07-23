@@ -189,6 +189,42 @@ impl ChatterboxT3Frontend {
         Ok(host)
     }
 
+    pub fn speech_logits_pair(
+        &self,
+        hidden_a: &[f32],
+        hidden_b: &[f32],
+        kernels: &mut GpuKernels,
+    ) -> anyhow::Result<(Vec<f16>, Vec<f16>)> {
+        ensure!(
+            hidden_a.len() == HIDDEN_SIZE && hidden_b.len() == HIDDEN_SIZE,
+            "paired T3 logits expect two hidden rows"
+        );
+        let stream = Arc::clone(kernels.ops.stream());
+        let hidden = hidden_a
+            .iter()
+            .chain(hidden_b)
+            .copied()
+            .map(f16::from_f32)
+            .collect::<Vec<_>>();
+        let hidden = stream.clone_htod(&hidden)?;
+        let mut logits = stream.alloc_zeros::<f16>(2 * SPEECH_VOCAB_SIZE)?;
+        kernels.gemm.matmul_f16(
+            &hidden,
+            &self.speech_head,
+            &mut logits,
+            2,
+            SPEECH_VOCAB_SIZE as u32,
+            HIDDEN_SIZE as u32,
+        )?;
+        stream.synchronize()?;
+        let mut host = vec![f16::ZERO; 2 * SPEECH_VOCAB_SIZE];
+        stream.memcpy_dtoh(&logits, &mut host)?;
+        Ok((
+            host[..SPEECH_VOCAB_SIZE].to_vec(),
+            host[SPEECH_VOCAB_SIZE..].to_vec(),
+        ))
+    }
+
     fn condition_embeddings(
         &self,
         conditioning: &ChatterboxConditioning,

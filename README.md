@@ -98,8 +98,7 @@ Next:
 - one CUDA graph for a complete 16-codebook audio frame;
 - optimized one-pass model loading and GPU-resident sampling;
 - arbitrary compressed reference-audio input in addition to native WAV;
-- native Chatterbox reference-audio conditioning;
-- batched conditional/unconditional Chatterbox flow evaluation.
+- native Chatterbox reference-audio conditioning.
 
 ## Quick start
 
@@ -230,15 +229,13 @@ cargo run --release -p chew-tts -- \
   cuda-chatterbox-s3-encoder-smoke /models/chatterbox-v3 --gpu 0 --tokens 257
 ```
 
-For 257 input tokens (157 reference tokens plus a representative 100 generated
-tokens), the encoder produces 514 flow-conditioning frames in about 1.15
-seconds wall time on an RTX 3080, including process startup, model loading, and
-NVRTC kernel loading.
-
-The native ten-step CFM path, including both conditional and unconditional CFG
-evaluations, takes about 15 seconds for 100 generated speech tokens (200 new
-mel frames) on the same GPU. This measurement also includes process startup,
-model loading, NVRTC, and the token-conditioning encoder.
+The production path batches conditional and unconditional CFG evaluation,
+uses batched cuBLAS/Tensor-Core attention, and lowers HiFT convolutions through
+unfold plus GEMM. A warm RTX 3080 request generating 2.80 seconds of audio
+completed in 0.845 seconds (RTF 0.30): approximately 0.14 seconds for prompt
+prefill, 0.37 seconds for paired T3 generation, 0.26 seconds for the ten-step
+flow, and 0.08 seconds for HiFT. The original correctness-first flow alone
+took roughly 8.2 seconds for the same short-request geometry.
 
 Run T3, S3Gen, and HiFT end to end:
 
@@ -250,9 +247,9 @@ cargo run --release -p chew-tts -- \
 ```
 
 The HiFT path was checked against the official PyTorch implementation at every
-major stage. A local 20-token smoke test generated 0.8 seconds of finite,
-unclipped 24-kHz audio; the complete post-T3 S3Gen and vocoder path took 8.7
-seconds on an RTX 3080, including model loading.
+major stage. The current native path produces finite, unclipped 24-kHz audio
+and keeps the model resident between HTTP requests; startup and NVRTC
+compilation are therefore excluded from the warm-request number above.
 
 ## CUDA validation
 

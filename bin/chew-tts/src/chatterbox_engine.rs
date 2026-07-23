@@ -116,11 +116,8 @@ impl ChatterboxEngine {
         let mut random = request.seed.max(1);
         let mut generated = Vec::new();
         for position in 0..request.max_frames {
-            let conditional_logits = self.frontend.speech_logits(
+            let (conditional_logits, unconditional_logits) = self.frontend.speech_logits_pair(
                 &conditional_hidden[conditional_hidden.len() - HIDDEN_SIZE..],
-                &mut self.kernels,
-            )?;
-            let unconditional_logits = self.frontend.speech_logits(
                 &unconditional_hidden[unconditional_hidden.len() - HIDDEN_SIZE..],
                 &mut self.kernels,
             )?;
@@ -139,16 +136,11 @@ impl ChatterboxEngine {
             let embedding =
                 self.frontend
                     .speech_embedding(token, position + 1, &mut self.kernels)?;
-            conditional_hidden = self.transformer.forward_session(
+            (conditional_hidden, unconditional_hidden) = self.transformer.forward_session_pair(
                 &mut conditional,
-                &embedding,
-                1,
-                &mut self.kernels,
-            )?;
-            unconditional_hidden = self.transformer.forward_session(
                 &mut unconditional,
                 &embedding,
-                1,
+                &embedding,
                 &mut self.kernels,
             )?;
         }

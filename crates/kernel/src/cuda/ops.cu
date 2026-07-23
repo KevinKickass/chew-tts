@@ -2232,6 +2232,33 @@ __global__ void rope_neox_freqs(__half* __restrict__ x,
     x[idx1] = __float2half(x0 * sin_a + x1 * cos_a);
 }
 
+__global__ void rope_neox_freqs_batched(__half* __restrict__ x,
+                                        const float* __restrict__ freq_factors,
+                                        int head_dim,
+                                        int n_heads,
+                                        int sequence_len,
+                                        int pos,
+                                        float theta_base) {
+    const int row = blockIdx.x;
+    const int head = blockIdx.y;
+    const int pair = threadIdx.x;
+    const int half_dim = head_dim / 2;
+    if (pair >= half_dim) return;
+    const int base = row * n_heads * head_dim + head * head_dim;
+    const int index0 = base + pair;
+    const int index1 = index0 + half_dim;
+    const float factor = freq_factors[pair];
+    const float frequency =
+        1.0f / (powf(theta_base, (float)(2 * pair) / (float)head_dim) * factor);
+    const float angle = (float)(pos + row % sequence_len) * frequency;
+    const float cosine = cosf(angle);
+    const float sine = sinf(angle);
+    const float value0 = __half2float(x[index0]);
+    const float value1 = __half2float(x[index1]);
+    x[index0] = __float2half(value0 * cosine - value1 * sine);
+    x[index1] = __float2half(value0 * sine + value1 * cosine);
+}
+
 // --- RoPE NeoX graph-compatible (reads pos from device memory) ---
 __global__ void rope_neox_graph(__half* __restrict__ x,
                                 const int* __restrict__ decode_params,

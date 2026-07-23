@@ -477,6 +477,189 @@ impl ChatterboxT3Layer {
         cache.position += seq_len;
         Ok(())
     }
+
+    fn forward_cached_pair_device(
+        &self,
+        hidden: &mut CudaSlice<f32>,
+        rope_factors: &CudaSlice<f32>,
+        cache_a: &mut ChatterboxT3KvCache,
+        cache_b: &mut ChatterboxT3KvCache,
+        scratch_a: &mut ChatterboxT3BatchScratch,
+        scratch_b: &mut ChatterboxT3BatchScratch,
+        kernels: &mut GpuKernels,
+    ) -> anyhow::Result<()> {
+        ensure!(
+            cache_a.position == cache_b.position,
+            "paired T3 caches are out of sync"
+        );
+        ensure!(
+            scratch_a.max_tokens >= 2 && scratch_b.max_tokens >= 1,
+            "paired T3 decode requires two scratch rows"
+        );
+        ensure!(
+            cache_a.position < cache_a.max_seq_len && cache_b.position < cache_b.max_seq_len,
+            "paired T3 KV capacity exceeded"
+        );
+        let stream = Arc::clone(kernels.ops.stream());
+        let position = cache_a.position;
+        let position_u32 = u32::try_from(position).context("T3 position exceeds CUDA limits")?;
+        let kv_len = u32::try_from(position + 1).context("T3 KV length exceeds CUDA limits")?;
+
+        kernels.ops.rms_norm_f32in(
+            hidden,
+            &self.input_norm,
+            &mut scratch_a.norm,
+            2,
+            HIDDEN_SIZE as u32,
+            1e-5,
+        )?;
+        for (weight, output) in [
+            (&self.q_proj, &mut scratch_a.q),
+            (&self.k_proj, &mut scratch_a.k),
+            (&self.v_proj, &mut scratch_a.v),
+        ] {
+            kernels.gemm.matmul_f16(
+                &scratch_a.norm,
+                weight,
+                output,
+                2,
+                HIDDEN_SIZE as u32,
+                HIDDEN_SIZE as u32,
+            )?;
+        }
+        kernels.ops.rope_neox_freqs_batched(
+            &mut scratch_a.q,
+            rope_factors,
+            2,
+            1,
+            ATTENTION_HEADS as u32,
+            HEAD_DIM as u32,
+            position_u32,
+            500_000.0,
+        )?;
+        kernels.ops.rope_neox_freqs_batched(
+            &mut scratch_a.k,
+            rope_factors,
+            2,
+            1,
+            ATTENTION_HEADS as u32,
+            HEAD_DIM as u32,
+            position_u32,
+            500_000.0,
+        )?;
+
+        stream.memcpy_dtod(
+            &scratch_a.q.slice(HIDDEN_SIZE..2 * HIDDEN_SIZE),
+            &mut scratch_b.q.slice_mut(..HIDDEN_SIZE),
+        )?;
+        stream.memcpy_dtod(
+            &scratch_a.k.slice(HIDDEN_SIZE..2 * HIDDEN_SIZE),
+            &mut scratch_b.k.slice_mut(..HIDDEN_SIZE),
+        )?;
+        stream.memcpy_dtod(
+            &scratch_a.v.slice(HIDDEN_SIZE..2 * HIDDEN_SIZE),
+            &mut scratch_b.v.slice_mut(..HIDDEN_SIZE),
+        )?;
+
+        let cache_offset = position * HIDDEN_SIZE;
+        let cache_end = cache_offset + HIDDEN_SIZE;
+        for (source, destination) in [
+            (&scratch_a.k, &mut cache_a.k),
+            (&scratch_a.v, &mut cache_a.v),
+            (&scratch_b.k, &mut cache_b.k),
+            (&scratch_b.v, &mut cache_b.v),
+        ] {
+            stream.memcpy_dtod(
+                &source.slice(..HIDDEN_SIZE),
+                &mut destination.slice_mut(cache_offset..cache_end),
+            )?;
+        }
+        kernels.ops.mha_fused(
+            &scratch_a.q,
+            &cache_a.k.slice(..cache_end),
+            &cache_a.v.slice(..cache_end),
+            &mut scratch_a.attention,
+            HEAD_DIM as u32,
+            ATTENTION_HEADS as u32,
+            ATTENTION_HEADS as u32,
+            1,
+            kv_len,
+            position_u32,
+        )?;
+        kernels.ops.mha_fused(
+            &scratch_b.q,
+            &cache_b.k.slice(..cache_end),
+            &cache_b.v.slice(..cache_end),
+            &mut scratch_b.attention,
+            HEAD_DIM as u32,
+            ATTENTION_HEADS as u32,
+            ATTENTION_HEADS as u32,
+            1,
+            kv_len,
+            position_u32,
+        )?;
+        stream.memcpy_dtod(
+            &scratch_b.attention.slice(..HIDDEN_SIZE),
+            &mut scratch_a.attention.slice_mut(HIDDEN_SIZE..2 * HIDDEN_SIZE),
+        )?;
+        kernels.gemm.matmul_f16(
+            &scratch_a.attention,
+            &self.o_proj,
+            &mut scratch_a.attention_out,
+            2,
+            HIDDEN_SIZE as u32,
+            HIDDEN_SIZE as u32,
+        )?;
+        kernels.ops.add_inplace_f32_f16(
+            hidden,
+            &scratch_a.attention_out,
+            (2 * HIDDEN_SIZE) as u32,
+        )?;
+        kernels.ops.rms_norm_f32in(
+            hidden,
+            &self.post_attention_norm,
+            &mut scratch_a.norm,
+            2,
+            HIDDEN_SIZE as u32,
+            1e-5,
+        )?;
+        kernels.gemm.matmul_f16(
+            &scratch_a.norm,
+            &self.gate_proj,
+            &mut scratch_a.gate,
+            2,
+            INTERMEDIATE_SIZE as u32,
+            HIDDEN_SIZE as u32,
+        )?;
+        kernels.gemm.matmul_f16(
+            &scratch_a.norm,
+            &self.up_proj,
+            &mut scratch_a.up,
+            2,
+            INTERMEDIATE_SIZE as u32,
+            HIDDEN_SIZE as u32,
+        )?;
+        kernels.ops.silu(
+            &scratch_a.gate,
+            &scratch_a.up,
+            &mut scratch_a.activation,
+            (2 * INTERMEDIATE_SIZE) as u32,
+        )?;
+        kernels.gemm.matmul_f16(
+            &scratch_a.activation,
+            &self.down_proj,
+            &mut scratch_a.mlp_out,
+            2,
+            HIDDEN_SIZE as u32,
+            INTERMEDIATE_SIZE as u32,
+        )?;
+        kernels
+            .ops
+            .add_inplace_f32_f16(hidden, &scratch_a.mlp_out, (2 * HIDDEN_SIZE) as u32)?;
+        cache_a.position += 1;
+        cache_b.position += 1;
+        Ok(())
+    }
 }
 
 impl ChatterboxT3Transformer {
@@ -602,6 +785,64 @@ impl ChatterboxT3Transformer {
             &mut output,
         )?;
         Ok(output.into_iter().map(f16::to_f32).collect())
+    }
+
+    pub fn forward_session_pair(
+        &self,
+        session_a: &mut ChatterboxT3Session,
+        session_b: &mut ChatterboxT3Session,
+        hidden_a: &[f32],
+        hidden_b: &[f32],
+        kernels: &mut GpuKernels,
+    ) -> anyhow::Result<(Vec<f32>, Vec<f32>)> {
+        ensure!(
+            hidden_a.len() == HIDDEN_SIZE && hidden_b.len() == HIDDEN_SIZE,
+            "paired T3 decode expects two hidden rows"
+        );
+        ensure!(
+            session_a.position() == session_b.position(),
+            "paired T3 sessions are out of sync"
+        );
+        ensure!(
+            session_a.position() < session_a.max_seq_len
+                && session_b.position() < session_b.max_seq_len,
+            "paired T3 session capacity exceeded"
+        );
+        let mut host = Vec::with_capacity(2 * HIDDEN_SIZE);
+        host.extend_from_slice(hidden_a);
+        host.extend_from_slice(hidden_b);
+        let stream = Arc::clone(kernels.ops.stream());
+        let mut hidden = stream.clone_htod(&host)?;
+        for index in 0..self.layers.len() {
+            self.layers[index].forward_cached_pair_device(
+                &mut hidden,
+                &self.rope_factors,
+                &mut session_a.caches[index],
+                &mut session_b.caches[index],
+                &mut session_a.scratch,
+                &mut session_b.scratch,
+                kernels,
+            )?;
+        }
+        kernels.ops.rms_norm_f32in(
+            &hidden,
+            &self.final_norm,
+            &mut session_a.scratch.norm,
+            2,
+            HIDDEN_SIZE as u32,
+            1e-5,
+        )?;
+        stream.synchronize()?;
+        let mut output = vec![f16::ZERO; 2 * HIDDEN_SIZE];
+        stream.memcpy_dtoh(
+            &session_a.scratch.norm.slice(..2 * HIDDEN_SIZE),
+            &mut output,
+        )?;
+        let output = output.into_iter().map(f16::to_f32).collect::<Vec<_>>();
+        Ok((
+            output[..HIDDEN_SIZE].to_vec(),
+            output[HIDDEN_SIZE..].to_vec(),
+        ))
     }
 }
 
