@@ -1,128 +1,92 @@
-# Chew
+# Chew TTS
 
-GPU inference engine for GGUF models. Full VRAM control, quantized weights stay quantized on GPU, on-the-fly dequant per GEMM.
+Chew TTS is a Rust and CUDA speech-synthesis engine built for predictable VRAM
+usage, high throughput, and a single deployable binary. CUDA kernels are
+compiled at startup with NVRTC for the GPU that is actually present.
 
-Built in Rust with raw CUDA (cudarc + NVRTC), no llama.cpp dependency.
+The project is a TTS-focused fork of
+[Chew](https://github.com/KevinKickass/chew). It intentionally has its own
+repository and release lifecycle: Fleet can deploy a small speech engine
+without carrying an LLM API or llama.cpp dependency.
 
-## Features
+## Status
 
-- **Exact VRAM budgeting** — knows before loading whether the model fits. No OOM surprises.
-- **Quantized weights on GPU** — Q4_K_M, Q6_K, IQ2_S, etc. stay quantized in VRAM. Only dequantized on-the-fly per matrix multiply into a reusable 128 MB scratch buffer.
-- **Chunked output GEMM** — large matrices (e.g. output [128k, 4096]) are processed in chunks, keeping the dequant scratch small.
-- **Auto context fitting** — tries max context, halves until it fits with 256 MB headroom.
-- **OpenAI-compatible API** — `/v1/chat/completions` endpoint.
-- **Built-in Web UI** — dark theme chat interface at `/`.
-- **NVRTC runtime compilation** — CUDA kernels compiled at startup, auto-detects GPU arch and patches PTX versions.
-- **Architecture-aware loader** — picks runtime path by GGUF arch (`llama`, `gemma4`, `mamba`, `bert`) instead of defaulting through a single transformer path.
+Qwen3-TTS support is under active development.
 
-## Architecture
+Implemented:
 
-```
+- model-independent TTS request, audio, and capability types;
+- memory-mapped native Safetensors access;
+- Qwen3-TTS Base, CustomVoice, and VoiceDesign configuration parsing;
+- validation of the talker and code-predictor geometry;
+- inspection of real Hugging Face model directories.
+
+Next:
+
+- F16 talker prefill and decode on Chew CUDA kernels;
+- code-predictor decode and GPU-side sampling;
+- one CUDA graph for a complete 16-codebook audio frame;
+- the 12 Hz speech-tokenizer decoder;
+- speaker and reference-audio encoders for voice cloning;
+- Kokoro as the second model family.
+
+## Why a separate repository?
+
+TTS and LLM serving share CUDA primitives, but not their product surface or
+hot path. Qwen3-TTS performs one large talker step followed by 15 small
+code-predictor steps for every 12.5 Hz audio frame. It also needs convolutional
+audio decoders, resampling, phonemization, and audio encoders that an LLM
+server does not need.
+
+The fork currently retains Chew's proven LLM crates as implementation
+references while the CUDA runtime is separated from GGUF-specific types. They
+will leave the final TTS binary and eventually the workspace after the Qwen
+path is verified.
+
+## Workspace
+
+```text
+bin/
+  chew-tts/             TTS CLI and, later, HTTP server
 crates/
-  gguf/      GGUF parser (tensors, metadata, quantization types)
-  vram/      VRAM allocator (multi-GPU ready)
-  kernel/    CUDA kernels (dequant, ops, GEMM) via NVRTC
-  engine/    Inference engine (weights, forward pass, KV cache, sampling, VRAM plan)
-  server/    HTTP server (Axum, OpenAI API, Web UI)
+  tts-core/             common request, audio, and capability types
+  safetensors/          mmap Safetensors access
+  model-qwen3-tts/      Qwen configuration and inference
+  kernel/               inherited CUDA/NVRTC kernels
+  vram/                 inherited VRAM ownership and budgeting
 ```
 
-### VRAM Budget
+The inherited `gguf`, `engine`, and `server` crates are temporary references
+and are not dependencies of the `chew-tts` binary.
 
-Before allocating anything, `VramPlan` computes exact requirements:
-
-| Component | Description |
-|-----------|-------------|
-| Weights | Quantized tensors at disk size + norms/embeddings as f16 |
-| Dequant scratch | 128 MB cap — largest weight chunk dequanted to f16 for cuBLAS |
-| KV cache | 2 * layers * context * kv_heads * head_dim * 2 bytes |
-| Forward scratch | All intermediate buffers (norm, QKV, FFN, logits) |
-| cuBLAS workspace | 32 MB |
-| Loading peak | Temporary overhead during upload_and_dequant |
-
-The plan reports **steady-state** and **peak** (during loading) VRAM, and a clear **FITS** or **DOES NOT FIT** verdict.
-
-### Weight Storage
-
-Large weight matrices stay quantized on GPU (`CudaSlice<u8>` + `GgmlType`). Per GEMM call:
-
-1. Dequant chunk of weight matrix into 128 MB f16 scratch buffer (GPU kernel)
-2. cuBLAS hgemm on the f16 chunk
-3. Repeat for remaining chunks (only needed for matrices > 64M elements like output projection)
-
-Small tensors (norms, embeddings) are dequanted once to f16 at load time.
-
-### Forward Pass
-
-Standard Llama transformer: RMSNorm -> QKV projection -> RoPE -> KV cache -> Fused MHA (with GQA) -> Output projection -> SiLU FFN -> Residual connections -> Final norm -> Logits.
-
-All matmuls use on-the-fly dequant from quantized weights.
-
-## Usage
-
-### Run server
+## Inspect a model
 
 ```bash
-cargo run --release -- /path/to/model.gguf \
-  --tokenizer /path/to/tokenizer.json \
-  --port 9090 \
-  --context 4096
+CARGO_TARGET_DIR=/tmp/chew-tts-target \
+  cargo run --release -p chew-tts -- \
+  inspect /models/Qwen3-TTS-12Hz-1.7B-Base
 ```
 
-Open `http://localhost:9090` for the Web UI.
+Example:
 
-### VRAM budget check (without loading)
-
-```bash
-cargo run --example vram_plan -- /path/to/model.gguf
-```
-
-Output:
-
-```
-Context     Weights  Dequant       KV  Scratch   cuBLAS    Total     Peak
---------------------------------------------------------------------------
-512          5404 MB    128 MB     64 MB    193 MB     32 MB   5822 MB   6104 MB
-1024         5404 MB    128 MB    128 MB    386 MB     32 MB   6079 MB   6361 MB
-2048         5404 MB    128 MB    256 MB    773 MB     32 MB   6593 MB   6875 MB
-...
-
->>> FITS - GO <<<
-```
-
-### API
-
-```bash
-curl http://localhost:9090/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "messages": [{"role": "user", "content": "Hello!"}],
-    "max_tokens": 100,
-    "temperature": 0.7
-  }'
-```
-
-### Health check
-
-```bash
-curl http://localhost:9090/health
+```text
+Qwen3-TTS 1b7 Base
+talker: 28 layers, hidden 2048, 16 Q heads / 8 KV heads
+code predictor: 5 layers, hidden 1024, 15 acoustic steps/frame
+weights: 480 tensors in 1 file(s), 3.59 GiB
 ```
 
 ## Requirements
 
-- NVIDIA GPU with compute capability >= 7.0
-- CUDA toolkit (for NVRTC runtime compilation)
+- NVIDIA GPU with compute capability 7.0 or newer
+- CUDA toolkit with NVRTC
 - Rust 2024 edition
 
-## Supported Quantization Types
+F16 is the common correctness baseline for V100 and A6000. BF16 and
+architecture-specific fast paths are enabled only after output parity.
 
-Q4_0, Q4_K, Q6_K, Q8_0, Q2_K, Q3_K, BF16, F16, F32, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS
+## References and licensing
 
-## Workspace Crates
-
-| Crate | Description |
-|-------|-------------|
-| `chew-gguf` | GGUF file parser — tensors, metadata, CPU dequantization |
-| `chew-vram` | GPU memory allocator with device enumeration |
-| `chew-kernel` | CUDA kernels compiled at runtime via NVRTC |
-| `chew-engine` | Core inference engine — weights, forward pass, KV cache, sampling |
-| `chew-server` | HTTP server with OpenAI-compatible API and Web UI |
+Chew TTS is MIT licensed. Qwen3-TTS porting behavior is checked against the
+official implementation and the pinned MIT Rust reference documented in
+[docs/PORTING_QWEN3_TTS.md](docs/PORTING_QWEN3_TTS.md).

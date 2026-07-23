@@ -1,0 +1,10 @@
+[package]
+name = "chew-tts-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Model-independent request, audio, and capability types for Chew TTS"
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true

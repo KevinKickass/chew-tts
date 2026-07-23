@@ -6,6 +6,10 @@ members = [
     "crates/kernel",
     "crates/engine",
     "crates/server",
+    "crates/tts-core",
+    "crates/safetensors",
+    "crates/model-qwen3-tts",
+    "bin/chew-tts",
 ]
 
 [workspace.package]
@@ -19,6 +23,9 @@ chew-gguf = { path = "crates/gguf" }
 chew-vram = { path = "crates/vram" }
 chew-kernel = { path = "crates/kernel" }
 chew-engine = { path = "crates/engine" }
+chew-tts-core = { path = "crates/tts-core" }
+chew-safetensors = { path = "crates/safetensors" }
+chew-model-qwen3-tts = { path = "crates/model-qwen3-tts" }
 
 # CUDA
 cudarc = { path = "cudarc-fork", features = ["std", "driver", "cublas", "nvrtc", "cuda-13000", "f16"] }
@@ -34,6 +41,7 @@ tower-http = { version = "0.6", features = ["cors", "trace"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 minijinja = "2"
+safetensors = "0.6"
 
 # Tokenizer
 tokenizers = "0.22"
@@ -53,3 +61,4 @@ memmap2 = "0.9"
 parking_lot = "0.12"
 dashmap = "6"
 uuid = { version = "1", features = ["v4"] }
+clap = { version = "4", features = ["derive"] }
