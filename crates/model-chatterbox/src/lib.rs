@@ -3,6 +3,10 @@ use candle_core::{DType, pickle::PthTensors};
 use chew_safetensors::{MappedSafetensors, TensorInfo};
 use std::path::{Path, PathBuf};
 
+mod cuda;
+
+pub use cuda::ChatterboxT3Layer;
+
 pub const TEXT_VOCAB_SIZE: usize = 2_454;
 pub const SPEECH_VOCAB_SIZE: usize = 8_194;
 pub const HIDDEN_SIZE: usize = 1_024;

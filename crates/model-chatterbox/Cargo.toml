@@ -8,4 +8,7 @@ description = "Native Chatterbox Multilingual V3 model inspection and loading fo
 [dependencies]
 anyhow.workspace = true
 candle-core.workspace = true
+chew-kernel.workspace = true
 chew-safetensors.workspace = true
+cudarc.workspace = true
+half.workspace = true

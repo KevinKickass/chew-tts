@@ -1,5 +1,8 @@
 use anyhow::Context;
-use chew_model_chatterbox::inspect_model as inspect_chatterbox_model;
+use chew_model_chatterbox::{
+    ChatterboxT3Layer, HIDDEN_SIZE as CHATTERBOX_HIDDEN_SIZE,
+    INTERMEDIATE_SIZE as CHATTERBOX_INTERMEDIATE_SIZE, inspect_model as inspect_chatterbox_model,
+};
 use chew_model_kokoro::{KokoroVoice, inspect_model as inspect_kokoro_model};
 use chew_model_qwen3_tts::{
     CodePredictorTransformer, CodecEncoder, CodecQuantizer, CodecTransformerSession,
@@ -86,6 +89,17 @@ enum Command {
     InspectChatterbox {
         /// Directory containing t3_mtl23ls_v3, S3Gen, and ve weights.
         model_dir: PathBuf,
+    },
+    /// Run one complete Chatterbox V3 T3 decoder layer on local CUDA.
+    CudaChatterboxLayerSmoke {
+        /// Directory containing t3_mtl23ls_v3.safetensors.
+        model_dir: PathBuf,
+        /// Zero-based CUDA device index.
+        #[arg(long, default_value_t = 0)]
+        gpu: usize,
+        /// T3 decoder layer to validate.
+        #[arg(long, default_value_t = 0)]
+        layer: usize,
     },
     /// Tokenize text with the model's local Qwen2 BPE files.
     Tokenize {
@@ -482,6 +496,38 @@ fn main() -> anyhow::Result<()> {
             println!(
                 "weights: {:.2} GiB",
                 inspection.total_weight_bytes as f64 / 1024.0_f64.powi(3),
+            );
+        }
+        Command::CudaChatterboxLayerSmoke {
+            model_dir,
+            gpu,
+            layer,
+        } => {
+            let allocator = chew_vram::VramAllocator::init()?;
+            anyhow::ensure!(
+                gpu < allocator.gpu_count(),
+                "GPU index {gpu} is out of range; detected {} device(s)",
+                allocator.gpu_count()
+            );
+            let stream = std::sync::Arc::clone(allocator.stream(gpu));
+            let mut kernels = chew_kernel::GpuKernels::load(
+                &stream,
+                CHATTERBOX_HIDDEN_SIZE * CHATTERBOX_INTERMEDIATE_SIZE,
+                CHATTERBOX_INTERMEDIATE_SIZE,
+            )?;
+            let layer = ChatterboxT3Layer::load(&model_dir, layer, &stream)?;
+            let hidden = (0..CHATTERBOX_HIDDEN_SIZE)
+                .map(|index| ((index as f32 * 0.013).sin() * 0.2) + 0.01)
+                .collect::<Vec<_>>();
+            let output = layer.forward_first_token(&hidden, &mut kernels)?;
+            let sum = output.iter().map(|value| f64::from(*value)).sum::<f64>();
+            let sum_sq = output
+                .iter()
+                .map(|value| f64::from(*value) * f64::from(*value))
+                .sum::<f64>();
+            println!(
+                "Chatterbox T3 layer CUDA: sum={sum:.9}, sum_sq={sum_sq:.9}, first={:?}",
+                &output[..8]
             );
         }
         Command::Tokenize { model_dir, text } => {

@@ -323,7 +323,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "candle-core",
+ "chew-kernel",
  "chew-safetensors",
+ "cudarc",
+ "half",
 ]
 
 [[package]]
