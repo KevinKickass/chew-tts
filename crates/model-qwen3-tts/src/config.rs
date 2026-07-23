@@ -66,11 +66,12 @@ pub struct TalkerConfig {
 
 impl TalkerConfig {
     fn validate(&self) -> Result<(), String> {
-        if self.num_attention_heads * self.head_dim != self.hidden_size {
-            return Err(format!(
-                "talker query geometry mismatch: {} heads * {} != hidden {}",
-                self.num_attention_heads, self.head_dim, self.hidden_size
-            ));
+        if self.hidden_size == 0
+            || self.num_attention_heads == 0
+            || self.num_key_value_heads == 0
+            || self.head_dim == 0
+        {
+            return Err("talker attention geometry must be non-zero".into());
         }
         if self.num_key_value_heads > self.num_attention_heads {
             return Err("talker KV heads exceed query heads".into());
@@ -113,5 +114,54 @@ impl CodePredictorConfig {
             return Err("code predictor must have layers and a vocabulary".into());
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn talker(hidden_size: usize) -> TalkerConfig {
+        TalkerConfig {
+            hidden_size,
+            intermediate_size: 3_072,
+            num_hidden_layers: 28,
+            num_attention_heads: 16,
+            num_key_value_heads: 8,
+            head_dim: 128,
+            vocab_size: 3_072,
+            text_vocab_size: 151_936,
+            text_hidden_size: 1_024,
+            num_code_groups: 16,
+            max_position_embeddings: 32_768,
+            rope_theta: 1_000_000.0,
+            rms_norm_eps: 1e-6,
+            code_predictor_config: CodePredictorConfig {
+                hidden_size: 1_024,
+                intermediate_size: 3_072,
+                num_hidden_layers: 5,
+                num_attention_heads: 16,
+                num_key_value_heads: 8,
+                head_dim: 64,
+                vocab_size: 2_048,
+                num_code_groups: 16,
+                max_position_embeddings: 32_768,
+                rope_theta: 1_000_000.0,
+                rms_norm_eps: 1e-6,
+            },
+            codec_language_id: HashMap::new(),
+            spk_id: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn accepts_official_06b_rectangular_query_projection() {
+        let config = talker(1_024);
+        assert_eq!(
+            config.num_attention_heads * config.head_dim,
+            2_048,
+            "the official 0.6B talker intentionally projects queries wider than hidden"
+        );
+        assert!(config.validate().is_ok());
     }
 }
