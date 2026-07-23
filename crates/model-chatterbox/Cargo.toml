@@ -1,0 +1,11 @@
+[package]
+name = "chew-model-chatterbox"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Native Chatterbox Multilingual V3 model inspection and loading for Chew TTS"
+
+[dependencies]
+anyhow.workspace = true
+candle-core.workspace = true
+chew-safetensors.workspace = true

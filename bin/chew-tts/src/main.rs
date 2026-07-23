@@ -1,4 +1,5 @@
 use anyhow::Context;
+use chew_model_chatterbox::inspect_model as inspect_chatterbox_model;
 use chew_model_kokoro::{KokoroVoice, inspect_model as inspect_kokoro_model};
 use chew_model_qwen3_tts::{
     CodePredictorTransformer, CodecEncoder, CodecQuantizer, CodecTransformerSession,
@@ -80,6 +81,11 @@ enum Command {
         /// Optional already-phonemized input to validate and map to token IDs.
         #[arg(long)]
         phonemes: Option<String>,
+    },
+    /// Validate Chatterbox Multilingual V3 T3, S3Gen, and voice-encoder weights.
+    InspectChatterbox {
+        /// Directory containing t3_mtl23ls_v3, S3Gen, and ve weights.
+        model_dir: PathBuf,
     },
     /// Tokenize text with the model's local Qwen2 BPE files.
     Tokenize {
@@ -453,6 +459,30 @@ fn main() -> anyhow::Result<()> {
                     path.display(),
                 );
             }
+        }
+        Command::InspectChatterbox { model_dir } => {
+            let inspection = inspect_chatterbox_model(&model_dir)
+                .with_context(|| format!("could not inspect {}", model_dir.display()))?;
+            println!("Chatterbox Multilingual V3: 30-layer Llama, hidden 1024, 16 heads");
+            println!(
+                "T3: {} tensors, text vocab 2454, speech vocab 8194 ({})",
+                inspection.t3_tensors.len(),
+                inspection.t3_path.display(),
+            );
+            println!(
+                "S3Gen: {} tensors ({})",
+                inspection.s3gen_tensor_count,
+                inspection.s3gen_path.display(),
+            );
+            println!(
+                "voice encoder: {} tensors ({})",
+                inspection.voice_encoder_tensor_count,
+                inspection.voice_encoder_path.display(),
+            );
+            println!(
+                "weights: {:.2} GiB",
+                inspection.total_weight_bytes as f64 / 1024.0_f64.powi(3),
+            );
         }
         Command::Tokenize { model_dir, text } => {
             let tokenizer = load_qwen_tokenizer(&model_dir)?;

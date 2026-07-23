@@ -318,6 +318,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "chew-model-chatterbox"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "candle-core",
+ "chew-safetensors",
+]
+
+[[package]]
 name = "chew-model-kokoro"
 version = "0.1.0"
 dependencies = [
@@ -380,6 +389,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "chew-kernel",
+ "chew-model-chatterbox",
  "chew-model-kokoro",
  "chew-model-qwen3-tts",
  "chew-vram",
