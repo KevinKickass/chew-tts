@@ -1,8 +1,10 @@
 mod config;
+mod cuda;
 
 pub use config::{
     CodePredictorConfig, ModelType, Qwen3TtsConfig, SpeakerEncoderConfig, TalkerConfig,
 };
+pub use cuda::TalkerDecoderLayer;
 
 use chew_safetensors::{MappedSafetensors, TensorInfo};
 use std::fs;
@@ -13,6 +15,11 @@ pub struct ModelInspection {
     pub weight_files: Vec<PathBuf>,
     pub tensors: Vec<TensorInfo>,
     pub total_weight_bytes: u64,
+}
+
+pub struct HostF16Tensor {
+    pub shape: Vec<usize>,
+    pub values: Vec<half::f16>,
 }
 
 pub fn inspect_model(model_dir: impl AsRef<Path>) -> Result<ModelInspection, Error> {
@@ -53,6 +60,31 @@ pub fn inspect_model(model_dir: impl AsRef<Path>) -> Result<ModelInspection, Err
     })
 }
 
+pub fn load_f16_tensor(
+    model_dir: impl AsRef<Path>,
+    tensor_name: &str,
+) -> Result<HostF16Tensor, Error> {
+    let model_dir = model_dir.as_ref();
+    let mut weight_files = fs::read_dir(model_dir)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "safetensors"))
+        .collect::<Vec<_>>();
+    weight_files.sort();
+    for path in weight_files {
+        let mapped = MappedSafetensors::open(path)?;
+        if mapped
+            .tensor_infos()?
+            .iter()
+            .any(|tensor| tensor.name == tensor_name)
+        {
+            let (shape, values) = mapped.tensor_f16(tensor_name)?;
+            return Ok(HostF16Tensor { shape, values });
+        }
+    }
+    Err(Error::TensorNotFound(tensor_name.to_string()))
+}
+
 fn validate_required_tensors(tensors: &[TensorInfo]) -> Result<(), Error> {
     for required in [
         "talker.model.codec_embedding.weight",
@@ -81,4 +113,6 @@ pub enum Error {
     MissingWeights,
     #[error("required tensor is missing: {0}")]
     MissingTensor(&'static str),
+    #[error("tensor not found: {0}")]
+    TensorNotFound(String),
 }

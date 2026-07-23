@@ -7,5 +7,9 @@ description = "CUDA/NVRTC speech synthesis engine"
 
 [dependencies]
 anyhow.workspace = true
+chew-kernel.workspace = true
 chew-model-qwen3-tts.workspace = true
+chew-vram.workspace = true
 clap.workspace = true
+half.workspace = true
+tracing-subscriber.workspace = true

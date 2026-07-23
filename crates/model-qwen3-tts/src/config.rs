@@ -27,10 +27,12 @@ impl Qwen3TtsConfig {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
 pub enum ModelType {
+    #[serde(rename = "base")]
     Base,
+    #[serde(rename = "custom_voice", alias = "customvoice")]
     CustomVoice,
+    #[serde(rename = "voice_design", alias = "voicedesign")]
     VoiceDesign,
 }
 

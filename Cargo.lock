@@ -250,8 +250,12 @@ dependencies = [
 name = "chew-model-qwen3-tts"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "chew-kernel",
  "chew-safetensors",
  "chew-tts-core",
+ "cudarc",
+ "half",
  "serde",
  "serde_json",
  "thiserror",
@@ -261,6 +265,7 @@ dependencies = [
 name = "chew-safetensors"
 version = "0.1.0"
 dependencies = [
+ "half",
  "memmap2",
  "safetensors",
  "thiserror",
@@ -290,8 +295,12 @@ name = "chew-tts"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chew-kernel",
  "chew-model-qwen3-tts",
+ "chew-vram",
  "clap",
+ "half",
+ "tracing-subscriber",
 ]
 
 [[package]]

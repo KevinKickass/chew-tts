@@ -62,6 +62,38 @@ impl MappedSafetensors {
         let tensors = SafeTensors::deserialize(&self.mmap)?;
         Ok(use_tensor(tensors.tensor(name)?))
     }
+
+    pub fn tensor_f16(&self, name: &str) -> Result<(Vec<usize>, Vec<half::f16>), Error> {
+        self.with_tensor(name, |tensor| {
+            let shape = tensor.shape().to_vec();
+            let values = match tensor.dtype() {
+                Dtype::F16 => tensor
+                    .data()
+                    .chunks_exact(2)
+                    .map(|bytes| half::f16::from_bits(u16::from_le_bytes([bytes[0], bytes[1]])))
+                    .collect(),
+                Dtype::BF16 => tensor
+                    .data()
+                    .chunks_exact(2)
+                    .map(|bytes| {
+                        let bits = u16::from_le_bytes([bytes[0], bytes[1]]);
+                        half::f16::from_f32(f32::from_bits(u32::from(bits) << 16))
+                    })
+                    .collect(),
+                Dtype::F32 => tensor
+                    .data()
+                    .chunks_exact(4)
+                    .map(|bytes| {
+                        half::f16::from_f32(f32::from_le_bytes([
+                            bytes[0], bytes[1], bytes[2], bytes[3],
+                        ]))
+                    })
+                    .collect(),
+                dtype => return Err(Error::UnsupportedDtype(dtype)),
+            };
+            Ok((shape, values))
+        })?
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -70,6 +102,8 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("Safetensors: {0}")]
     Format(#[from] safetensors::SafeTensorError),
+    #[error("tensor dtype {0:?} cannot be converted to f16")]
+    UnsupportedDtype(Dtype),
 }
 
 #[cfg(test)]
@@ -96,6 +130,9 @@ mod tests {
         assert_eq!(infos[0].name, "weight");
         assert_eq!(infos[0].shape, vec![2]);
         assert_eq!(infos[0].bytes, 8);
+        let (shape, values) = mapped.tensor_f16("weight").unwrap();
+        assert_eq!(shape, vec![2]);
+        assert_eq!(values, vec![half::f16::ZERO; 2]);
 
         std::fs::remove_file(path).unwrap();
     }

@@ -6,8 +6,12 @@ license.workspace = true
 description = "Qwen3-TTS model configuration and inference for Chew TTS"
 
 [dependencies]
+anyhow.workspace = true
+chew-kernel.workspace = true
 chew-safetensors.workspace = true
 chew-tts-core.workspace = true
+cudarc.workspace = true
+half.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

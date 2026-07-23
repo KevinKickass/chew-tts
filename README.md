@@ -19,11 +19,13 @@ Implemented:
 - memory-mapped native Safetensors access;
 - Qwen3-TTS Base, CustomVoice, and VoiceDesign configuration parsing;
 - validation of the talker and code-predictor geometry;
-- inspection of real Hugging Face model directories.
+- inspection of real Hugging Face model directories;
+- native F16 CUDA execution of a complete Qwen talker decoder layer;
+- PyTorch parity checks for real Qwen weights.
 
 Next:
 
-- F16 talker prefill and decode on Chew CUDA kernels;
+- full talker prefill, KV cache, and autoregressive decode;
 - code-predictor decode and GPU-side sampling;
 - one CUDA graph for a complete 16-codebook audio frame;
 - the 12 Hz speech-tokenizer decoder;
@@ -75,6 +77,28 @@ talker: 28 layers, hidden 2048, 16 Q heads / 8 KV heads
 code predictor: 5 layers, hidden 1024, 15 acoustic steps/frame
 weights: 480 tensors in 1 file(s), 3.59 GiB
 ```
+
+## CUDA validation
+
+Compile the inherited kernels with NVRTC for the installed GPU:
+
+```bash
+CARGO_TARGET_DIR=/tmp/chew-tts-target \
+  cargo run --release -p chew-tts -- cuda-smoke --gpu 0
+```
+
+Run one real Qwen talker decoder layer:
+
+```bash
+CARGO_TARGET_DIR=/tmp/chew-tts-target \
+  cargo run --release -p chew-tts -- \
+  cuda-layer-smoke /models/Qwen3-TTS-12Hz-1.7B-VoiceDesign \
+  --gpu 0 --layer 0
+```
+
+An optional raw little-endian F32 output can be supplied with `--reference`.
+The command then fails if CUDA and the reference differ beyond the configured
+correctness tolerance.
 
 ## Requirements
 

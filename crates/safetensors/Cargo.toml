@@ -6,6 +6,7 @@ license.workspace = true
 description = "Memory-mapped Safetensors metadata and tensor access for Chew TTS"
 
 [dependencies]
+half.workspace = true
 memmap2.workspace = true
 safetensors.workspace = true
 thiserror.workspace = true
