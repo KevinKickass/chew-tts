@@ -94,6 +94,35 @@ impl MappedSafetensors {
             Ok((shape, values))
         })?
     }
+
+    pub fn tensor_f32(&self, name: &str) -> Result<(Vec<usize>, Vec<f32>), Error> {
+        self.with_tensor(name, |tensor| {
+            let shape = tensor.shape().to_vec();
+            let values = match tensor.dtype() {
+                Dtype::F16 => tensor
+                    .data()
+                    .chunks_exact(2)
+                    .map(|bytes| {
+                        half::f16::from_bits(u16::from_le_bytes([bytes[0], bytes[1]])).to_f32()
+                    })
+                    .collect(),
+                Dtype::BF16 => tensor
+                    .data()
+                    .chunks_exact(2)
+                    .map(|bytes| {
+                        f32::from_bits(u32::from(u16::from_le_bytes([bytes[0], bytes[1]])) << 16)
+                    })
+                    .collect(),
+                Dtype::F32 => tensor
+                    .data()
+                    .chunks_exact(4)
+                    .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("four-byte chunk")))
+                    .collect(),
+                dtype => return Err(Error::UnsupportedDtype(dtype)),
+            };
+            Ok((shape, values))
+        })?
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -133,6 +162,9 @@ mod tests {
         let (shape, values) = mapped.tensor_f16("weight").unwrap();
         assert_eq!(shape, vec![2]);
         assert_eq!(values, vec![half::f16::ZERO; 2]);
+        let (shape, values) = mapped.tensor_f32("weight").unwrap();
+        assert_eq!(shape, vec![2]);
+        assert_eq!(values, vec![0.0; 2]);
 
         std::fs::remove_file(path).unwrap();
     }

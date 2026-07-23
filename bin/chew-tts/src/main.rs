@@ -1,7 +1,7 @@
 use anyhow::Context;
 use chew_model_qwen3_tts::{
-    CodePredictorTransformer, TalkerDecoderLayer, TalkerLayerKvCache, TalkerTransformer,
-    inspect_model, load_f16_tensor,
+    CodePredictorTransformer, CodecQuantizer, TalkerDecoderLayer, TalkerLayerKvCache,
+    TalkerTransformer, inspect_model, load_f16_tensor,
 };
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -94,6 +94,29 @@ enum Command {
         #[arg(long, default_value_t = 3)]
         repeats: usize,
         /// Optional raw little-endian f32 reference output.
+        #[arg(long)]
+        reference: Option<PathBuf>,
+    },
+    /// Decode one 16-codebook frame into a codec latent.
+    CudaCodecLatentSmoke {
+        /// Directory containing speech_tokenizer/model.safetensors.
+        tokenizer_dir: PathBuf,
+        /// Zero-based CUDA device index.
+        #[arg(long, default_value_t = 0)]
+        gpu: usize,
+        /// Sixteen comma-separated codec IDs.
+        #[arg(
+            long,
+            default_value = "42,146,1921,714,1858,646,2036,1792,1614,912,581,708,1202,991,1341,259"
+        )]
+        codes: String,
+        /// Also apply the codec's causal pre-convolution.
+        #[arg(long)]
+        preconv: bool,
+        /// Also run the codec's eight-layer pre-transformer.
+        #[arg(long)]
+        transformer: bool,
+        /// Optional raw little-endian f32 reference latent.
         #[arg(long)]
         reference: Option<PathBuf>,
     },
@@ -199,7 +222,73 @@ fn main() -> anyhow::Result<()> {
             repeats,
             reference.as_deref(),
         )?,
+        Command::CudaCodecLatentSmoke {
+            tokenizer_dir,
+            gpu,
+            codes,
+            preconv,
+            transformer,
+            reference,
+        } => cuda_codec_latent_smoke(
+            &tokenizer_dir,
+            gpu,
+            &codes,
+            preconv,
+            transformer,
+            reference.as_deref(),
+        )?,
     }
+    Ok(())
+}
+
+fn cuda_codec_latent_smoke(
+    tokenizer_dir: &PathBuf,
+    gpu: usize,
+    codes: &str,
+    preconv: bool,
+    transformer: bool,
+    reference: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    let codes = codes
+        .split(',')
+        .map(|value| value.trim().parse::<i32>())
+        .collect::<Result<Vec<_>, _>>()
+        .context("codec IDs must be comma-separated integers")?;
+    let allocator = chew_vram::VramAllocator::init()?;
+    if gpu >= allocator.gpu_count() {
+        anyhow::bail!(
+            "GPU index {gpu} is out of range; detected {} device(s)",
+            allocator.gpu_count()
+        );
+    }
+    let free_before = allocator.free_bytes(gpu)?;
+    let stream = allocator.stream(gpu);
+    let mut kernels = chew_kernel::GpuKernels::load(stream, 512 * 256, 512)?;
+    let quantizer = CodecQuantizer::load(tokenizer_dir, stream)?;
+    let free_loaded = allocator.free_bytes(gpu)?;
+    let started = std::time::Instant::now();
+    let latent = if transformer {
+        quantizer.decode_frame_transformer(&codes, &mut kernels)?
+    } else if preconv {
+        quantizer.decode_frame_preconv(&codes, &mut kernels)?
+    } else {
+        quantizer.decode_frame(&codes, &mut kernels)?
+    };
+    let stage = if transformer {
+        "transformer"
+    } else if preconv {
+        "pre-conv"
+    } else {
+        "quantizer"
+    };
+    println!(
+        "codec {}: {:.1} MiB VRAM, {:.3}ms, output[0..8]={:?}",
+        stage,
+        free_before.saturating_sub(free_loaded) as f64 / 1024.0_f64.powi(2),
+        started.elapsed().as_secs_f64() * 1000.0,
+        &latent[..8]
+    );
+    compare_reference(&latent, reference, if transformer { 0.1 } else { 0.02 })?;
     Ok(())
 }
 

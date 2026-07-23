@@ -26,13 +26,14 @@ Implemented:
 - a native dense F16 decode GEMV path;
 - GPU-resident execution of the five-layer Qwen code predictor;
 - complete 15-codebook acoustic generation with GPU embeddings and argmax;
+- native decoding of all 16 codec codebooks into the 512-channel latent;
+- the codec's causal pre-convolution and eight-layer transformer on CUDA;
 - PyTorch parity checks for real Qwen weights, RoPE, GQA, and cached decoding.
 
 Next:
 
-- code-predictor decode and GPU-side sampling;
 - one CUDA graph for a complete 16-codebook audio frame;
-- the 12 Hz speech-tokenizer decoder;
+- the convolutional upsampling stages of the 12 Hz speech-tokenizer decoder;
 - speaker and reference-audio encoders for voice cloning;
 - Kokoro as the second model family.
 
@@ -120,6 +121,21 @@ executes in approximately 0.7 ms per codebook step. A warm, complete
 15-codebook predictor frame including projection, embeddings, heads, and GPU
 argmax takes approximately 10 ms. Talker plus predictor therefore take roughly
 17 ms per 80-ms audio frame before the speech codec.
+
+Decode one complete codec frame through its quantizers, causal pre-convolution,
+and eight-layer transformer:
+
+```bash
+CARGO_TARGET_DIR=/tmp/chew-tts-target \
+  cargo run --release -p chew-tts -- \
+  cuda-codec-latent-smoke /models/Qwen3-TTS-12Hz-1.7B-VoiceDesign/speech_tokenizer \
+  --gpu 0 --transformer
+```
+
+This codec front end uses approximately 108 MiB of VRAM and takes approximately
+0.8 ms per frame on an RTX 3080. Its output is checked against an independent
+F32 PyTorch implementation; the measured maximum absolute delta is below
+0.00005 for the documented validation frame.
 
 ## Requirements
 

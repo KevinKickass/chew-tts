@@ -1,7 +1,9 @@
+mod codec;
 mod config;
 mod cuda;
 mod predictor;
 
+pub use codec::CodecQuantizer;
 pub use config::{
     CodePredictorConfig, ModelType, Qwen3TtsConfig, SpeakerEncoderConfig, TalkerConfig,
 };
@@ -22,6 +24,11 @@ pub struct ModelInspection {
 pub struct HostF16Tensor {
     pub shape: Vec<usize>,
     pub values: Vec<half::f16>,
+}
+
+pub struct HostF32Tensor {
+    pub shape: Vec<usize>,
+    pub values: Vec<f32>,
 }
 
 pub fn inspect_model(model_dir: impl AsRef<Path>) -> Result<ModelInspection, Error> {
@@ -82,6 +89,31 @@ pub fn load_f16_tensor(
         {
             let (shape, values) = mapped.tensor_f16(tensor_name)?;
             return Ok(HostF16Tensor { shape, values });
+        }
+    }
+    Err(Error::TensorNotFound(tensor_name.to_string()))
+}
+
+pub fn load_f32_tensor(
+    model_dir: impl AsRef<Path>,
+    tensor_name: &str,
+) -> Result<HostF32Tensor, Error> {
+    let model_dir = model_dir.as_ref();
+    let mut weight_files = fs::read_dir(model_dir)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "safetensors"))
+        .collect::<Vec<_>>();
+    weight_files.sort();
+    for path in weight_files {
+        let mapped = MappedSafetensors::open(path)?;
+        if mapped
+            .tensor_infos()?
+            .iter()
+            .any(|tensor| tensor.name == tensor_name)
+        {
+            let (shape, values) = mapped.tensor_f32(tensor_name)?;
+            return Ok(HostF32Tensor { shape, values });
         }
     }
     Err(Error::TensorNotFound(tensor_name.to_string()))

@@ -74,6 +74,7 @@ pub struct OpsKernels {
     // MoE GPU router
     softmax_topk: CudaFunction,
     fused_moe_router: CudaFunction,
+    conv1d_causal_f16: CudaFunction,
 }
 
 impl OpsKernels {
@@ -138,12 +139,58 @@ impl OpsKernels {
             rope_kv_write: loader::get_fn(&module, "rope_kv_write")?,
             softmax_topk: loader::get_fn(&module, "softmax_topk")?,
             fused_moe_router: loader::get_fn(&module, "fused_moe_router")?,
+            conv1d_causal_f16: loader::get_fn(&module, "conv1d_causal_f16")?,
             _module: module,
         })
     }
 
     pub fn stream(&self) -> &Arc<CudaStream> {
         &self.stream
+    }
+
+    /// Causal 1D convolution over channel-first f16 data.
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv1d_causal_f16(
+        &self,
+        x: &CudaSlice<half::f16>,
+        weight: &CudaSlice<half::f16>,
+        bias: &CudaSlice<half::f16>,
+        out: &mut CudaSlice<half::f16>,
+        in_channels: u32,
+        out_channels: u32,
+        seq_len: u32,
+        kernel_size: u32,
+        dilation: u32,
+        groups: u32,
+    ) -> Result<(), KernelError> {
+        let ic = in_channels as i32;
+        let oc = out_channels as i32;
+        let sl = seq_len as i32;
+        let ks = kernel_size as i32;
+        let dil = dilation as i32;
+        let grp = groups as i32;
+        let mut args: [*mut c_void; 10] = [
+            slice_ptr(x),
+            slice_ptr(weight),
+            slice_ptr(bias),
+            slice_ptr_mut(out),
+            scalar_ptr(&ic),
+            scalar_ptr(&oc),
+            scalar_ptr(&sl),
+            scalar_ptr(&ks),
+            scalar_ptr(&dil),
+            scalar_ptr(&grp),
+        ];
+        unsafe {
+            self.fast.fire(
+                &self.conv1d_causal_f16,
+                (out_channels, seq_len, 1),
+                (256, 1, 1),
+                0,
+                &mut args,
+            );
+        }
+        Ok(())
     }
 
     /// RMSNorm: f16 input → f16 output.
