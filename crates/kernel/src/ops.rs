@@ -199,7 +199,7 @@ impl OpsKernels {
         unsafe {
             self.fast.fire(
                 &self.conv1d_causal_f16,
-                (out_channels, seq_len, 1),
+                (seq_len, out_channels, 1),
                 (256, 1, 1),
                 0,
                 &mut args,
@@ -241,7 +241,7 @@ impl OpsKernels {
         unsafe {
             self.fast.fire(
                 &self.conv_transpose1d_causal_f16,
-                (out_channels, input_len * stride, 1),
+                (input_len * stride, out_channels, 1),
                 (256, 1, 1),
                 0,
                 &mut args,

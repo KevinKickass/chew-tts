@@ -2100,8 +2100,10 @@ __global__ void conv1d_causal_f16(const __half* __restrict__ x,
                                   int kernel_size,
                                   int dilation,
                                   int groups) {
-    const int out_channel = blockIdx.x;
-    const int position = blockIdx.y;
+    // Sequence length can exceed CUDA's 65,535-block Y limit for longer
+    // audio. Keep positions on the much larger X grid dimension.
+    const int position = blockIdx.x;
+    const int out_channel = blockIdx.y;
     if (out_channel >= out_channels || position >= seq_len) return;
     const int channels_per_group = in_channels / groups;
     const int outputs_per_group = out_channels / groups;
@@ -2158,8 +2160,8 @@ __global__ void conv_transpose1d_causal_f16(
     int input_len,
     int kernel_size,
     int stride) {
-    const int out_channel = blockIdx.x;
-    const int position = blockIdx.y;
+    const int position = blockIdx.x;
+    const int out_channel = blockIdx.y;
     const int output_len = input_len * stride;
     if (out_channel >= out_channels || position >= output_len) return;
     float sum = 0.0f;

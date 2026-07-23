@@ -230,6 +230,11 @@ approximately 4.2 seconds from a warm filesystem cache. Debug builds are not
 representative because their element-wise F16 conversion is intentionally
 unoptimized.
 
+A 48-frame stability run produces 3.84 seconds of continuous audio in
+approximately 2.14 seconds (RTF 0.56). Convolution kernels place the audio
+timeline on CUDA's large X grid dimension, so output is not limited by the
+65,535-block Y dimension once a waveform exceeds roughly 2.7 seconds.
+
 ## Requirements
 
 - NVIDIA GPU with compute capability 7.0 or newer

@@ -199,9 +199,9 @@ enum Command {
         /// Language name from the model config.
         #[arg(long, default_value = "german")]
         language: String,
-        /// Maximum number of 80-ms codec frames.
-        #[arg(long, default_value_t = 12)]
-        frames: usize,
+        /// Safety limit in 80-ms codec frames; generation normally stops at EOS.
+        #[arg(long = "max-frames", alias = "frames", default_value_t = 2048)]
+        max_frames: usize,
         /// Deterministic sampling seed.
         #[arg(long, default_value_t = 42)]
         seed: u64,
@@ -376,7 +376,7 @@ fn main() -> anyhow::Result<()> {
             text,
             instruction,
             language,
-            frames,
+            max_frames,
             seed,
             temperature,
             top_k,
@@ -387,7 +387,7 @@ fn main() -> anyhow::Result<()> {
             &text,
             &instruction,
             &language,
-            frames,
+            max_frames,
             seed,
             temperature,
             top_k,
@@ -512,6 +512,11 @@ fn cuda_predictor_codec_smoke(
     if frames == 0 {
         anyhow::bail!("frames must be non-zero");
     }
+    if let Some(parent) = wav.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        if !parent.is_dir() {
+            anyhow::bail!("WAV output directory does not exist: {}", parent.display());
+        }
+    }
     let inspection = inspect_model(model_dir)?;
     let config = &inspection.config.talker_config.code_predictor_config;
     let allocator = chew_vram::VramAllocator::init()?;
@@ -579,14 +584,19 @@ fn cuda_voice_design_smoke(
     text: &str,
     instruction: &str,
     language: &str,
-    frames: usize,
+    max_frames: usize,
     mut seed: u64,
     temperature: f32,
     top_k: usize,
     wav: &std::path::Path,
 ) -> anyhow::Result<()> {
-    if frames == 0 {
-        anyhow::bail!("frames must be non-zero");
+    if max_frames == 0 {
+        anyhow::bail!("max-frames must be non-zero");
+    }
+    if let Some(parent) = wav.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        if !parent.is_dir() {
+            anyhow::bail!("WAV output directory does not exist: {}", parent.display());
+        }
     }
     let inspection = inspect_model(model_dir)?;
     let config = &inspection.config.talker_config;
@@ -644,7 +654,7 @@ fn cuda_voice_design_smoke(
         language_codec_id,
         &mut kernels,
     )?;
-    let max_seq_len = inputs.prefill_tokens + frames;
+    let max_seq_len = inputs.prefill_tokens + max_frames;
     if max_seq_len > config.max_position_embeddings {
         anyhow::bail!(
             "prompt plus generation is {max_seq_len} tokens, model limit is {}",
@@ -660,7 +670,7 @@ fn cuda_voice_design_smoke(
         &mut kernels,
     )?;
     let mut last_hidden = normalized[normalized.len() - config.hidden_size..].to_vec();
-    let mut generated_semantics = Vec::with_capacity(frames);
+    let mut generated_semantics = Vec::with_capacity(max_frames);
     let mut semantic = frontend.semantic_speech_sample(
         &last_hidden,
         &generated_semantics,
@@ -674,8 +684,8 @@ fn cuda_voice_design_smoke(
     let prompt_elapsed = prompt_started.elapsed();
 
     let generation_started = std::time::Instant::now();
-    let mut codec_frames = Vec::with_capacity(frames);
-    for frame_index in 0..frames {
+    let mut codec_frames = Vec::with_capacity(max_frames.min(1024));
+    for frame_index in 0..max_frames {
         if semantic == 2_150 {
             println!("codec EOS at frame {frame_index}");
             break;
@@ -699,9 +709,6 @@ fn cuda_voice_design_smoke(
             frame_started.elapsed().as_secs_f64() * 1000.0
         );
 
-        if frame_index + 1 == frames {
-            break;
-        }
         let semantic_embedding = frontend.codec_embeddings(&[semantic], &mut kernels)?;
         let acoustic_embedding = predictor.acoustic_embeddings_sum(&acoustic, &mut kernels)?;
         let text_embedding = if frame_index < inputs.trailing_tokens {
@@ -732,6 +739,7 @@ fn cuda_voice_design_smoke(
     if codec_frames.is_empty() {
         anyhow::bail!("model emitted EOS before producing audio");
     }
+    let truncated = semantic != 2_150 && codec_frames.len() == max_frames;
 
     let decode_started = std::time::Instant::now();
     let audio = codec.decode_frames_audio(&codec_frames, &mut kernels)?;
@@ -757,6 +765,13 @@ fn cuda_voice_design_smoke(
         free_before.saturating_sub(free_loaded) as f64 / 1024.0_f64.powi(2),
         wav.display(),
     );
+    if truncated {
+        anyhow::bail!(
+            "generation reached the {max_frames}-frame safety limit before EOS; \
+             {} contains truncated audio",
+            wav.display()
+        );
+    }
     Ok(())
 }
 
