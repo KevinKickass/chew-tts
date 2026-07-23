@@ -1,0 +1,13 @@
+[package]
+name = "chew-model-kokoro"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Native Kokoro model configuration and checkpoint loading for Chew TTS"
+
+[dependencies]
+anyhow.workspace = true
+candle-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+zip.workspace = true

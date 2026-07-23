@@ -9,6 +9,7 @@ members = [
     "crates/tts-core",
     "crates/safetensors",
     "crates/model-qwen3-tts",
+    "crates/model-kokoro",
     "bin/chew-tts",
 ]
 
@@ -26,6 +27,7 @@ chew-engine = { path = "crates/engine" }
 chew-tts-core = { path = "crates/tts-core" }
 chew-safetensors = { path = "crates/safetensors" }
 chew-model-qwen3-tts = { path = "crates/model-qwen3-tts" }
+chew-model-kokoro = { path = "crates/model-kokoro" }
 
 # CUDA
 cudarc = { path = "cudarc-fork", features = ["std", "driver", "cublas", "nvrtc", "cuda-12060", "f16"] }
@@ -66,3 +68,5 @@ base64 = "0.22"
 hound = "3.5"
 rustfft = "6.2"
 sha2 = "0.10"
+candle-core = { version = "0.10.2", default-features = false }
+zip = { version = "7.2.0", default-features = false, features = ["deflate"] }

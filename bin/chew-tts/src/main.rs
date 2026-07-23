@@ -1,4 +1,5 @@
 use anyhow::Context;
+use chew_model_kokoro::{KokoroVoice, inspect_model as inspect_kokoro_model};
 use chew_model_qwen3_tts::{
     CodePredictorTransformer, CodecEncoder, CodecQuantizer, CodecTransformerSession,
     SpeakerEncoder, TalkerDecoderLayer, TalkerFrontend, TalkerLayerKvCache, TalkerTransformer,
@@ -68,6 +69,17 @@ enum Command {
     Inspect {
         /// Directory containing config.json and Safetensors weights.
         model_dir: PathBuf,
+    },
+    /// Validate a Kokoro model and print its native checkpoint geometry.
+    InspectKokoro {
+        /// Directory containing config.json and kokoro-v1_0.pth.
+        model_dir: PathBuf,
+        /// Optional official Kokoro .pt voice pack to validate.
+        #[arg(long)]
+        voice: Option<PathBuf>,
+        /// Optional already-phonemized input to validate and map to token IDs.
+        #[arg(long)]
+        phonemes: Option<String>,
     },
     /// Tokenize text with the model's local Qwen2 BPE files.
     Tokenize {
@@ -379,6 +391,68 @@ fn main() -> anyhow::Result<()> {
                 inspection.weight_files.len(),
                 inspection.total_weight_bytes as f64 / 1024.0_f64.powi(3)
             );
+        }
+        Command::InspectKokoro {
+            model_dir,
+            voice,
+            phonemes,
+        } => {
+            let inspection = inspect_kokoro_model(&model_dir)
+                .with_context(|| format!("could not inspect {}", model_dir.display()))?;
+            println!(
+                "Kokoro: {} tokens, context {}, hidden {}, style {}",
+                inspection.config.n_token,
+                inspection.config.plbert.max_position_embeddings,
+                inspection.config.hidden_dim,
+                inspection.config.style_dim,
+            );
+            println!(
+                "Albert: {} shared layers, hidden {}, {} heads",
+                inspection.config.plbert.num_hidden_layers,
+                inspection.config.plbert.hidden_size,
+                inspection.config.plbert.num_attention_heads,
+            );
+            println!(
+                "iSTFTNet: upsample {:?}, kernels {:?}, n_fft {}, hop {}",
+                inspection.config.istftnet.upsample_rates,
+                inspection.config.istftnet.upsample_kernel_sizes,
+                inspection.config.istftnet.gen_istft_n_fft,
+                inspection.config.istftnet.gen_istft_hop_size,
+            );
+            println!(
+                "weights: {} tensors, {:.2} MiB ({})",
+                inspection.tensors.len(),
+                inspection.total_weight_bytes as f64 / 1024.0_f64.powi(2),
+                inspection.checkpoint.display(),
+            );
+            if let Some(phonemes) = phonemes {
+                let tokens = inspection.config.tokenize_phonemes(&phonemes)?;
+                println!(
+                    "phonemes: {} mapped, {} skipped, {} tokens with boundaries",
+                    tokens.phoneme_count,
+                    tokens.skipped_phonemes,
+                    tokens.ids.len(),
+                );
+                if let Some(path) = voice.as_deref() {
+                    let voice = KokoroVoice::load(path, &inspection.config)?;
+                    let style = voice.style_for_phoneme_count(tokens.phoneme_count)?;
+                    println!(
+                        "voice: {} entries x {}, selected style {} finite values ({})",
+                        voice.entries(),
+                        voice.style_width(),
+                        style.len(),
+                        path.display(),
+                    );
+                }
+            } else if let Some(path) = voice.as_deref() {
+                let voice = KokoroVoice::load(path, &inspection.config)?;
+                println!(
+                    "voice: {} entries x {} finite values ({})",
+                    voice.entries(),
+                    voice.style_width(),
+                    path.display(),
+                );
+            }
         }
         Command::Tokenize { model_dir, text } => {
             let tokenizer = load_qwen_tokenizer(&model_dir)?;
