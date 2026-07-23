@@ -2163,12 +2163,15 @@ __global__ void conv_transpose1d_causal_f16(
     const int output_len = input_len * stride;
     if (out_channel >= out_channels || position >= output_len) return;
     float sum = 0.0f;
-    const int work = in_channels * kernel_size;
+    const int phase = position % stride;
+    const int kernels_for_phase =
+        phase < kernel_size ? 1 + (kernel_size - 1 - phase) / stride : 0;
+    const int work = in_channels * kernels_for_phase;
     for (int item = threadIdx.x; item < work; item += blockDim.x) {
-        const int input_channel = item / kernel_size;
-        const int kernel_index = item % kernel_size;
+        const int input_channel = item / kernels_for_phase;
+        const int kernel_index = phase + (item % kernels_for_phase) * stride;
         const int source = position - kernel_index;
-        if (source >= 0 && source % stride == 0) {
+        if (source >= 0) {
             const int input_position = source / stride;
             if (input_position < input_len) {
                 const int input_index = input_channel * input_len + input_position;
@@ -2225,6 +2228,37 @@ __global__ void gelu_erf_f16(const __half* __restrict__ x,
         const float value = __half2float(x[index]);
         out[index] = __float2half(
             0.5f * value * (1.0f + erff(value * 0.7071067811865475f)));
+    }
+}
+
+// Channel-wise SnakeBeta activation over channel-first data.
+__global__ void snake_beta_f16(const __half* __restrict__ x,
+                               const __half* __restrict__ alpha,
+                               const __half* __restrict__ beta,
+                               __half* __restrict__ out,
+                               int channels,
+                               int seq_len) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    const int n = channels * seq_len;
+    if (index < n) {
+        const int channel = index / seq_len;
+        const float value = __half2float(x[index]);
+        const float frequency = expf(__half2float(alpha[channel]));
+        const float magnitude = expf(__half2float(beta[channel])) + 1e-9f;
+        const float periodic = sinf(frequency * value);
+        out[index] = __float2half(value + periodic * periodic / magnitude);
+    }
+}
+
+__global__ void clamp_f16(const __half* __restrict__ x,
+                          __half* __restrict__ out,
+                          int n,
+                          float minimum,
+                          float maximum) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < n) {
+        const float value = __half2float(x[index]);
+        out[index] = __float2half(fminf(maximum, fmaxf(minimum, value)));
     }
 }
 

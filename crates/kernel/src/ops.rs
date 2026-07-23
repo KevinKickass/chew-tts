@@ -78,6 +78,8 @@ pub struct OpsKernels {
     conv_transpose1d_causal_f16: CudaFunction,
     transpose_f16: CudaFunction,
     gelu_erf_f16: CudaFunction,
+    snake_beta_f16: CudaFunction,
+    clamp_f16: CudaFunction,
 }
 
 impl OpsKernels {
@@ -149,6 +151,8 @@ impl OpsKernels {
             )?,
             transpose_f16: loader::get_fn(&module, "transpose_f16")?,
             gelu_erf_f16: loader::get_fn(&module, "gelu_erf_f16")?,
+            snake_beta_f16: loader::get_fn(&module, "snake_beta_f16")?,
+            clamp_f16: loader::get_fn(&module, "clamp_f16")?,
             _module: module,
         })
     }
@@ -291,6 +295,70 @@ impl OpsKernels {
         unsafe {
             self.fast.fire(
                 &self.gelu_erf_f16,
+                ((n + threads - 1) / threads, 1, 1),
+                (threads, 1, 1),
+                0,
+                &mut args,
+            );
+        }
+        Ok(())
+    }
+
+    /// Channel-wise SnakeBeta over channel-first f16 data.
+    pub fn snake_beta_f16(
+        &self,
+        x: &CudaSlice<half::f16>,
+        alpha: &CudaSlice<half::f16>,
+        beta: &CudaSlice<half::f16>,
+        out: &mut CudaSlice<half::f16>,
+        channels: u32,
+        seq_len: u32,
+    ) -> Result<(), KernelError> {
+        let n = channels * seq_len;
+        let threads = 256;
+        let channels_i = channels as i32;
+        let seq_len_i = seq_len as i32;
+        let mut args: [*mut c_void; 6] = [
+            slice_ptr(x),
+            slice_ptr(alpha),
+            slice_ptr(beta),
+            slice_ptr_mut(out),
+            scalar_ptr(&channels_i),
+            scalar_ptr(&seq_len_i),
+        ];
+        unsafe {
+            self.fast.fire(
+                &self.snake_beta_f16,
+                ((n + threads - 1) / threads, 1, 1),
+                (threads, 1, 1),
+                0,
+                &mut args,
+            );
+        }
+        Ok(())
+    }
+
+    /// Clamp every f16 element to an inclusive range.
+    pub fn clamp_f16(
+        &self,
+        x: &CudaSlice<half::f16>,
+        out: &mut CudaSlice<half::f16>,
+        n: u32,
+        minimum: f32,
+        maximum: f32,
+    ) -> Result<(), KernelError> {
+        let threads = 256;
+        let n_i = n as i32;
+        let mut args: [*mut c_void; 5] = [
+            slice_ptr(x),
+            slice_ptr_mut(out),
+            scalar_ptr(&n_i),
+            scalar_ptr(&minimum),
+            scalar_ptr(&maximum),
+        ];
+        unsafe {
+            self.fast.fire(
+                &self.clamp_f16,
                 ((n + threads - 1) / threads, 1, 1),
                 (threads, 1, 1),
                 0,

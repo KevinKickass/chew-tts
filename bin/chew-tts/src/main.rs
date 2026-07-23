@@ -119,6 +119,9 @@ enum Command {
         /// Also run both 2x ConvNeXt upsampling stages.
         #[arg(long)]
         upsample: bool,
+        /// Decode the complete 1,920-sample waveform frame.
+        #[arg(long)]
+        audio: bool,
         /// Number of times to run the selected codec stage.
         #[arg(long, default_value_t = 1)]
         repeats: usize,
@@ -235,6 +238,7 @@ fn main() -> anyhow::Result<()> {
             preconv,
             transformer,
             upsample,
+            audio,
             repeats,
             reference,
         } => cuda_codec_latent_smoke(
@@ -244,6 +248,7 @@ fn main() -> anyhow::Result<()> {
             preconv,
             transformer,
             upsample,
+            audio,
             repeats,
             reference.as_deref(),
         )?,
@@ -258,6 +263,7 @@ fn cuda_codec_latent_smoke(
     preconv: bool,
     transformer: bool,
     upsample: bool,
+    audio: bool,
     repeats: usize,
     reference: Option<&std::path::Path>,
 ) -> anyhow::Result<()> {
@@ -282,7 +288,9 @@ fn cuda_codec_latent_smoke(
     let quantizer = CodecQuantizer::load(tokenizer_dir, stream)?;
     let free_loaded = allocator.free_bytes(gpu)?;
     if repeats > 1 {
-        if upsample {
+        if audio {
+            quantizer.decode_frame_audio(&codes, &mut kernels)?;
+        } else if upsample {
             quantizer.decode_frame_upsampled(&codes, &mut kernels)?;
         } else if transformer {
             quantizer.decode_frame_transformer(&codes, &mut kernels)?;
@@ -295,7 +303,9 @@ fn cuda_codec_latent_smoke(
     let started = std::time::Instant::now();
     let mut latent = Vec::new();
     for _ in 0..repeats {
-        latent = if upsample {
+        latent = if audio {
+            quantizer.decode_frame_audio(&codes, &mut kernels)?
+        } else if upsample {
             quantizer.decode_frame_upsampled(&codes, &mut kernels)?
         } else if transformer {
             quantizer.decode_frame_transformer(&codes, &mut kernels)?
@@ -305,7 +315,9 @@ fn cuda_codec_latent_smoke(
             quantizer.decode_frame(&codes, &mut kernels)?
         };
     }
-    let stage = if upsample {
+    let stage = if audio {
+        "audio"
+    } else if upsample {
         "upsampled"
     } else if transformer {
         "transformer"
@@ -325,7 +337,11 @@ fn cuda_codec_latent_smoke(
     compare_reference(
         &latent,
         reference,
-        if transformer || upsample { 0.1 } else { 0.02 },
+        if audio || transformer || upsample {
+            0.1
+        } else {
+            0.02
+        },
     )?;
     Ok(())
 }

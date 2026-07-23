@@ -29,12 +29,14 @@ Implemented:
 - native decoding of all 16 codec codebooks into the 512-channel latent;
 - the codec's causal pre-convolution and eight-layer transformer on CUDA;
 - both 2x causal ConvNeXt codec upsampling stages;
+- the complete BigVGAN waveform decoder, including SnakeBeta activations,
+  dilated residual units, and all four upsampling blocks;
 - PyTorch parity checks for real Qwen weights, RoPE, GQA, and cached decoding.
 
 Next:
 
 - one CUDA graph for a complete 16-codebook audio frame;
-- the BigVGAN waveform decoder of the 12 Hz speech tokenizer;
+- multi-frame codec decoding with preserved causal history;
 - speaker and reference-audio encoders for voice cloning;
 - Kokoro as the second model family.
 
@@ -143,6 +145,14 @@ upsampling stages. After one cuBLAS warm-up pass, the complete path through the
 four 1024-channel output steps takes approximately 1.1 ms per frame on the same
 GPU. Against the independent F32 reference, the mean absolute delta is below
 0.002.
+
+Add `--audio --repeats 10` to run through the complete BigVGAN decoder and
+produce one 1,920-sample frame at 24 kHz. The warm single-frame path takes
+approximately 24 ms on an RTX 3080, including the codec front end. Its mean
+absolute delta against the independent F32 waveform reference is below 0.0002
+and its maximum delta below 0.0009. Multi-frame decoding is still required
+before these isolated frames can be joined into continuous speech, because
+the causal transformer and convolutions must retain their preceding context.
 
 ## Requirements
 

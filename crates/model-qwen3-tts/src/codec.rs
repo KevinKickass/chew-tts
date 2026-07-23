@@ -39,6 +39,31 @@ struct CodecUpsampleStage {
     gamma: CudaSlice<f16>,
 }
 
+struct SnakeBetaWeights {
+    alpha: CudaSlice<f16>,
+    beta: CudaSlice<f16>,
+}
+
+struct CodecResidualUnit {
+    first_activation: SnakeBetaWeights,
+    first_weight: CudaSlice<f16>,
+    first_bias: CudaSlice<f16>,
+    second_activation: SnakeBetaWeights,
+    second_weight: CudaSlice<f16>,
+    second_bias: CudaSlice<f16>,
+    dilation: usize,
+}
+
+struct CodecDecoderBlock {
+    activation: SnakeBetaWeights,
+    transposed_weight: CudaSlice<f16>,
+    transposed_bias: CudaSlice<f16>,
+    residual_units: Vec<CodecResidualUnit>,
+    in_channels: usize,
+    out_channels: usize,
+    rate: usize,
+}
+
 /// Qwen 12-Hz codec codebooks and their 1x1 output projections.
 pub struct CodecQuantizer {
     first_codebook: CudaSlice<f16>,
@@ -54,6 +79,12 @@ pub struct CodecQuantizer {
     transformer_output_weight: CudaSlice<f16>,
     transformer_output_bias: CudaSlice<f16>,
     upsample_stages: Vec<CodecUpsampleStage>,
+    decoder_input_weight: CudaSlice<f16>,
+    decoder_input_bias: CudaSlice<f16>,
+    decoder_blocks: Vec<CodecDecoderBlock>,
+    decoder_final_activation: SnakeBetaWeights,
+    decoder_final_weight: CudaSlice<f16>,
+    decoder_final_bias: CudaSlice<f16>,
 }
 
 impl CodecQuantizer {
@@ -167,6 +198,66 @@ impl CodecQuantizer {
                 gamma: load(&format!("{prefix}.1.gamma"), &[1024])?,
             });
         }
+        let load_snake = |prefix: &str, channels: usize| -> anyhow::Result<SnakeBetaWeights> {
+            Ok(SnakeBetaWeights {
+                alpha: load(&format!("{prefix}.alpha"), &[channels])?,
+                beta: load(&format!("{prefix}.beta"), &[channels])?,
+            })
+        };
+        let decoder_input_weight = load("decoder.decoder.0.conv.weight", &[1536, 1024, 7])?;
+        let decoder_input_bias = load("decoder.decoder.0.conv.bias", &[1536])?;
+        let mut decoder_blocks = Vec::with_capacity(4);
+        for (block, (in_channels, out_channels, rate)) in [
+            (1536usize, 768usize, 8usize),
+            (768, 384, 5),
+            (384, 192, 4),
+            (192, 96, 3),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let prefix = format!("decoder.decoder.{}", block + 1);
+            let mut residual_units = Vec::with_capacity(3);
+            for (unit, dilation) in [1usize, 3, 9].into_iter().enumerate() {
+                let residual_prefix = format!("{prefix}.block.{}", unit + 2);
+                residual_units.push(CodecResidualUnit {
+                    first_activation: load_snake(&format!("{residual_prefix}.act1"), out_channels)?,
+                    first_weight: load(
+                        &format!("{residual_prefix}.conv1.conv.weight"),
+                        &[out_channels, out_channels, 7],
+                    )?,
+                    first_bias: load(
+                        &format!("{residual_prefix}.conv1.conv.bias"),
+                        &[out_channels],
+                    )?,
+                    second_activation: load_snake(
+                        &format!("{residual_prefix}.act2"),
+                        out_channels,
+                    )?,
+                    second_weight: load(
+                        &format!("{residual_prefix}.conv2.conv.weight"),
+                        &[out_channels, out_channels, 1],
+                    )?,
+                    second_bias: load(
+                        &format!("{residual_prefix}.conv2.conv.bias"),
+                        &[out_channels],
+                    )?,
+                    dilation,
+                });
+            }
+            decoder_blocks.push(CodecDecoderBlock {
+                activation: load_snake(&format!("{prefix}.block.0"), in_channels)?,
+                transposed_weight: load(
+                    &format!("{prefix}.block.1.conv.weight"),
+                    &[in_channels, out_channels, rate * 2],
+                )?,
+                transposed_bias: load(&format!("{prefix}.block.1.conv.bias"), &[out_channels])?,
+                residual_units,
+                in_channels,
+                out_channels,
+                rate,
+            });
+        }
         Ok(Self {
             first_codebook,
             rest_codebooks,
@@ -184,6 +275,12 @@ impl CodecQuantizer {
             )?,
             transformer_output_bias: load("decoder.pre_transformer.output_proj.bias", &[1024])?,
             upsample_stages,
+            decoder_input_weight,
+            decoder_input_bias,
+            decoder_blocks,
+            decoder_final_activation: load_snake("decoder.decoder.5", 96)?,
+            decoder_final_weight: load("decoder.decoder.6.conv.weight", &[1, 96, 7])?,
+            decoder_final_bias: load("decoder.decoder.6.conv.bias", &[1])?,
         })
     }
 
@@ -582,6 +679,148 @@ impl CodecQuantizer {
         stream.synchronize()?;
         let mut output_host = vec![f16::ZERO; CHANNELS * seq_len];
         stream.memcpy_dtoh(&hidden, &mut output_host)?;
+        Ok(output_host.into_iter().map(f16::to_f32).collect())
+    }
+
+    /// Decode one complete 12.5-Hz codec frame into 1,920 PCM samples at 24 kHz.
+    pub fn decode_frame_audio(
+        &self,
+        codes: &[i32],
+        kernels: &mut GpuKernels,
+    ) -> anyhow::Result<Vec<f32>> {
+        let upsampled = self.decode_frame_upsampled(codes, kernels)?;
+        let stream = Arc::clone(kernels.ops.stream());
+        let upsampled = upsampled.into_iter().map(f16::from_f32).collect::<Vec<_>>();
+        let upsampled = stream.clone_htod(&upsampled)?;
+        let mut seq_len = 4usize;
+        let mut hidden = stream.alloc_zeros::<f16>(1536 * seq_len)?;
+        kernels.ops.conv1d_causal_f16(
+            &upsampled,
+            &self.decoder_input_weight,
+            &self.decoder_input_bias,
+            &mut hidden,
+            1024,
+            1536,
+            seq_len as u32,
+            7,
+            1,
+            1,
+        )?;
+
+        for block in &self.decoder_blocks {
+            let mut activated = stream.alloc_zeros::<f16>(block.in_channels * seq_len)?;
+            kernels.ops.snake_beta_f16(
+                &hidden,
+                &block.activation.alpha,
+                &block.activation.beta,
+                &mut activated,
+                block.in_channels as u32,
+                seq_len as u32,
+            )?;
+            let output_len = seq_len * block.rate;
+            let mut output = stream.alloc_zeros::<f16>(block.out_channels * output_len)?;
+            kernels.ops.conv_transpose1d_causal_f16(
+                &activated,
+                &block.transposed_weight,
+                &block.transposed_bias,
+                &mut output,
+                block.in_channels as u32,
+                block.out_channels as u32,
+                seq_len as u32,
+                (block.rate * 2) as u32,
+                block.rate as u32,
+            )?;
+
+            for unit in &block.residual_units {
+                let mut first_activation =
+                    stream.alloc_zeros::<f16>(block.out_channels * output_len)?;
+                kernels.ops.snake_beta_f16(
+                    &output,
+                    &unit.first_activation.alpha,
+                    &unit.first_activation.beta,
+                    &mut first_activation,
+                    block.out_channels as u32,
+                    output_len as u32,
+                )?;
+                let mut first_conv = stream.alloc_zeros::<f16>(block.out_channels * output_len)?;
+                kernels.ops.conv1d_causal_f16(
+                    &first_activation,
+                    &unit.first_weight,
+                    &unit.first_bias,
+                    &mut first_conv,
+                    block.out_channels as u32,
+                    block.out_channels as u32,
+                    output_len as u32,
+                    7,
+                    unit.dilation as u32,
+                    1,
+                )?;
+                let mut second_activation =
+                    stream.alloc_zeros::<f16>(block.out_channels * output_len)?;
+                kernels.ops.snake_beta_f16(
+                    &first_conv,
+                    &unit.second_activation.alpha,
+                    &unit.second_activation.beta,
+                    &mut second_activation,
+                    block.out_channels as u32,
+                    output_len as u32,
+                )?;
+                let mut second_conv = stream.alloc_zeros::<f16>(block.out_channels * output_len)?;
+                kernels.ops.conv1d_causal_f16(
+                    &second_activation,
+                    &unit.second_weight,
+                    &unit.second_bias,
+                    &mut second_conv,
+                    block.out_channels as u32,
+                    block.out_channels as u32,
+                    output_len as u32,
+                    1,
+                    1,
+                    1,
+                )?;
+                let mut residual = stream.alloc_zeros::<f16>(block.out_channels * output_len)?;
+                kernels.ops.add_f16(
+                    &output,
+                    &second_conv,
+                    &mut residual,
+                    (block.out_channels * output_len) as u32,
+                )?;
+                output = residual;
+            }
+            hidden = output;
+            seq_len = output_len;
+        }
+
+        ensure!(seq_len == 1920, "codec produced {seq_len} samples");
+        let mut final_activation = stream.alloc_zeros::<f16>(96 * seq_len)?;
+        kernels.ops.snake_beta_f16(
+            &hidden,
+            &self.decoder_final_activation.alpha,
+            &self.decoder_final_activation.beta,
+            &mut final_activation,
+            96,
+            seq_len as u32,
+        )?;
+        let mut waveform = stream.alloc_zeros::<f16>(seq_len)?;
+        kernels.ops.conv1d_causal_f16(
+            &final_activation,
+            &self.decoder_final_weight,
+            &self.decoder_final_bias,
+            &mut waveform,
+            96,
+            1,
+            seq_len as u32,
+            7,
+            1,
+            1,
+        )?;
+        let mut clamped = stream.alloc_zeros::<f16>(seq_len)?;
+        kernels
+            .ops
+            .clamp_f16(&waveform, &mut clamped, seq_len as u32, -1.0, 1.0)?;
+        stream.synchronize()?;
+        let mut output_host = vec![f16::ZERO; seq_len];
+        stream.memcpy_dtoh(&clamped, &mut output_host)?;
         Ok(output_host.into_iter().map(f16::to_f32).collect())
     }
 }
