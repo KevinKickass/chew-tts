@@ -96,6 +96,36 @@ impl KokoroGeneratorResBlock {
         kernels
             .ops
             .transpose_f16(&rows, &mut hidden, frames as u32, self.channels as u32)?;
+        let hidden = self.forward_device(&hidden, frames, style, kernels)?;
+        let mut output = stream.alloc_zeros::<f16>(hidden.len())?;
+        kernels
+            .ops
+            .transpose_f16(&hidden, &mut output, self.channels as u32, frames as u32)?;
+        stream.synchronize()?;
+        let mut host = vec![f16::ZERO; output.len()];
+        stream.memcpy_dtoh(&output, &mut host)?;
+        Ok(host.into_iter().map(f16::to_f32).collect())
+    }
+
+    /// Channel-major device input/output `[channels, frames]`.
+    ///
+    /// Keeping this path on the device is important: a generator invocation runs
+    /// eight of these blocks and the old frame-major wrapper forced a full
+    /// device-to-host-to-device round trip for every block.
+    pub fn forward_device(
+        &self,
+        input: &CudaSlice<f16>,
+        frames: usize,
+        style: &[f32],
+        kernels: &mut GpuKernels,
+    ) -> anyhow::Result<CudaSlice<f16>> {
+        ensure!(
+            input.len() == frames * self.channels && style.len() == 128,
+            "invalid Kokoro generator residual input"
+        );
+        let stream = Arc::clone(kernels.ops.stream());
+        let mut hidden = stream.alloc_zeros::<f16>(input.len())?;
+        stream.memcpy_dtod(input, &mut hidden)?;
         for stage in &self.stages {
             let normalized = stage
                 .norm1
@@ -134,14 +164,7 @@ impl KokoroGeneratorResBlock {
                 .add_f16(&hidden, &second, &mut residual, hidden.len() as u32)?;
             hidden = residual;
         }
-        let mut output = stream.alloc_zeros::<f16>(hidden.len())?;
-        kernels
-            .ops
-            .transpose_f16(&hidden, &mut output, self.channels as u32, frames as u32)?;
-        stream.synchronize()?;
-        let mut host = vec![f16::ZERO; output.len()];
-        stream.memcpy_dtoh(&output, &mut host)?;
-        Ok(host.into_iter().map(f16::to_f32).collect())
+        Ok(hidden)
     }
 }
 
@@ -213,21 +236,36 @@ fn run_conv(
     kernels: &mut GpuKernels,
 ) -> anyhow::Result<CudaSlice<f16>> {
     let stream = Arc::clone(kernels.ops.stream());
-    let mut output = stream.alloc_zeros::<f16>(channels * frames)?;
-    kernels.ops.conv1d_general_f16(
+    let width = channels * conv.kernel;
+    let padding = (conv.kernel * dilation - dilation) / 2;
+    let mut unfolded = stream.alloc_zeros::<f16>(frames * width)?;
+    kernels.ops.unfold_conv1d_f16(
         input,
-        &conv.weight,
-        &conv.bias,
-        &mut output,
-        channels as u32,
+        &mut unfolded,
         channels as u32,
         frames as u32,
         frames as u32,
         conv.kernel as u32,
         1,
-        ((conv.kernel * dilation - dilation) / 2) as u32,
+        padding as u32,
         dilation as u32,
     )?;
+    let mut rows = stream.alloc_zeros::<f16>(frames * channels)?;
+    kernels.gemm.matmul_f16(
+        &unfolded,
+        &conv.weight,
+        &mut rows,
+        frames as u32,
+        channels as u32,
+        width as u32,
+    )?;
+    kernels
+        .ops
+        .add_bias_f16_inplace(&mut rows, &conv.bias, frames as u32, channels as u32)?;
+    let mut output = stream.alloc_zeros::<f16>(channels * frames)?;
+    kernels
+        .ops
+        .transpose_f16(&rows, &mut output, frames as u32, channels as u32)?;
     Ok(output)
 }
 

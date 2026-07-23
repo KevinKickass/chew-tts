@@ -156,15 +156,14 @@ impl LstmDirection {
         )?;
         let mut hidden = stream.alloc_zeros::<f16>(hidden_size)?;
         let mut cell = stream.alloc_zeros::<f32>(hidden_size)?;
+        let mut hidden_gates = stream.alloc_zeros::<f16>(gate_width)?;
         let mut output = stream.alloc_zeros::<f16>(frames * hidden_size)?;
         for step in 0..frames {
             let timestep = if reverse { frames - 1 - step } else { step };
-            let mut hidden_gates = stream.alloc_zeros::<f16>(gate_width)?;
-            kernels.gemm.matmul_f16(
+            kernels.gemv.gemv_f16(
                 &hidden,
                 &self.weight_hh,
                 &mut hidden_gates,
-                1,
                 gate_width as u32,
                 hidden_size as u32,
             )?;

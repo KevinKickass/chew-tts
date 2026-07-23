@@ -16,7 +16,8 @@ struct Conv {
 }
 
 struct ConvTranspose {
-    weight: CudaSlice<f16>,
+    phase_weights: Vec<CudaSlice<f16>>,
+    phase_offsets: Vec<i32>,
     bias: CudaSlice<f16>,
     input: usize,
     output: usize,
@@ -197,11 +198,7 @@ impl KokoroGenerator {
                 kernels,
             )?;
             let source_branch =
-                device_to_rows(&source_branch, source_len, source_conv.output, kernels)?;
-            let source_branch =
-                self.noise_res[stage].forward(&source_branch, source_len, style, kernels)?;
-            let source_branch =
-                rows_to_device(&source_branch, source_len, source_conv.output, kernels)?;
+                self.noise_res[stage].forward_device(&source_branch, source_len, style, kernels)?;
             hidden = run_transpose(&activated, hidden_frames, &self.ups[stage], kernels)?;
             hidden_frames *= self.ups[stage].stride;
             if stage == 1 {
@@ -217,16 +214,22 @@ impl KokoroGenerator {
             kernels
                 .ops
                 .add_f16(&hidden, &source_branch, &mut fused, hidden.len() as u32)?;
-            let fused_rows =
-                device_to_rows(&fused, hidden_frames, self.ups[stage].output, kernels)?;
-            let mut sum = vec![0.0f32; fused_rows.len()];
-            for block in &self.resblocks[stage * 3..stage * 3 + 3] {
-                let branch = block.forward(&fused_rows, hidden_frames, style, kernels)?;
-                for (sum, value) in sum.iter_mut().zip(branch) {
-                    *sum += value / 3.0;
-                }
-            }
-            hidden = rows_to_device(&sum, hidden_frames, self.ups[stage].output, kernels)?;
+            let blocks = &self.resblocks[stage * 3..stage * 3 + 3];
+            let first = blocks[0].forward_device(&fused, hidden_frames, style, kernels)?;
+            let second = blocks[1].forward_device(&fused, hidden_frames, style, kernels)?;
+            let third = blocks[2].forward_device(&fused, hidden_frames, style, kernels)?;
+            let mut first_two = stream.alloc_zeros::<f16>(fused.len())?;
+            kernels
+                .ops
+                .add_f16(&first, &second, &mut first_two, fused.len() as u32)?;
+            let mut sum = stream.alloc_zeros::<f16>(fused.len())?;
+            kernels
+                .ops
+                .add_f16(&first_two, &third, &mut sum, fused.len() as u32)?;
+            hidden = stream.alloc_zeros::<f16>(fused.len())?;
+            kernels
+                .ops
+                .scale_f16(&sum, &mut hidden, fused.len() as u32, 1.0 / 3.0)?;
         }
         let mut activated = stream.alloc_zeros::<f16>(hidden.len())?;
         kernels
@@ -251,14 +254,12 @@ fn run_conv(
 ) -> anyhow::Result<CudaSlice<f16>> {
     let output_frames = (input_frames + 2 * padding - conv.kernel) / stride + 1;
     let stream = Arc::clone(kernels.ops.stream());
-    let mut output = stream.alloc_zeros::<f16>(conv.output * output_frames)?;
-    kernels.ops.conv1d_general_f16(
+    let width = conv.input * conv.kernel;
+    let mut unfolded = stream.alloc_zeros::<f16>(output_frames * width)?;
+    kernels.ops.unfold_conv1d_f16(
         input,
-        &conv.weight,
-        &conv.bias,
-        &mut output,
+        &mut unfolded,
         conv.input as u32,
-        conv.output as u32,
         input_frames as u32,
         output_frames as u32,
         conv.kernel as u32,
@@ -266,6 +267,25 @@ fn run_conv(
         padding as u32,
         1,
     )?;
+    let mut rows = stream.alloc_zeros::<f16>(output_frames * conv.output)?;
+    kernels.gemm.matmul_f16(
+        &unfolded,
+        &conv.weight,
+        &mut rows,
+        output_frames as u32,
+        conv.output as u32,
+        width as u32,
+    )?;
+    kernels.ops.add_bias_f16_inplace(
+        &mut rows,
+        &conv.bias,
+        output_frames as u32,
+        conv.output as u32,
+    )?;
+    let mut output = stream.alloc_zeros::<f16>(conv.output * output_frames)?;
+    kernels
+        .ops
+        .transpose_f16(&rows, &mut output, output_frames as u32, conv.output as u32)?;
     Ok(output)
 }
 
@@ -276,54 +296,47 @@ fn run_transpose(
     kernels: &mut GpuKernels,
 ) -> anyhow::Result<CudaSlice<f16>> {
     let output_frames = (input_frames - 1) * conv.stride - 2 * conv.padding + conv.kernel;
+    ensure!(
+        output_frames == input_frames * conv.stride,
+        "unsupported Kokoro transposed convolution geometry"
+    );
     let stream = Arc::clone(kernels.ops.stream());
     let mut output = stream.alloc_zeros::<f16>(conv.output * output_frames)?;
-    kernels.ops.conv_transpose1d_general_f16(
-        input,
-        &conv.weight,
-        &conv.bias,
-        &mut output,
-        conv.input as u32,
-        conv.output as u32,
-        input_frames as u32,
-        output_frames as u32,
-        conv.kernel as u32,
-        conv.stride as u32,
-        conv.padding as u32,
-    )?;
+    let width = conv.input * 2;
+    let mut unfolded = stream.alloc_zeros::<f16>(input_frames * width)?;
+    let mut rows = stream.alloc_zeros::<f16>(input_frames * conv.output)?;
+    for (phase, (weight, offset)) in conv
+        .phase_weights
+        .iter()
+        .zip(&conv.phase_offsets)
+        .enumerate()
+    {
+        kernels.ops.unfold_adjacent_f16(
+            input,
+            &mut unfolded,
+            conv.input as u32,
+            input_frames as u32,
+            *offset,
+        )?;
+        kernels.gemm.matmul_f16(
+            &unfolded,
+            weight,
+            &mut rows,
+            input_frames as u32,
+            conv.output as u32,
+            width as u32,
+        )?;
+        kernels.ops.scatter_conv_transpose_phase_f16(
+            &rows,
+            &conv.bias,
+            &mut output,
+            input_frames as u32,
+            conv.output as u32,
+            conv.stride as u32,
+            phase as u32,
+        )?;
+    }
     Ok(output)
-}
-
-fn rows_to_device(
-    rows: &[f32],
-    frames: usize,
-    channels: usize,
-    kernels: &mut GpuKernels,
-) -> anyhow::Result<CudaSlice<f16>> {
-    let stream = Arc::clone(kernels.ops.stream());
-    let rows = stream.clone_htod(&rows.iter().copied().map(f16::from_f32).collect::<Vec<_>>())?;
-    let mut output = stream.alloc_zeros::<f16>(frames * channels)?;
-    kernels
-        .ops
-        .transpose_f16(&rows, &mut output, frames as u32, channels as u32)?;
-    Ok(output)
-}
-
-fn device_to_rows(
-    input: &CudaSlice<f16>,
-    frames: usize,
-    channels: usize,
-    kernels: &mut GpuKernels,
-) -> anyhow::Result<Vec<f32>> {
-    let stream = Arc::clone(kernels.ops.stream());
-    let mut rows = stream.alloc_zeros::<f16>(frames * channels)?;
-    kernels
-        .ops
-        .transpose_f16(input, &mut rows, channels as u32, frames as u32)?;
-    stream.synchronize()?;
-    let mut host = vec![f16::ZERO; rows.len()];
-    stream.memcpy_dtoh(&rows, &mut host)?;
-    Ok(host.into_iter().map(f16::to_f32).collect())
 }
 
 fn reflection_pad_left(
@@ -332,11 +345,12 @@ fn reflection_pad_left(
     frames: usize,
     kernels: &mut GpuKernels,
 ) -> anyhow::Result<CudaSlice<f16>> {
-    let rows = device_to_rows(input, frames, channels, kernels)?;
-    let mut padded = Vec::with_capacity((frames + 1) * channels);
-    padded.extend_from_slice(&rows[channels..channels * 2]);
-    padded.extend_from_slice(&rows);
-    rows_to_device(&padded, frames + 1, channels, kernels)
+    let stream = Arc::clone(kernels.ops.stream());
+    let mut padded = stream.alloc_zeros::<f16>((frames + 1) * channels)?;
+    kernels
+        .ops
+        .reflection_pad_left_f16(input, &mut padded, channels as u32, frames as u32)?;
+    Ok(padded)
 }
 
 fn load_plain_conv(
@@ -430,8 +444,32 @@ fn load_transpose(
                 .max(1e-12);
         weight.extend(row.iter().map(|value| f16::from_f32(value * scale)));
     }
+    ensure!(
+        kernel == stride * 2 && kernel == stride + 2 * padding,
+        "unsupported Kokoro transposed convolution geometry"
+    );
+    let mut phase_weights = Vec::with_capacity(stride);
+    let mut phase_offsets = Vec::with_capacity(stride);
+    for phase in 0..stride {
+        let combined = phase + padding;
+        let kernel_first = combined % stride;
+        let kernel_second = kernel_first + stride;
+        let carry = combined / stride;
+        let mut phase_weight = Vec::with_capacity(output * input * 2);
+        for output_channel in 0..output {
+            for input_channel in 0..input {
+                let base = (input_channel * output + output_channel) * kernel;
+                // unfold_adjacent emits source q+carry-1 followed by q+carry.
+                phase_weight.push(weight[base + kernel_second]);
+                phase_weight.push(weight[base + kernel_first]);
+            }
+        }
+        phase_weights.push(stream.clone_htod(&phase_weight)?);
+        phase_offsets.push(carry as i32 - 1);
+    }
     Ok(ConvTranspose {
-        weight: stream.clone_htod(&weight)?,
+        phase_weights,
+        phase_offsets,
         bias: stream.clone_htod(&bias)?,
         input,
         output,

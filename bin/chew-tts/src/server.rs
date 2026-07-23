@@ -35,6 +35,9 @@ struct GeneratedAudio {
     samples: Vec<f32>,
     frames: usize,
     inference_ms: f64,
+    prompt_ms: f64,
+    generation_ms: f64,
+    codec_ms: f64,
 }
 
 struct AppState {
@@ -334,6 +337,9 @@ fn synthesize_segmented(
         samples: Vec::new(),
         frames: 0,
         inference_ms: 0.0,
+        prompt_ms: 0.0,
+        generation_ms: 0.0,
+        codec_ms: 0.0,
     };
     for (index, text) in segments.iter().enumerate() {
         let mut segment = request.clone();
@@ -352,6 +358,9 @@ fn synthesize_segmented(
         }
         audio.frames += output.generated_frames;
         audio.inference_ms += output.inference_elapsed().as_secs_f64() * 1_000.0;
+        audio.prompt_ms += output.prompt_elapsed.as_secs_f64() * 1_000.0;
+        audio.generation_ms += output.generation_elapsed.as_secs_f64() * 1_000.0;
+        audio.codec_ms += output.codec_elapsed.as_secs_f64() * 1_000.0;
         audio.samples.extend(output.samples);
     }
     Ok(audio)
@@ -616,6 +625,9 @@ async fn submit(state: &Arc<AppState>, request: SpeechRequest) -> Result<Generat
                 frames = audio.frames,
                 audio_seconds = audio.samples.len() as f64 / SAMPLE_RATE as f64,
                 inference_ms = audio.inference_ms,
+                prompt_ms = audio.prompt_ms,
+                generation_ms = audio.generation_ms,
+                codec_ms = audio.codec_ms,
                 wall_ms = started.elapsed().as_secs_f64() * 1_000.0,
                 "speech generated"
             );

@@ -1946,6 +1946,22 @@ __global__ void scale_f16(const __half* __restrict__ x,
     out[idx] = __float2half(__half2float(x[idx]) * scale);
 }
 
+// Reflection-pad one frame on the left of channel-major [channels, frames].
+// PyTorch ReflectionPad1d((1, 0)) maps the new first frame to input frame 1.
+__global__ void reflection_pad_left_f16(const __half* __restrict__ input,
+                                        __half* __restrict__ output,
+                                        int channels,
+                                        int frames) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int output_frames = frames + 1;
+    int n = channels * output_frames;
+    if (idx >= n) return;
+    int channel = idx / output_frames;
+    int frame = idx - channel * output_frames;
+    int input_frame = frame == 0 ? 1 : frame - 1;
+    output[idx] = input[channel * frames + input_frame];
+}
+
 // --- Scale f32 tensor by scalar in-place ---
 // x[i] *= scale
 __global__ void scale_f32_inplace(float* __restrict__ x,
@@ -2575,6 +2591,55 @@ __global__ void unfold_causal_f16(
         position - (kernel_size - 1 - kernel_index) * dilation;
     out[index] = input_position >= 0
         ? x[channel * seq_len + input_position]
+        : __float2half(0.0f);
+}
+
+// Unfold a general channel-first Conv1d input into row-major GEMM rows.
+// [channels, input_len] -> [output_len, channels * kernel_size].
+__global__ void unfold_conv1d_f16(
+    const __half* __restrict__ x,
+    __half* __restrict__ out,
+    int channels,
+    int input_len,
+    int output_len,
+    int kernel_size,
+    int stride,
+    int padding,
+    int dilation) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    const int row_width = channels * kernel_size;
+    const int n = output_len * row_width;
+    if (index >= n) return;
+    const int position = index / row_width;
+    const int item = index - position * row_width;
+    const int channel = item / kernel_size;
+    const int kernel_index = item - channel * kernel_size;
+    const int source =
+        position * stride - padding + kernel_index * dilation;
+    out[index] = source >= 0 && source < input_len
+        ? x[channel * input_len + source]
+        : __float2half(0.0f);
+}
+
+// Gather two adjacent input frames per channel for a polyphase
+// ConvTranspose1d GEMM. Output is [input_len, channels * 2].
+__global__ void unfold_adjacent_f16(
+    const __half* __restrict__ x,
+    __half* __restrict__ out,
+    int channels,
+    int input_len,
+    int first_offset) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    const int row_width = channels * 2;
+    const int n = input_len * row_width;
+    if (index >= n) return;
+    const int position = index / row_width;
+    const int item = index - position * row_width;
+    const int channel = item / 2;
+    const int tap = item - channel * 2;
+    const int source = position + first_offset + tap;
+    out[index] = source >= 0 && source < input_len
+        ? x[channel * input_len + source]
         : __float2half(0.0f);
 }
 

@@ -68,6 +68,7 @@ pub struct OpsKernels {
     rms_norm_no_weight: CudaFunction,
     rms_norm_f32in_no_weight: CudaFunction,
     scale_f16: CudaFunction,
+    reflection_pad_left_f16: CudaFunction,
     weighted_sum_rows_f16: CudaFunction,
     scale_f32_inplace: CudaFunction,
     logit_softcap: CudaFunction,
@@ -91,6 +92,8 @@ pub struct OpsKernels {
     conv1d_general_f16: CudaFunction,
     conv1d_causal_offset_f16: CudaFunction,
     unfold_causal_f16: CudaFunction,
+    unfold_conv1d_f16: CudaFunction,
+    unfold_adjacent_f16: CudaFunction,
     scatter_conv_transpose_phase_f16: CudaFunction,
     conv_transpose1d_causal_f16: CudaFunction,
     conv_transpose1d_general_f16: CudaFunction,
@@ -168,6 +171,7 @@ impl OpsKernels {
             rms_norm_no_weight: loader::get_fn(&module, "rms_norm_no_weight")?,
             rms_norm_f32in_no_weight: loader::get_fn(&module, "rms_norm_f32in_no_weight")?,
             scale_f16: loader::get_fn(&module, "scale_f16")?,
+            reflection_pad_left_f16: loader::get_fn(&module, "reflection_pad_left_f16")?,
             weighted_sum_rows_f16: loader::get_fn(&module, "weighted_sum_rows_f16")?,
             scale_f32_inplace: loader::get_fn(&module, "scale_f32_inplace")?,
             logit_softcap: loader::get_fn(&module, "logit_softcap")?,
@@ -189,6 +193,8 @@ impl OpsKernels {
             conv1d_general_f16: loader::get_fn(&module, "conv1d_general_f16")?,
             conv1d_causal_offset_f16: loader::get_fn(&module, "conv1d_causal_offset_f16")?,
             unfold_causal_f16: loader::get_fn(&module, "unfold_causal_f16")?,
+            unfold_conv1d_f16: loader::get_fn(&module, "unfold_conv1d_f16")?,
+            unfold_adjacent_f16: loader::get_fn(&module, "unfold_adjacent_f16")?,
             scatter_conv_transpose_phase_f16: loader::get_fn(
                 &module,
                 "scatter_conv_transpose_phase_f16",
@@ -442,6 +448,86 @@ impl OpsKernels {
         unsafe {
             self.fast.launch(
                 &self.unfold_causal_f16,
+                LaunchConfig {
+                    grid_dim: (n.div_ceil(256), 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                &mut args,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Unfold a general channel-first Conv1d input into GEMM rows.
+    #[allow(clippy::too_many_arguments)]
+    pub fn unfold_conv1d_f16(
+        &self,
+        x: &CudaSlice<half::f16>,
+        out: &mut CudaSlice<half::f16>,
+        channels: u32,
+        input_len: u32,
+        output_len: u32,
+        kernel_size: u32,
+        stride: u32,
+        padding: u32,
+        dilation: u32,
+    ) -> Result<(), KernelError> {
+        let ch = channels as i32;
+        let il = input_len as i32;
+        let ol = output_len as i32;
+        let ks = kernel_size as i32;
+        let st = stride as i32;
+        let pad = padding as i32;
+        let dil = dilation as i32;
+        let n = output_len * channels * kernel_size;
+        let mut args: [*mut c_void; 9] = [
+            slice_ptr(x),
+            slice_ptr_mut(out),
+            scalar_ptr(&ch),
+            scalar_ptr(&il),
+            scalar_ptr(&ol),
+            scalar_ptr(&ks),
+            scalar_ptr(&st),
+            scalar_ptr(&pad),
+            scalar_ptr(&dil),
+        ];
+        unsafe {
+            self.fast.launch(
+                &self.unfold_conv1d_f16,
+                LaunchConfig {
+                    grid_dim: (n.div_ceil(256), 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                &mut args,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Gather two adjacent frames per channel into row-major GEMM rows.
+    pub fn unfold_adjacent_f16(
+        &self,
+        x: &CudaSlice<half::f16>,
+        out: &mut CudaSlice<half::f16>,
+        channels: u32,
+        input_len: u32,
+        first_offset: i32,
+    ) -> Result<(), KernelError> {
+        let ch = channels as i32;
+        let il = input_len as i32;
+        let n = input_len * channels * 2;
+        let mut args: [*mut c_void; 5] = [
+            slice_ptr(x),
+            slice_ptr_mut(out),
+            scalar_ptr(&ch),
+            scalar_ptr(&il),
+            scalar_ptr(&first_offset),
+        ];
+        unsafe {
+            self.fast.launch(
+                &self.unfold_adjacent_f16,
                 LaunchConfig {
                     grid_dim: (n.div_ceil(256), 1, 1),
                     block_dim: (256, 1, 1),
@@ -2182,6 +2268,42 @@ impl OpsKernels {
         unsafe {
             self.fast.fire(
                 &self.scale_f16,
+                (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2),
+                (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2),
+                cfg.shared_mem_bytes,
+                &mut args,
+            );
+        }
+        Ok(())
+    }
+
+    /// Reflection-pad one frame on the left of channel-major `[channels, frames]`.
+    pub fn reflection_pad_left_f16(
+        &self,
+        input: &CudaSlice<half::f16>,
+        output: &mut CudaSlice<half::f16>,
+        channels: u32,
+        frames: u32,
+    ) -> Result<(), KernelError> {
+        let n = channels * (frames + 1);
+        let threads = 256u32;
+        let blocks = (n + threads - 1) / threads;
+        let cfg = LaunchConfig {
+            grid_dim: (blocks, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let channels_i = channels as i32;
+        let frames_i = frames as i32;
+        let mut args: [*mut c_void; 4] = [
+            slice_ptr(input),
+            slice_ptr_mut(output),
+            scalar_ptr(&channels_i),
+            scalar_ptr(&frames_i),
+        ];
+        unsafe {
+            self.fast.fire(
+                &self.reflection_pad_left_f16,
                 (cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2),
                 (cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2),
                 cfg.shared_mem_bytes,

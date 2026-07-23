@@ -6,9 +6,10 @@ use chew_model_kokoro::{
 };
 use cudarc::driver::CudaStream;
 use std::collections::HashMap;
+use std::ffi::{CStr, CString, c_char, c_void};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 pub struct KokoroEngine {
@@ -47,6 +48,9 @@ impl KokoroEngine {
         let default = KokoroVoice::load(&model_dir.join("voices/af_heart.pt"), &config)?;
         let mut voices = HashMap::new();
         voices.insert("af_heart".into(), default);
+        // Pay the dynamic-library initialization cost during readiness rather
+        // than on the first customer request.
+        let _ = espeak_api();
         Ok(Self {
             model_dir: model_dir.to_path_buf(),
             config,
@@ -97,13 +101,15 @@ impl KokoroEngine {
             .voices
             .get(&voice_name)
             .context("voice cache failure")?;
-        let started = Instant::now();
+        let prompt_started = Instant::now();
         let prosody = self
             .prosody
             .predict(&tokens.ids, voice, request.speed, &mut self.kernels)?;
         let asr = self
             .text
             .encode_aligned(&tokens.ids, &prosody.durations, &mut self.kernels)?;
+        let prompt_elapsed = prompt_started.elapsed();
+        let generation_started = Instant::now();
         let (f0, noise) = self.f0_noise.predict(
             &prosody.aligned,
             prosody.acoustic_frames,
@@ -118,6 +124,8 @@ impl KokoroEngine {
             &prosody.decoder_style,
             &mut self.kernels,
         )?;
+        let generation_elapsed = generation_started.elapsed();
+        let codec_started = Instant::now();
         let samples = self.generator.synthesize(
             &latent,
             &f0,
@@ -127,13 +135,13 @@ impl KokoroEngine {
             &mut self.kernels,
         )?;
         self.stream.synchronize()?;
-        let elapsed = started.elapsed();
+        let codec_elapsed = codec_started.elapsed();
         Ok(SynthesisOutput {
             samples,
             generated_frames: f0.len(),
-            prompt_elapsed: Duration::ZERO,
-            generation_elapsed: elapsed,
-            codec_elapsed: Duration::ZERO,
+            prompt_elapsed,
+            generation_elapsed,
+            codec_elapsed,
         })
     }
 }
@@ -156,6 +164,9 @@ fn phonemize(text: &str, language: &str) -> anyhow::Result<String> {
         "it" | "it-it" | "italian" => "it",
         other => other,
     };
+    if let Some(result) = phonemize_in_process(text, voice) {
+        return result;
+    }
     let output = Command::new("espeak-ng")
         .args(["-q", "--ipa=3", "-v", voice, text])
         .output()
@@ -172,4 +183,101 @@ fn phonemize(text: &str, language: &str) -> anyhow::Result<String> {
         "phonemizer returned no phonemes"
     );
     Ok(phonemes)
+}
+
+type EspeakInitialize = unsafe extern "C" fn(i32, i32, *const c_char, i32) -> i32;
+type EspeakSetVoice = unsafe extern "C" fn(*const c_char) -> i32;
+type EspeakTextToPhonemes = unsafe extern "C" fn(*mut *const c_void, i32, i32) -> *const c_char;
+
+struct EspeakApi {
+    _handle: *mut c_void,
+    set_voice: EspeakSetVoice,
+    text_to_phonemes: EspeakTextToPhonemes,
+}
+
+// eSpeak-NG keeps voice and translator state globally. Serializing this tiny
+// frontend operation makes it safe across multiple persistent GPU workers.
+unsafe impl Send for EspeakApi {}
+
+static ESPEAK: OnceLock<Option<Mutex<EspeakApi>>> = OnceLock::new();
+
+fn espeak_api() -> Option<&'static Mutex<EspeakApi>> {
+    ESPEAK
+        .get_or_init(|| EspeakApi::load().map(Mutex::new))
+        .as_ref()
+}
+
+fn phonemize_in_process(text: &str, voice: &str) -> Option<anyhow::Result<String>> {
+    let api = espeak_api()?;
+    Some((|| {
+        let api = api
+            .lock()
+            .map_err(|_| anyhow::anyhow!("eSpeak-NG phonemizer lock was poisoned"))?;
+        let voice = CString::new(voice).context("language contains a NUL byte")?;
+        let status = unsafe { (api.set_voice)(voice.as_ptr()) };
+        ensure!(
+            status == 0,
+            "eSpeak-NG does not support the selected language"
+        );
+        let input = CString::new(text).context("text contains a NUL byte")?;
+        let mut cursor = input.as_ptr().cast::<c_void>();
+        let mut output = String::new();
+        while !cursor.is_null() {
+            let chunk = unsafe { (api.text_to_phonemes)(&mut cursor, 1, 2) };
+            ensure!(!chunk.is_null(), "eSpeak-NG phonemizer returned no output");
+            output.push_str(
+                unsafe { CStr::from_ptr(chunk) }
+                    .to_str()
+                    .context("eSpeak-NG returned invalid UTF-8")?,
+            );
+        }
+        let output = output.replace(['\u{200d}', '\n', '\r'], "");
+        ensure!(!output.trim().is_empty(), "phonemizer returned no phonemes");
+        Ok(output)
+    })())
+}
+
+impl EspeakApi {
+    fn load() -> Option<Self> {
+        #[cfg(unix)]
+        unsafe {
+            unsafe extern "C" {
+                fn dlopen(filename: *const c_char, flags: i32) -> *mut c_void;
+                fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+            }
+            const RTLD_NOW: i32 = 2;
+            let mut handle = std::ptr::null_mut();
+            for library in [c"libespeak-ng.so.1", c"libespeak-ng.so"] {
+                handle = dlopen(library.as_ptr(), RTLD_NOW);
+                if !handle.is_null() {
+                    break;
+                }
+            }
+            if handle.is_null() {
+                return None;
+            }
+            let initialize = dlsym(handle, c"espeak_Initialize".as_ptr());
+            let set_voice = dlsym(handle, c"espeak_SetVoiceByName".as_ptr());
+            let text_to_phonemes = dlsym(handle, c"espeak_TextToPhonemes".as_ptr());
+            if initialize.is_null() || set_voice.is_null() || text_to_phonemes.is_null() {
+                return None;
+            }
+            let initialize: EspeakInitialize = std::mem::transmute(initialize);
+            let set_voice: EspeakSetVoice = std::mem::transmute(set_voice);
+            let text_to_phonemes: EspeakTextToPhonemes = std::mem::transmute(text_to_phonemes);
+            // AUDIO_OUTPUT_SYNCHRONOUS; no audio is generated by TextToPhonemes.
+            if initialize(2, 0, std::ptr::null(), 0) < 0 {
+                return None;
+            }
+            Some(Self {
+                _handle: handle,
+                set_voice,
+                text_to_phonemes,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    }
 }
