@@ -28,7 +28,7 @@ chew-safetensors = { path = "crates/safetensors" }
 chew-model-qwen3-tts = { path = "crates/model-qwen3-tts" }
 
 # CUDA
-cudarc = { path = "cudarc-fork", features = ["std", "driver", "cublas", "nvrtc", "cuda-13000", "f16"] }
+cudarc = { path = "cudarc-fork", features = ["std", "driver", "cublas", "nvrtc", "cuda-12060", "f16"] }
 
 # Async
 tokio = { version = "1", features = ["full"] }
