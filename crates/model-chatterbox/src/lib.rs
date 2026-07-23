@@ -10,7 +10,9 @@ mod s3gen;
 mod tokenizer;
 
 pub use cuda::{ChatterboxT3Layer, ChatterboxT3Transformer};
-pub use flow::{ChatterboxFlowResnetBlock, ChatterboxFlowTransformerBlock};
+pub use flow::{
+    ChatterboxFlowResnetBlock, ChatterboxFlowTimeEmbedding, ChatterboxFlowTransformerBlock,
+};
 pub use frontend::{ChatterboxT3Frontend, ChatterboxT3Prefix};
 pub use s3gen::{
     ChatterboxS3ConformerLayer, ChatterboxS3Encoder, S3_HIDDEN_SIZE, S3_INTERMEDIATE_SIZE,

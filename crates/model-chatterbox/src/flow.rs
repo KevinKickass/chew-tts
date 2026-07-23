@@ -11,6 +11,14 @@ const ATTENTION_DIM: usize = 512;
 const HEADS: usize = 8;
 const HEAD_DIM: usize = 64;
 const FF_DIM: usize = 1_024;
+const TIME_INPUT_DIM: usize = 320;
+
+pub struct ChatterboxFlowTimeEmbedding {
+    linear1_weight: CudaSlice<f16>,
+    linear1_bias: CudaSlice<f16>,
+    linear2_weight: CudaSlice<f16>,
+    linear2_bias: CudaSlice<f16>,
+}
 
 pub struct ChatterboxFlowResnetBlock {
     input_channels: usize,
@@ -191,6 +199,77 @@ impl ChatterboxFlowTransformerBlock {
         let mut output = vec![0.0; n];
         stream.memcpy_dtoh(&hidden, &mut output)?;
         Ok(output)
+    }
+}
+
+impl ChatterboxFlowTimeEmbedding {
+    pub fn load(model_dir: &Path, stream: &Arc<CudaStream>) -> anyhow::Result<Self> {
+        let weights = MappedSafetensors::open(model_dir.join("s3gen_v3.safetensors"))?;
+        let load = |name: &str, shape: &[usize]| -> anyhow::Result<CudaSlice<f16>> {
+            let (actual, values) = weights.tensor_f16(name)?;
+            ensure!(
+                actual == shape,
+                "{name}: got {actual:?}, expected {shape:?}"
+            );
+            Ok(stream.clone_htod(&values)?)
+        };
+        Ok(Self {
+            linear1_weight: load(
+                "flow.decoder.estimator.time_mlp.linear_1.weight",
+                &[FF_DIM, TIME_INPUT_DIM],
+            )?,
+            linear1_bias: load("flow.decoder.estimator.time_mlp.linear_1.bias", &[FF_DIM])?,
+            linear2_weight: load(
+                "flow.decoder.estimator.time_mlp.linear_2.weight",
+                &[FF_DIM, FF_DIM],
+            )?,
+            linear2_bias: load("flow.decoder.estimator.time_mlp.linear_2.bias", &[FF_DIM])?,
+        })
+    }
+
+    pub fn forward(&self, timestep: f32, kernels: &mut GpuKernels) -> anyhow::Result<Vec<f32>> {
+        let stream = Arc::clone(kernels.ops.stream());
+        let half_dim = TIME_INPUT_DIM / 2;
+        let exponent_scale = 10_000.0f32.ln() / (half_dim - 1) as f32;
+        let angles = (0..half_dim)
+            .map(|index| 1_000.0 * timestep * (-(index as f32) * exponent_scale).exp())
+            .collect::<Vec<_>>();
+        let input = angles
+            .iter()
+            .map(|value| f16::from_f32(value.sin()))
+            .chain(angles.iter().map(|value| f16::from_f32(value.cos())))
+            .collect::<Vec<_>>();
+        let input = stream.clone_htod(&input)?;
+        let mut first = stream.alloc_zeros::<f16>(FF_DIM)?;
+        kernels.gemv.gemv_f16(
+            &input,
+            &self.linear1_weight,
+            &mut first,
+            FF_DIM as u32,
+            TIME_INPUT_DIM as u32,
+        )?;
+        kernels
+            .ops
+            .add_bias_f16_inplace(&mut first, &self.linear1_bias, 1, FF_DIM as u32)?;
+        let mut activated = stream.alloc_zeros::<f16>(FF_DIM)?;
+        kernels
+            .ops
+            .silu_act_f16(&first, &mut activated, FF_DIM as u32)?;
+        let mut output = stream.alloc_zeros::<f16>(FF_DIM)?;
+        kernels.gemv.gemv_f16(
+            &activated,
+            &self.linear2_weight,
+            &mut output,
+            FF_DIM as u32,
+            FF_DIM as u32,
+        )?;
+        kernels
+            .ops
+            .add_bias_f16_inplace(&mut output, &self.linear2_bias, 1, FF_DIM as u32)?;
+        stream.synchronize()?;
+        let mut host = vec![f16::ZERO; FF_DIM];
+        stream.memcpy_dtoh(&output, &mut host)?;
+        Ok(host.into_iter().map(f16::to_f32).collect())
     }
 }
 
