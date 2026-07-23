@@ -326,6 +326,11 @@ async fn handle_fleet_connection(
     if body.len() as u64 > MAX_FLEET_REQUEST_BYTES {
         return Err("request exceeds 40 MiB".into());
     }
+    // Fleet's supervisor probes TCP readiness by connecting and immediately
+    // closing. Treat that as a health check instead of a malformed request.
+    if body.is_empty() {
+        return Ok(());
+    }
     let request: SpeechRequest =
         serde_json::from_slice(&body).map_err(|error| format!("invalid request JSON: {error}"))?;
     let speed = request.speed;
