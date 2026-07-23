@@ -8,7 +8,8 @@ use chew_model_chatterbox::{
     S3_HIDDEN_SIZE, inspect_model as inspect_chatterbox_model,
 };
 use chew_model_kokoro::{
-    KokoroAlbert, KokoroBiLstm, KokoroCheckpoint, KokoroProsodyFrontend, KokoroVoice,
+    KokoroAdaInResBlock, KokoroAlbert, KokoroBiLstm, KokoroCheckpoint, KokoroDecoderFrontend,
+    KokoroF0Noise, KokoroGenerator, KokoroProsodyFrontend, KokoroTextEncoder, KokoroVoice,
     inspect_model as inspect_kokoro_model,
 };
 use chew_model_qwen3_tts::{
@@ -115,6 +116,18 @@ enum Command {
         #[arg(long, default_value_t = 1.0)]
         speed: f32,
         phonemes: String,
+        #[arg(long)]
+        wav: Option<PathBuf>,
+    },
+    /// Validate one native Kokoro AdaIN residual block.
+    CudaKokoroAdaInSmoke {
+        model_dir: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        gpu: usize,
+        #[arg(long, default_value_t = 8)]
+        frames: usize,
+        #[arg(long)]
+        upsample: bool,
     },
     /// Validate Chatterbox Multilingual V3 T3, S3Gen, and voice-encoder weights.
     InspectChatterbox {
@@ -702,6 +715,7 @@ fn main() -> anyhow::Result<()> {
             gpu,
             speed,
             phonemes,
+            wav,
         } => {
             let config = chew_model_kokoro::KokoroConfig::load(&model_dir)?;
             let tokens = config.tokenize_phonemes(&phonemes)?;
@@ -716,8 +730,45 @@ fn main() -> anyhow::Result<()> {
                 speed,
                 &mut kernels,
             )?;
+            let asr = KokoroTextEncoder::load(&model_dir, &stream)?.encode_aligned(
+                &tokens.ids,
+                &prosody.durations,
+                &mut kernels,
+            )?;
+            let (f0, noise) = KokoroF0Noise::load(&model_dir, &stream)?.predict(
+                &prosody.aligned,
+                prosody.acoustic_frames,
+                &prosody.predictor_style,
+                &mut kernels,
+            )?;
+            let decoder = KokoroDecoderFrontend::load(&model_dir, &stream)?.decode(
+                &asr,
+                &f0,
+                &noise,
+                prosody.acoustic_frames,
+                &prosody.decoder_style,
+                &mut kernels,
+            )?;
+            if let Some(path) = wav {
+                let audio = KokoroGenerator::load(&model_dir, &stream)?.synthesize(
+                    &decoder,
+                    &f0,
+                    f0.len(),
+                    &prosody.decoder_style,
+                    42,
+                    &mut kernels,
+                )?;
+                write_pcm16_wav(&path, &audio, 24_000)?;
+                println!(
+                    "Kokoro end-to-end WAV: samples={}, seconds={:.3}, peak={:.6}, wav={}",
+                    audio.len(),
+                    audio.len() as f64 / 24_000.0,
+                    audio.iter().map(|value| value.abs()).fold(0.0f32, f32::max),
+                    path.display()
+                );
+            }
             println!(
-                "Kokoro prosody CUDA: tokens={}, acoustic_frames={}, durations={:?}, aligned_sum={:.9}, aligned_sum_sq={:.9}",
+                "Kokoro prosody CUDA: tokens={}, acoustic_frames={}, durations={:?}, aligned_sum={:.9}, aligned_sum_sq={:.9}, asr_sum={:.9}, asr_sum_sq={:.9}, f0_sum={:.9}, f0_sum_sq={:.9}, noise_sum={:.9}, noise_sum_sq={:.9}, decoder_sum={:.9}, decoder_sum_sq={:.9}",
                 tokens.ids.len(),
                 prosody.acoustic_frames,
                 prosody.durations,
@@ -727,6 +778,69 @@ fn main() -> anyhow::Result<()> {
                     .iter()
                     .map(|x| f64::from(*x) * f64::from(*x))
                     .sum::<f64>(),
+                asr.iter().map(|x| f64::from(*x)).sum::<f64>(),
+                asr.iter()
+                    .map(|x| f64::from(*x) * f64::from(*x))
+                    .sum::<f64>(),
+                f0.iter().map(|x| f64::from(*x)).sum::<f64>(),
+                f0.iter()
+                    .map(|x| f64::from(*x) * f64::from(*x))
+                    .sum::<f64>(),
+                noise.iter().map(|x| f64::from(*x)).sum::<f64>(),
+                noise
+                    .iter()
+                    .map(|x| f64::from(*x) * f64::from(*x))
+                    .sum::<f64>(),
+                decoder.iter().map(|x| f64::from(*x)).sum::<f64>(),
+                decoder
+                    .iter()
+                    .map(|x| f64::from(*x) * f64::from(*x))
+                    .sum::<f64>(),
+            );
+        }
+        Command::CudaKokoroAdaInSmoke {
+            model_dir,
+            gpu,
+            frames,
+            upsample,
+        } => {
+            let allocator = chew_vram::VramAllocator::init()?;
+            anyhow::ensure!(gpu < allocator.gpu_count(), "GPU index out of range");
+            let stream = std::sync::Arc::clone(allocator.stream(gpu));
+            let mut kernels = chew_kernel::GpuKernels::load(&stream, 768 * 2_048, 2_048)?;
+            let checkpoint = KokoroCheckpoint::open(model_dir.join("kokoro-v1_0.pth"))?;
+            let (prefix, output) = if upsample {
+                ("module.F0.1", 256)
+            } else {
+                ("module.F0.0", 512)
+            };
+            let input = (0..frames * 512)
+                .map(|index| (index as f32 * 0.013).sin() * 0.2)
+                .collect::<Vec<_>>();
+            let style = (0..128)
+                .map(|index| (index as f32 * 0.031).cos() * 0.1)
+                .collect::<Vec<_>>();
+            let result = KokoroAdaInResBlock::load(
+                &checkpoint,
+                "predictor",
+                prefix,
+                512,
+                output,
+                upsample,
+                &stream,
+            )?
+            .forward(&input, frames, &style, &mut kernels)?;
+            println!(
+                "Kokoro AdaIN CUDA: frames={}, output_frames={}, channels={}, sum={:.9}, sum_sq={:.9}, first={:?}",
+                frames,
+                if upsample { frames * 2 } else { frames },
+                output,
+                result.iter().map(|x| f64::from(*x)).sum::<f64>(),
+                result
+                    .iter()
+                    .map(|x| f64::from(*x) * f64::from(*x))
+                    .sum::<f64>(),
+                &result[..8]
             );
         }
         Command::InspectChatterbox { model_dir } => {

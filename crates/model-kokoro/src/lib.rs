@@ -7,10 +7,22 @@ use std::path::{Path, PathBuf};
 
 mod albert;
 pub use albert::KokoroAlbert;
+mod adain;
+pub use adain::KokoroAdaInResBlock;
 mod lstm;
 pub use lstm::KokoroBiLstm;
 mod prosody;
 pub use prosody::{KokoroProsody, KokoroProsodyFrontend, load_default_voice};
+mod text;
+pub use text::KokoroTextEncoder;
+mod f0;
+pub use f0::KokoroF0Noise;
+mod decoder;
+pub use decoder::KokoroDecoderFrontend;
+mod generator_res;
+pub use generator_res::KokoroGeneratorResBlock;
+mod generator;
+pub use generator::KokoroGenerator;
 
 pub const CHECKPOINT_GROUPS: [&str; 5] = [
     "bert",

@@ -2800,6 +2800,101 @@ __global__ void lstm_cell_f16(const __half* __restrict__ input_gates,
         __float2half(new_hidden);
 }
 
+// InstanceNorm1d followed by Kokoro's style affine:
+// (1 + gamma[channel]) * normalized + beta[channel].
+__global__ void instance_norm_affine_f16(
+    const __half* __restrict__ x,
+    const __half* __restrict__ gamma,
+    const __half* __restrict__ beta,
+    __half* __restrict__ out,
+    int channels,
+    int frames,
+    float epsilon) {
+    const int channel = blockIdx.x;
+    if (channel >= channels) return;
+    float sum = 0.0f;
+    float sum_sq = 0.0f;
+    for (int frame = threadIdx.x; frame < frames; frame += blockDim.x) {
+        const float value = __half2float(x[channel * frames + frame]);
+        sum += value;
+        sum_sq += value * value;
+    }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+        sum_sq += __shfl_down_sync(0xFFFFFFFF, sum_sq, offset);
+    }
+    __shared__ float warp_sum[8];
+    __shared__ float warp_sq[8];
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    if (lane == 0) {
+        warp_sum[warp] = sum;
+        warp_sq[warp] = sum_sq;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        sum = lane < 8 ? warp_sum[lane] : 0.0f;
+        sum_sq = lane < 8 ? warp_sq[lane] : 0.0f;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+            sum_sq += __shfl_down_sync(0xFFFFFFFF, sum_sq, offset);
+        }
+        if (lane == 0) {
+            warp_sum[0] = sum / frames;
+            const float variance = fmaxf(0.0f, sum_sq / frames - warp_sum[0] * warp_sum[0]);
+            warp_sq[0] = rsqrtf(variance + epsilon);
+        }
+    }
+    __syncthreads();
+    const float mean = warp_sum[0];
+    const float inverse = warp_sq[0];
+    const float scale = 1.0f + __half2float(gamma[channel]);
+    const float shift = __half2float(beta[channel]);
+    for (int frame = threadIdx.x; frame < frames; frame += blockDim.x) {
+        const int index = channel * frames + frame;
+        out[index] = __float2half(
+            scale * (__half2float(x[index]) - mean) * inverse + shift);
+    }
+}
+
+// Depthwise ConvTranspose1d used by Kokoro's learned 2x AdaIN upsamplers.
+__global__ void conv_transpose1d_depthwise_f16(
+    const __half* __restrict__ x,
+    const __half* __restrict__ weight,
+    const __half* __restrict__ bias,
+    __half* __restrict__ out,
+    int channels,
+    int input_len,
+    int output_len,
+    int kernel_size,
+    int stride,
+    int padding) {
+    const int position = blockIdx.x;
+    const int channel = blockIdx.y;
+    if (channel >= channels || position >= output_len) return;
+    float sum = 0.0f;
+    for (int kernel_index = threadIdx.x;
+         kernel_index < kernel_size;
+         kernel_index += blockDim.x) {
+        const int numerator = position + padding - kernel_index;
+        if (numerator >= 0 && numerator % stride == 0) {
+            const int source = numerator / stride;
+            if (source < input_len) {
+                sum += __half2float(x[channel * input_len + source])
+                    * __half2float(weight[channel * kernel_size + kernel_index]);
+            }
+        }
+    }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+    if (threadIdx.x == 0)
+        out[channel * output_len + position] =
+            __float2half(sum + __half2float(bias[channel]));
+}
+
 __global__ void mish_f16(const __half* __restrict__ x,
                          __half* __restrict__ out,
                          int n) {

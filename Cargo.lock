@@ -341,6 +341,7 @@ dependencies = [
  "chew-kernel",
  "cudarc",
  "half",
+ "rustfft",
  "serde",
  "serde_json",
  "zip",

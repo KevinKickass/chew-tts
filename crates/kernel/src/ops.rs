@@ -91,6 +91,8 @@ pub struct OpsKernels {
     leaky_relu_f16: CudaFunction,
     elu_f16: CudaFunction,
     lstm_cell_f16: CudaFunction,
+    instance_norm_affine_f16: CudaFunction,
+    conv_transpose1d_depthwise_f16: CudaFunction,
     mish_f16: CudaFunction,
     repeat_interleave_f16: CudaFunction,
     concat_f32_f16_rows: CudaFunction,
@@ -181,6 +183,11 @@ impl OpsKernels {
             leaky_relu_f16: loader::get_fn(&module, "leaky_relu_f16")?,
             elu_f16: loader::get_fn(&module, "elu_f16")?,
             lstm_cell_f16: loader::get_fn(&module, "lstm_cell_f16")?,
+            instance_norm_affine_f16: loader::get_fn(&module, "instance_norm_affine_f16")?,
+            conv_transpose1d_depthwise_f16: loader::get_fn(
+                &module,
+                "conv_transpose1d_depthwise_f16",
+            )?,
             mish_f16: loader::get_fn(&module, "mish_f16")?,
             repeat_interleave_f16: loader::get_fn(&module, "repeat_interleave_f16")?,
             concat_f32_f16_rows: loader::get_fn(&module, "concat_f32_f16_rows")?,
@@ -719,6 +726,83 @@ impl OpsKernels {
                 &self.lstm_cell_f16,
                 (hidden_size.div_ceil(threads), 1, 1),
                 (threads, 1, 1),
+                0,
+                &mut args,
+            );
+        }
+        Ok(())
+    }
+
+    pub fn instance_norm_affine_f16(
+        &self,
+        x: &CudaSlice<half::f16>,
+        gamma: &CudaSlice<half::f16>,
+        beta: &CudaSlice<half::f16>,
+        out: &mut CudaSlice<half::f16>,
+        channels: u32,
+        frames: u32,
+        epsilon: f32,
+    ) -> Result<(), KernelError> {
+        let ch = channels as i32;
+        let fr = frames as i32;
+        let mut args: [*mut c_void; 7] = [
+            slice_ptr(x),
+            slice_ptr(gamma),
+            slice_ptr(beta),
+            slice_ptr_mut(out),
+            scalar_ptr(&ch),
+            scalar_ptr(&fr),
+            scalar_ptr(&epsilon),
+        ];
+        unsafe {
+            self.fast.fire(
+                &self.instance_norm_affine_f16,
+                (channels, 1, 1),
+                (256, 1, 1),
+                0,
+                &mut args,
+            );
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv_transpose1d_depthwise_f16(
+        &self,
+        x: &CudaSlice<half::f16>,
+        weight: &CudaSlice<half::f16>,
+        bias: &CudaSlice<half::f16>,
+        out: &mut CudaSlice<half::f16>,
+        channels: u32,
+        input_len: u32,
+        output_len: u32,
+        kernel_size: u32,
+        stride: u32,
+        padding: u32,
+    ) -> Result<(), KernelError> {
+        let ch = channels as i32;
+        let il = input_len as i32;
+        let ol = output_len as i32;
+        let ks = kernel_size as i32;
+        let st = stride as i32;
+        let pad = padding as i32;
+        let mut args: [*mut c_void; 10] = [
+            slice_ptr(x),
+            slice_ptr(weight),
+            slice_ptr(bias),
+            slice_ptr_mut(out),
+            scalar_ptr(&ch),
+            scalar_ptr(&il),
+            scalar_ptr(&ol),
+            scalar_ptr(&ks),
+            scalar_ptr(&st),
+            scalar_ptr(&pad),
+        ];
+        unsafe {
+            self.fast.fire(
+                &self.conv_transpose1d_depthwise_f16,
+                (output_len, channels, 1),
+                (32, 1, 1),
                 0,
                 &mut args,
             );
