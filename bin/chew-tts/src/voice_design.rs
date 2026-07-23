@@ -6,6 +6,8 @@ use chew_model_qwen3_tts::{
     TalkerFrontend, TalkerTransformer, inspect_model,
 };
 use cudarc::driver::CudaStream;
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -27,9 +29,17 @@ pub struct VoiceDesignEngine {
     codec: CodecQuantizer,
     speaker_encoder: Option<SpeakerEncoder>,
     codec_encoder: Option<CodecEncoder>,
+    reference_cache: HashMap<[u8; 32], CachedReference>,
     max_frames: usize,
     pub load_elapsed: Duration,
     pub vram_bytes: u64,
+}
+
+#[derive(Clone)]
+struct CachedReference {
+    samples: Vec<f32>,
+    speaker_embedding: Vec<f32>,
+    codes: Option<Vec<Vec<i32>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -122,6 +132,7 @@ impl VoiceDesignEngine {
             codec,
             speaker_encoder,
             codec_encoder,
+            reference_cache: HashMap::new(),
             max_frames,
             load_elapsed,
             vram_bytes: free_before.saturating_sub(free_loaded),
@@ -191,7 +202,12 @@ impl VoiceDesignEngine {
             self.model_type != ModelType::VoiceDesign || instruction_ids.is_some(),
             "instruction must not be empty for a VoiceDesign model"
         );
-        let mut base_samples = None;
+        let wants_icl = self.model_type == ModelType::Base
+            && request
+                .reference_text
+                .as_deref()
+                .is_some_and(|text| !text.trim().is_empty());
+        let mut base_codes = None;
         let speaker_embedding = match self.model_type {
             ModelType::CustomVoice => {
                 let speaker = normalize_speaker_name(&request.voice);
@@ -213,15 +229,46 @@ impl VoiceDesignEngine {
                     .reference_audio_wav
                     .as_deref()
                     .context("reference_audio is required for a Base model")?;
-                let (samples, sample_rate) = decode_wav(wav)?;
-                let samples = resample(&samples, sample_rate, 24_000);
-                let (mel, frames) = speaker_mel(&samples)?;
-                let embedding = self
-                    .speaker_encoder
-                    .as_ref()
-                    .context("Base speaker encoder was not loaded")?
-                    .encode_mel(&mel, frames, &mut self.kernels)?;
-                base_samples = Some(samples);
+                let digest: [u8; 32] = Sha256::digest(wav).into();
+                let cached = self.reference_cache.get(&digest).cloned();
+                let mut reference = if let Some(cached) = cached {
+                    cached
+                } else {
+                    let (samples, sample_rate) = decode_wav(wav)?;
+                    let samples = resample(&samples, sample_rate, 24_000);
+                    ensure!(
+                        samples.len() <= 60 * 24_000,
+                        "reference audio exceeds 60 seconds"
+                    );
+                    let (mel, frames) = speaker_mel(&samples)?;
+                    let speaker_embedding = self
+                        .speaker_encoder
+                        .as_ref()
+                        .context("Base speaker encoder was not loaded")?
+                        .encode_mel(&mel, frames, &mut self.kernels)?;
+                    CachedReference {
+                        samples,
+                        speaker_embedding,
+                        codes: None,
+                    }
+                };
+                if wants_icl && reference.codes.is_none() {
+                    reference.codes = Some(
+                        self.codec_encoder
+                            .as_ref()
+                            .context("Base codec encoder was not loaded")?
+                            .encode(&reference.samples, &mut self.kernels)?,
+                    );
+                }
+                if !self.reference_cache.contains_key(&digest)
+                    && self.reference_cache.len() >= 8
+                    && let Some(oldest) = self.reference_cache.keys().next().copied()
+                {
+                    self.reference_cache.remove(&oldest);
+                }
+                base_codes = reference.codes.clone();
+                let embedding = reference.speaker_embedding.clone();
+                self.reference_cache.insert(digest, reference);
                 Some(embedding)
             }
             ModelType::VoiceDesign => None,
@@ -229,28 +276,16 @@ impl VoiceDesignEngine {
         let mut seed = request.seed;
 
         let prompt_started = Instant::now();
-        let inputs = if self.model_type == ModelType::Base
-            && request
-                .reference_text
-                .as_deref()
-                .is_some_and(|text| !text.trim().is_empty())
-        {
+        let inputs = if wants_icl {
             let reference_text_ids =
                 encode(request.reference_text.as_deref().expect("checked above"))?;
-            let reference_codes = self
-                .codec_encoder
-                .as_ref()
-                .context("Base codec encoder was not loaded")?
-                .encode(
-                    base_samples
-                        .as_deref()
-                        .context("Base reference waveform is unavailable")?,
-                    &mut self.kernels,
-                )?;
+            let reference_codes = base_codes
+                .as_deref()
+                .context("Base reference codec frames are unavailable")?;
             self.frontend.build_icl_inputs(
                 &text_ids,
                 &reference_text_ids,
-                &reference_codes,
+                reference_codes,
                 instruction_ids.as_deref(),
                 language_codec_id,
                 speaker_embedding

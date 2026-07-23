@@ -47,13 +47,14 @@ Implemented:
   CUDA ECAPA-TDNN speaker encoder for Base x-vector voice cloning;
 - native SEANet/Transformer speech-tokenizer encoding, 16-codebook residual
   vector quantization, and Base ICL prompts with reference text;
+- an eight-entry SHA-256 reference cache for speaker embeddings, waveforms,
+  and ICL codec frames;
 - PyTorch parity checks for real Qwen weights, RoPE, GQA, and cached decoding.
 
 Next:
 
 - one CUDA graph for a complete 16-codebook audio frame;
 - optimized one-pass model loading and GPU-resident sampling;
-- cached reusable Base reference prompts;
 - arbitrary compressed reference-audio input in addition to native WAV;
 - Kokoro as the second model family.
 
@@ -307,7 +308,8 @@ WAV or WAV data URL. An instruction can be supplied at the same time. Without
 transcript in `reference_text` enables the stronger ICL path with native
 speech-tokenizer codes. Reference extraction is completely native; an
 end-to-end ICL request producing 4.24 seconds of audio takes approximately
-1.16 seconds on an RTX 3080.
+1.16 seconds on an RTX 3080. Reused reference audio is cached by SHA-256; in a
+short validation request this reduced wall time from 0.59 to 0.38 seconds.
 
 Supported `response_format` values are `wav`, `pcm`, `mp3`, `opus`, `aac`,
 and `flac`. Compressed formats and non-default `speed` use FFmpeg.

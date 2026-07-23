@@ -65,3 +65,4 @@ clap = { version = "4", features = ["derive"] }
 base64 = "0.22"
 hound = "3.5"
 rustfft = "6.2"
+sha2 = "0.10"
