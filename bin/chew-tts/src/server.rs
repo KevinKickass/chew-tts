@@ -1,3 +1,5 @@
+use crate::chatterbox_engine::ChatterboxEngine;
+use crate::kokoro_engine::KokoroEngine;
 use crate::voice_design::{SynthesisRequest, VoiceDesignEngine};
 use axum::extract::State;
 use axum::http::{StatusCode, header};
@@ -19,7 +21,7 @@ use tracing::{error, info};
 
 const SAMPLE_RATE: u32 = 24_000;
 const DEFAULT_INSTRUCTION: &str = "A natural, clear studio voice.";
-const MAX_SYNTHESIS_SEGMENT_CHARS: usize = 700;
+const MAX_SYNTHESIS_SEGMENT_CHARS: usize = 350;
 const SEGMENT_GAP_SAMPLES: usize = 1_200;
 
 struct Job {
@@ -38,6 +40,59 @@ struct AppState {
     model: String,
     max_frames: usize,
     vram_bytes: u64,
+}
+
+enum TtsEngine {
+    Qwen(VoiceDesignEngine),
+    Kokoro(KokoroEngine),
+    Chatterbox(ChatterboxEngine),
+}
+
+impl TtsEngine {
+    fn load(model_dir: &std::path::Path, gpu: usize, max_frames: usize) -> anyhow::Result<Self> {
+        if model_dir.join("kokoro-v1_0.pth").is_file() {
+            Ok(Self::Kokoro(KokoroEngine::load(model_dir, gpu)?))
+        } else if model_dir.join("t3_mtl23ls_v3.safetensors").is_file() {
+            Ok(Self::Chatterbox(ChatterboxEngine::load(
+                model_dir, gpu, max_frames,
+            )?))
+        } else {
+            Ok(Self::Qwen(VoiceDesignEngine::load(
+                model_dir, gpu, max_frames,
+            )?))
+        }
+    }
+
+    fn metadata(&self) -> (std::time::Duration, u64, String) {
+        match self {
+            Self::Qwen(engine) => (
+                engine.load_elapsed,
+                engine.vram_bytes,
+                engine.model_id().to_owned(),
+            ),
+            Self::Kokoro(engine) => (
+                engine.load_elapsed,
+                engine.vram_bytes,
+                engine.model_id().to_owned(),
+            ),
+            Self::Chatterbox(engine) => (
+                engine.load_elapsed,
+                engine.vram_bytes,
+                engine.model_id().to_owned(),
+            ),
+        }
+    }
+
+    fn synthesize(
+        &mut self,
+        request: &SynthesisRequest,
+    ) -> anyhow::Result<crate::voice_design::SynthesisOutput> {
+        match self {
+            Self::Qwen(engine) => engine.synthesize(request),
+            Self::Kokoro(engine) => engine.synthesize(request),
+            Self::Chatterbox(engine) => engine.synthesize(request),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -176,14 +231,10 @@ async fn start_engine(
     std::thread::Builder::new()
         .name("chew-tts-gpu".into())
         .spawn(move || {
-            let engine = VoiceDesignEngine::load(&model_dir, gpu, max_frames);
+            let engine = TtsEngine::load(&model_dir, gpu, max_frames);
             match engine {
                 Ok(engine) => {
-                    let metadata = (
-                        engine.load_elapsed,
-                        engine.vram_bytes,
-                        engine.model_id().to_owned(),
-                    );
+                    let metadata = engine.metadata();
                     if ready_tx.send(Ok(metadata)).is_ok() {
                         gpu_worker(engine, receiver);
                     }
@@ -215,7 +266,7 @@ async fn shutdown_signal() {
     }
 }
 
-fn gpu_worker(mut engine: VoiceDesignEngine, mut jobs: mpsc::Receiver<Job>) {
+fn gpu_worker(mut engine: TtsEngine, mut jobs: mpsc::Receiver<Job>) {
     while let Some(job) = jobs.blocking_recv() {
         let result = synthesize_segmented(&mut engine, &job.request);
         let _ = job.response.send(result);
@@ -223,7 +274,7 @@ fn gpu_worker(mut engine: VoiceDesignEngine, mut jobs: mpsc::Receiver<Job>) {
 }
 
 fn synthesize_segmented(
-    engine: &mut VoiceDesignEngine,
+    engine: &mut TtsEngine,
     request: &SynthesisRequest,
 ) -> Result<GeneratedAudio, String> {
     let segments = split_synthesis_text(&request.text, MAX_SYNTHESIS_SEGMENT_CHARS);
@@ -236,6 +287,9 @@ fn synthesize_segmented(
         let mut segment = request.clone();
         segment.text.clone_from(text);
         segment.seed = segment.seed.wrapping_add(index as u64);
+        // Tempo is applied once to the concatenated waveform. This avoids
+        // compounding model-native duration control with the response encoder.
+        segment.speed = 1.0;
         let output = engine.synthesize(&segment).map_err(|error| {
             format!("segment {}/{} failed: {error:#}", index + 1, segments.len())
         })?;
@@ -439,6 +493,10 @@ async fn submit(state: &Arc<AppState>, request: SpeechRequest) -> Result<Generat
                     | "tts-multilingual"
                     | "tts-premium"
                     | "tts-voice-clone"
+                    | "tts-fast"
+                    | "kokoro"
+                    | "tts-expressive"
+                    | "chatterbox"
             )
         {
             return Err(error_response(
@@ -476,6 +534,7 @@ async fn submit(state: &Arc<AppState>, request: SpeechRequest) -> Result<Generat
         },
         reference_text: request.reference_text,
         language: normalize_language(&request.language),
+        speed: request.speed,
         max_frames: request.max_frames.unwrap_or(state.max_frames),
         seed: request.seed,
         temperature: request.temperature,

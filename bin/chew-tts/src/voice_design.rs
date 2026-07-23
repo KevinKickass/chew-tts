@@ -50,6 +50,7 @@ pub struct SynthesisRequest {
     pub reference_audio_wav: Option<Vec<u8>>,
     pub reference_text: Option<String>,
     pub language: String,
+    pub speed: f32,
     pub max_frames: usize,
     pub seed: u64,
     pub temperature: f32,

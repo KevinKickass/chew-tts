@@ -25,6 +25,8 @@ use tokenizers::pre_tokenizers::byte_level::ByteLevel;
 use tokenizers::{AddedToken, Tokenizer};
 
 mod audio_input;
+mod chatterbox_engine;
+mod kokoro_engine;
 mod server;
 mod voice_design;
 
