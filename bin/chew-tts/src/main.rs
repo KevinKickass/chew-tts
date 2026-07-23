@@ -4,7 +4,7 @@ use chew_model_qwen3_tts::{
     TalkerLayerKvCache, TalkerTransformer, inspect_model, load_f16_tensor,
 };
 use clap::{Parser, Subcommand};
-use std::io::Write;
+use std::io::{Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use tokenizers::models::bpe::BPE;
 use tokenizers::pre_tokenizers::byte_level::ByteLevel;
@@ -702,7 +702,11 @@ fn cuda_voice_design_smoke(
         chunk_frames
     });
     let mut codec_context = Vec::with_capacity(chunk_context);
-    let mut streamed_audio = Vec::new();
+    let mut wav_writer = if chunk_frames > 0 {
+        Some(Pcm16WavWriter::create(wav, 24_000)?)
+    } else {
+        None
+    };
     let mut codec_elapsed = std::time::Duration::ZERO;
     let mut generated_frames = 0usize;
     for frame_index in 0..max_frames {
@@ -735,7 +739,9 @@ fn cuda_voice_design_smoke(
                 &mut codec_frames,
                 &mut codec_context,
                 chunk_context,
-                &mut streamed_audio,
+                wav_writer
+                    .as_mut()
+                    .expect("chunked decoding has a WAV writer"),
                 &mut kernels,
             )?;
         }
@@ -773,8 +779,10 @@ fn cuda_voice_design_smoke(
     let truncated = semantic != 2_150 && generated_frames == max_frames;
 
     let decode_started = std::time::Instant::now();
-    let audio = if chunk_frames == 0 {
-        codec.decode_frames_audio(&codec_frames, &mut kernels)?
+    let audio_samples = if chunk_frames == 0 {
+        let audio = codec.decode_frames_audio(&codec_frames, &mut kernels)?;
+        write_pcm16_wav(wav, &audio, 24_000)?;
+        audio.len()
     } else {
         if !codec_frames.is_empty() {
             codec_elapsed += decode_codec_chunk(
@@ -782,19 +790,23 @@ fn cuda_voice_design_smoke(
                 &mut codec_frames,
                 &mut codec_context,
                 chunk_context,
-                &mut streamed_audio,
+                wav_writer
+                    .as_mut()
+                    .expect("chunked decoding has a WAV writer"),
                 &mut kernels,
             )?;
         }
-        streamed_audio
+        wav_writer
+            .take()
+            .expect("chunked decoding has a WAV writer")
+            .finish()?
     };
     let decode_elapsed = if chunk_frames == 0 {
         decode_started.elapsed()
     } else {
         codec_elapsed
     };
-    write_pcm16_wav(wav, &audio, 24_000)?;
-    let audio_seconds = audio.len() as f64 / 24_000.0;
+    let audio_seconds = audio_samples as f64 / 24_000.0;
     let inference_seconds = prompt_elapsed.as_secs_f64()
         + generation_elapsed.as_secs_f64()
         + decode_elapsed.as_secs_f64();
@@ -829,7 +841,7 @@ fn decode_codec_chunk(
     pending: &mut Vec<Vec<i32>>,
     context: &mut Vec<Vec<i32>>,
     context_frames: usize,
-    output: &mut Vec<f32>,
+    output: &mut Pcm16WavWriter,
     kernels: &mut chew_kernel::GpuKernels,
 ) -> anyhow::Result<std::time::Duration> {
     if pending.is_empty() {
@@ -844,7 +856,7 @@ fn decode_codec_chunk(
     let started = std::time::Instant::now();
     let decoded = codec.decode_frames_audio(&decode_frames, kernels)?;
     let elapsed = started.elapsed();
-    output.extend_from_slice(&decoded[prefix_frames * SAMPLES_PER_FRAME..]);
+    output.write_samples(&decoded[prefix_frames * SAMPLES_PER_FRAME..])?;
 
     let keep = context_frames.min(decode_frames.len());
     context.clear();
@@ -984,33 +996,67 @@ fn write_pcm16_wav(
     samples: &[f32],
     sample_rate: u32,
 ) -> anyhow::Result<()> {
-    let data_bytes = samples
-        .len()
-        .checked_mul(2)
-        .context("WAV data is too large")?;
-    let data_bytes = u32::try_from(data_bytes).context("WAV data exceeds 4 GiB")?;
-    let riff_size = 36u32
-        .checked_add(data_bytes)
-        .context("WAV RIFF size overflow")?;
-    let mut file = std::fs::File::create(path)
-        .with_context(|| format!("could not create WAV {}", path.display()))?;
-    file.write_all(b"RIFF")?;
-    file.write_all(&riff_size.to_le_bytes())?;
-    file.write_all(b"WAVEfmt ")?;
-    file.write_all(&16u32.to_le_bytes())?;
-    file.write_all(&1u16.to_le_bytes())?;
-    file.write_all(&1u16.to_le_bytes())?;
-    file.write_all(&sample_rate.to_le_bytes())?;
-    file.write_all(&(sample_rate * 2).to_le_bytes())?;
-    file.write_all(&2u16.to_le_bytes())?;
-    file.write_all(&16u16.to_le_bytes())?;
-    file.write_all(b"data")?;
-    file.write_all(&data_bytes.to_le_bytes())?;
-    for sample in samples {
-        let pcm = (sample.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16;
-        file.write_all(&pcm.to_le_bytes())?;
+    let mut writer = Pcm16WavWriter::create(path, sample_rate)?;
+    writer.write_samples(samples)?;
+    writer.finish().map(|_| ())
+}
+
+struct Pcm16WavWriter {
+    file: std::fs::File,
+    samples: usize,
+}
+
+impl Pcm16WavWriter {
+    fn create(path: &std::path::Path, sample_rate: u32) -> anyhow::Result<Self> {
+        let mut file = std::fs::File::create(path)
+            .with_context(|| format!("could not create WAV {}", path.display()))?;
+        file.write_all(b"RIFF")?;
+        file.write_all(&36u32.to_le_bytes())?;
+        file.write_all(b"WAVEfmt ")?;
+        file.write_all(&16u32.to_le_bytes())?;
+        file.write_all(&1u16.to_le_bytes())?;
+        file.write_all(&1u16.to_le_bytes())?;
+        file.write_all(&sample_rate.to_le_bytes())?;
+        file.write_all(&(sample_rate * 2).to_le_bytes())?;
+        file.write_all(&2u16.to_le_bytes())?;
+        file.write_all(&16u16.to_le_bytes())?;
+        file.write_all(b"data")?;
+        file.write_all(&0u32.to_le_bytes())?;
+        Ok(Self { file, samples: 0 })
     }
-    Ok(())
+
+    fn write_samples(&mut self, samples: &[f32]) -> anyhow::Result<()> {
+        let new_samples = self
+            .samples
+            .checked_add(samples.len())
+            .context("WAV sample count overflow")?;
+        let data_bytes = new_samples
+            .checked_mul(2)
+            .context("WAV data is too large")?;
+        u32::try_from(data_bytes).context("WAV data exceeds 4 GiB")?;
+
+        let mut pcm = Vec::with_capacity(samples.len() * 2);
+        for sample in samples {
+            let value = (sample.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16;
+            pcm.extend_from_slice(&value.to_le_bytes());
+        }
+        self.file.write_all(&pcm)?;
+        self.samples = new_samples;
+        Ok(())
+    }
+
+    fn finish(mut self) -> anyhow::Result<usize> {
+        let data_bytes = u32::try_from(self.samples * 2).context("WAV data exceeds 4 GiB")?;
+        let riff_size = 36u32
+            .checked_add(data_bytes)
+            .context("WAV RIFF size overflow")?;
+        self.file.seek(SeekFrom::Start(4))?;
+        self.file.write_all(&riff_size.to_le_bytes())?;
+        self.file.seek(SeekFrom::Start(40))?;
+        self.file.write_all(&data_bytes.to_le_bytes())?;
+        self.file.flush()?;
+        Ok(self.samples)
+    }
 }
 
 fn cuda_predictor_smoke(

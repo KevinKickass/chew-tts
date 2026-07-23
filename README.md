@@ -239,7 +239,9 @@ timeline on CUDA's large X grid dimension, so output is not limited by the
 
 By default, generated codes are drained through a bounded 32-frame codec
 buffer with 64 previous frames of causal context. This caps the codec working
-set at 96 frames and enables early audio delivery. For the 6.88-second
+set at 96 frames and enables early audio delivery. PCM chunks are written
+immediately through a streaming WAV sink; generated audio is not accumulated
+in RAM, and the header is finalized at EOS. For the 6.88-second
 VoiceDesign validation sample, chunked output differs from full-sequence
 decoding by only 0.72 PCM16 levels on average (26 maximum) and remains faster
 than real time at RTF 0.83. Use `--chunk-frames 0` for exact full-sequence
