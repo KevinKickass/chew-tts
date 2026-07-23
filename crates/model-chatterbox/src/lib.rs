@@ -5,10 +5,14 @@ use std::path::{Path, PathBuf};
 
 mod cuda;
 mod frontend;
+mod s3gen;
 mod tokenizer;
 
 pub use cuda::{ChatterboxT3Layer, ChatterboxT3Transformer};
 pub use frontend::{ChatterboxT3Frontend, ChatterboxT3Prefix};
+pub use s3gen::{
+    ChatterboxS3ConformerLayer, ChatterboxS3Encoder, S3_HIDDEN_SIZE, S3_INTERMEDIATE_SIZE,
+};
 pub use tokenizer::{ChatterboxTokenizer, normalize_multilingual_text};
 
 pub const TEXT_VOCAB_SIZE: usize = 2_454;

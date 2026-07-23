@@ -1069,6 +1069,62 @@ __global__ void mha_naive_full(const __half* __restrict__ q,
     }
 }
 
+// Full bidirectional ESPnet relative-position attention. One block handles
+// one (head, query-position) pair. S3Gen sequences are short enough that this
+// correctness-first implementation is practical.
+__global__ void mha_relative_full(const __half* __restrict__ q,
+                                  const __half* __restrict__ k,
+                                  const __half* __restrict__ v,
+                                  const __half* __restrict__ pos,
+                                  const __half* __restrict__ bias_u,
+                                  const __half* __restrict__ bias_v,
+                                  __half* __restrict__ out,
+                                  int head_dim,
+                                  int n_heads,
+                                  int seq_len) {
+    if (threadIdx.x != 0 || threadIdx.y != 0) return;
+    const int head = blockIdx.x;
+    const int query_pos = blockIdx.y;
+    const int width = n_heads * head_dim;
+    const int q_base = query_pos * width + head * head_dim;
+
+    extern __shared__ float scratch[];
+    float* scores = scratch;
+    float* probs = scratch + seq_len;
+    const float scale = rsqrtf((float)head_dim);
+    float maximum = -3.402823466e+38F;
+    for (int key_pos = 0; key_pos < seq_len; ++key_pos) {
+        const int k_base = key_pos * width + head * head_dim;
+        const int p_base =
+            (seq_len - 1 - query_pos + key_pos) * width + head * head_dim;
+        float score = 0.0f;
+        for (int d = 0; d < head_dim; ++d) {
+            const float qv = __half2float(q[q_base + d]);
+            score += (qv + __half2float(bias_u[head * head_dim + d]))
+                * __half2float(k[k_base + d]);
+            score += (qv + __half2float(bias_v[head * head_dim + d]))
+                * __half2float(pos[p_base + d]);
+        }
+        score *= scale;
+        scores[key_pos] = score;
+        maximum = fmaxf(maximum, score);
+    }
+    float denominator = 0.0f;
+    for (int key_pos = 0; key_pos < seq_len; ++key_pos) {
+        probs[key_pos] = expf(scores[key_pos] - maximum);
+        denominator += probs[key_pos];
+    }
+    const float inv_denominator = denominator > 0.0f ? 1.0f / denominator : 0.0f;
+    for (int d = 0; d < head_dim; ++d) {
+        float value = 0.0f;
+        for (int key_pos = 0; key_pos < seq_len; ++key_pos) {
+            const int v_index = key_pos * width + head * head_dim + d;
+            value += probs[key_pos] * inv_denominator * __half2float(v[v_index]);
+        }
+        out[q_base + d] = __float2half(value);
+    }
+}
+
 // --- Naive MHA with an explicit additive attention mask (DiffusionGemma) ---
 // Same as mha_naive_full, but adds mask[q_pos * kv_len + kp] to each score
 // before the softmax. Mask convention: 0.0 = allowed, large-negative = blocked.
@@ -2344,6 +2400,49 @@ __global__ void conv1d_causal_f16(const __half* __restrict__ x,
     }
 }
 
+__global__ void conv1d_padded_f16(const __half* __restrict__ x,
+                                  const __half* __restrict__ weight,
+                                  const __half* __restrict__ bias,
+                                  __half* __restrict__ out,
+                                  int in_channels,
+                                  int out_channels,
+                                  int seq_len,
+                                  int kernel_size,
+                                  int left_padding) {
+    const int position = blockIdx.x;
+    const int out_channel = blockIdx.y;
+    float sum = 0.0f;
+    const int work = in_channels * kernel_size;
+    for (int item = threadIdx.x; item < work; item += blockDim.x) {
+        const int input_channel = item / kernel_size;
+        const int kernel_index = item % kernel_size;
+        const int source = position + kernel_index - left_padding;
+        if (source >= 0 && source < seq_len) {
+            sum += __half2float(x[input_channel * seq_len + source])
+                * __half2float(weight[
+                    (out_channel * in_channels + input_channel) * kernel_size
+                    + kernel_index]);
+        }
+    }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+    __shared__ float warp_sums[8];
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    if (lane == 0) warp_sums[warp] = sum;
+    __syncthreads();
+    if (warp == 0) {
+        sum = lane < 8 ? warp_sums[lane] : 0.0f;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+        if (lane == 0)
+            out[out_channel * seq_len + position] =
+                __float2half(sum + __half2float(bias[out_channel]));
+    }
+}
+
 // Streaming causal convolution. x contains history followed by new positions;
 // out contains only the new positions.
 __global__ void conv1d_causal_offset_f16(
@@ -2541,6 +2640,32 @@ __global__ void silu_act_f16(const __half* __restrict__ x,
     if (index < n) {
         const float value = __half2float(x[index]);
         out[index] = __float2half(value / (1.0f + expf(-value)));
+    }
+}
+
+__global__ void leaky_relu_f16(const __half* __restrict__ x,
+                               __half* __restrict__ out,
+                               int n,
+                               float negative_slope) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < n) {
+        const float value = __half2float(x[index]);
+        out[index] = __float2half(value >= 0.0f ? value : value * negative_slope);
+    }
+}
+
+__global__ void repeat_interleave_f16(const __half* __restrict__ x,
+                                      __half* __restrict__ out,
+                                      int channels,
+                                      int seq_len,
+                                      int repeats) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    const int output_len = seq_len * repeats;
+    const int n = channels * output_len;
+    if (index < n) {
+        const int channel = index / output_len;
+        const int position = index % output_len;
+        out[index] = x[channel * seq_len + position / repeats];
     }
 }
 

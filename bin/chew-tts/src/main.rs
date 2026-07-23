@@ -1,8 +1,9 @@
 use anyhow::Context;
 use chew_model_chatterbox::{
-    ChatterboxConditioning, ChatterboxT3Frontend, ChatterboxT3Layer, ChatterboxT3Transformer,
-    ChatterboxTokenizer, HIDDEN_SIZE as CHATTERBOX_HIDDEN_SIZE,
-    INTERMEDIATE_SIZE as CHATTERBOX_INTERMEDIATE_SIZE, inspect_model as inspect_chatterbox_model,
+    ChatterboxConditioning, ChatterboxS3ConformerLayer, ChatterboxS3Encoder, ChatterboxT3Frontend,
+    ChatterboxT3Layer, ChatterboxT3Transformer, ChatterboxTokenizer,
+    HIDDEN_SIZE as CHATTERBOX_HIDDEN_SIZE, INTERMEDIATE_SIZE as CHATTERBOX_INTERMEDIATE_SIZE,
+    S3_HIDDEN_SIZE, inspect_model as inspect_chatterbox_model,
 };
 use chew_model_kokoro::{KokoroVoice, inspect_model as inspect_kokoro_model};
 use chew_model_qwen3_tts::{
@@ -122,6 +123,31 @@ enum Command {
         /// Compare a split cached decode against one-pass prefill.
         #[arg(long)]
         compare_cache: bool,
+    },
+    /// Run one native S3Gen relative-attention Conformer block on local CUDA.
+    CudaChatterboxS3LayerSmoke {
+        /// Directory containing s3gen_v3.safetensors.
+        model_dir: PathBuf,
+        /// Zero-based CUDA device index.
+        #[arg(long, default_value_t = 0)]
+        gpu: usize,
+        /// Conformer layer within the selected six- or four-layer stage.
+        #[arg(long, default_value_t = 0)]
+        layer: usize,
+        /// Select the four layers after the 2x upsampling operation.
+        #[arg(long)]
+        upsampled: bool,
+        /// Number of deterministic test frames.
+        #[arg(long, default_value_t = 8)]
+        seq_len: usize,
+    },
+    /// Run the complete native S3Gen token-conditioning encoder.
+    CudaChatterboxS3EncoderSmoke {
+        model_dir: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        gpu: usize,
+        #[arg(long, default_value_t = 8)]
+        tokens: usize,
     },
     /// Generate native Chatterbox speech tokens through the complete T3 path.
     CudaChatterboxGenerationSmoke {
@@ -648,6 +674,65 @@ fn main() -> anyhow::Result<()> {
             println!(
                 "Chatterbox T3 {} CUDA: sum={sum:.9}, sum_sq={sum_sq:.9}, first={:?}",
                 if stack { "stack" } else { "layer" },
+                &output[..8]
+            );
+        }
+        Command::CudaChatterboxS3LayerSmoke {
+            model_dir,
+            gpu,
+            layer,
+            upsampled,
+            seq_len,
+        } => {
+            anyhow::ensure!(seq_len > 0, "sequence length must be non-zero");
+            let allocator = chew_vram::VramAllocator::init()?;
+            anyhow::ensure!(
+                gpu < allocator.gpu_count(),
+                "GPU index {gpu} is out of range; detected {} device(s)",
+                allocator.gpu_count()
+            );
+            let stream = std::sync::Arc::clone(allocator.stream(gpu));
+            let mut kernels =
+                chew_kernel::GpuKernels::load(&stream, S3_HIDDEN_SIZE * 2_048, 2_048)?;
+            let hidden = (0..seq_len * S3_HIDDEN_SIZE)
+                .map(|index| ((index as f32 * 0.013).sin() * 0.2) + 0.01)
+                .collect::<Vec<_>>();
+            let output = ChatterboxS3ConformerLayer::load(&model_dir, upsampled, layer, &stream)?
+                .forward(&hidden, seq_len, &mut kernels)?;
+            let sum = output.iter().map(|value| f64::from(*value)).sum::<f64>();
+            let sum_sq = output
+                .iter()
+                .map(|value| f64::from(*value) * f64::from(*value))
+                .sum::<f64>();
+            println!(
+                "Chatterbox S3Gen layer CUDA: sum={sum:.9}, sum_sq={sum_sq:.9}, first={:?}",
+                &output[..8]
+            );
+        }
+        Command::CudaChatterboxS3EncoderSmoke {
+            model_dir,
+            gpu,
+            tokens,
+        } => {
+            anyhow::ensure!(tokens > 0, "token count must be non-zero");
+            let allocator = chew_vram::VramAllocator::init()?;
+            anyhow::ensure!(gpu < allocator.gpu_count(), "GPU index out of range");
+            let stream = std::sync::Arc::clone(allocator.stream(gpu));
+            let mut kernels =
+                chew_kernel::GpuKernels::load(&stream, S3_HIDDEN_SIZE * 2_048, 2_048)?;
+            let model = ChatterboxS3Encoder::load(&model_dir, &stream)?;
+            let ids = (0..tokens)
+                .map(|index| ((index * 977 + 31) % 6_561) as i32)
+                .collect::<Vec<_>>();
+            let output = model.encode(&ids, &mut kernels)?;
+            let sum = output.iter().map(|x| f64::from(*x)).sum::<f64>();
+            let sum_sq = output
+                .iter()
+                .map(|x| f64::from(*x) * f64::from(*x))
+                .sum::<f64>();
+            println!(
+                "Chatterbox S3Gen encoder CUDA: frames={}, sum={sum:.9}, sum_sq={sum_sq:.9}, first={:?}",
+                output.len() / 80,
                 &output[..8]
             );
         }

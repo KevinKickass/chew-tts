@@ -44,6 +44,7 @@ pub struct OpsKernels {
     mha_fused: CudaFunction,
     mha_naive: CudaFunction,
     mha_naive_full: CudaFunction,
+    mha_relative_full: CudaFunction,
     mha_naive_masked: CudaFunction,
     gather_rows_f16: CudaFunction,
     scatter_add_rows_f16: CudaFunction,
@@ -77,6 +78,7 @@ pub struct OpsKernels {
     softmax_topk: CudaFunction,
     fused_moe_router: CudaFunction,
     conv1d_causal_f16: CudaFunction,
+    conv1d_padded_f16: CudaFunction,
     conv1d_causal_offset_f16: CudaFunction,
     unfold_causal_f16: CudaFunction,
     scatter_conv_transpose_phase_f16: CudaFunction,
@@ -84,6 +86,8 @@ pub struct OpsKernels {
     transpose_f16: CudaFunction,
     gelu_erf_f16: CudaFunction,
     silu_act_f16: CudaFunction,
+    leaky_relu_f16: CudaFunction,
+    repeat_interleave_f16: CudaFunction,
     snake_beta_f16: CudaFunction,
     clamp_f16: CudaFunction,
 }
@@ -123,6 +127,7 @@ impl OpsKernels {
             mha_fused: loader::get_fn(&module, "mha_fused")?,
             mha_naive: loader::get_fn(&module, "mha_naive")?,
             mha_naive_full: loader::get_fn(&module, "mha_naive_full")?,
+            mha_relative_full: loader::get_fn(&module, "mha_relative_full")?,
             mha_naive_masked: loader::get_fn(&module, "mha_naive_masked")?,
             gather_rows_f16: loader::get_fn(&module, "gather_rows_f16")?,
             scatter_add_rows_f16: loader::get_fn(&module, "scatter_add_rows_f16")?,
@@ -153,6 +158,7 @@ impl OpsKernels {
             softmax_topk: loader::get_fn(&module, "softmax_topk")?,
             fused_moe_router: loader::get_fn(&module, "fused_moe_router")?,
             conv1d_causal_f16: loader::get_fn(&module, "conv1d_causal_f16")?,
+            conv1d_padded_f16: loader::get_fn(&module, "conv1d_padded_f16")?,
             conv1d_causal_offset_f16: loader::get_fn(&module, "conv1d_causal_offset_f16")?,
             unfold_causal_f16: loader::get_fn(&module, "unfold_causal_f16")?,
             scatter_conv_transpose_phase_f16: loader::get_fn(
@@ -163,6 +169,8 @@ impl OpsKernels {
             transpose_f16: loader::get_fn(&module, "transpose_f16")?,
             gelu_erf_f16: loader::get_fn(&module, "gelu_erf_f16")?,
             silu_act_f16: loader::get_fn(&module, "silu_act_f16")?,
+            leaky_relu_f16: loader::get_fn(&module, "leaky_relu_f16")?,
+            repeat_interleave_f16: loader::get_fn(&module, "repeat_interleave_f16")?,
             snake_beta_f16: loader::get_fn(&module, "snake_beta_f16")?,
             clamp_f16: loader::get_fn(&module, "clamp_f16")?,
             _module: module,
@@ -216,6 +224,49 @@ impl OpsKernels {
                 },
                 &mut args,
             )?;
+        }
+        Ok(())
+    }
+
+    /// Channel-first Conv1d with explicit left padding. Positions outside the
+    /// input are zero and the output length equals the input length.
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv1d_padded_f16(
+        &self,
+        x: &CudaSlice<half::f16>,
+        weight: &CudaSlice<half::f16>,
+        bias: &CudaSlice<half::f16>,
+        out: &mut CudaSlice<half::f16>,
+        in_channels: u32,
+        out_channels: u32,
+        seq_len: u32,
+        kernel_size: u32,
+        left_padding: u32,
+    ) -> Result<(), KernelError> {
+        let ic = in_channels as i32;
+        let oc = out_channels as i32;
+        let sl = seq_len as i32;
+        let ks = kernel_size as i32;
+        let lp = left_padding as i32;
+        let mut args: [*mut c_void; 9] = [
+            slice_ptr(x),
+            slice_ptr(weight),
+            slice_ptr(bias),
+            slice_ptr_mut(out),
+            scalar_ptr(&ic),
+            scalar_ptr(&oc),
+            scalar_ptr(&sl),
+            scalar_ptr(&ks),
+            scalar_ptr(&lp),
+        ];
+        unsafe {
+            self.fast.fire(
+                &self.conv1d_padded_f16,
+                (seq_len, out_channels, 1),
+                (256, 1, 1),
+                0,
+                &mut args,
+            );
         }
         Ok(())
     }
@@ -460,6 +511,66 @@ impl OpsKernels {
             self.fast.fire(
                 &self.silu_act_f16,
                 ((n + threads - 1) / threads, 1, 1),
+                (threads, 1, 1),
+                0,
+                &mut args,
+            );
+        }
+        Ok(())
+    }
+
+    pub fn leaky_relu_f16(
+        &self,
+        x: &CudaSlice<half::f16>,
+        out: &mut CudaSlice<half::f16>,
+        n: u32,
+        negative_slope: f32,
+    ) -> Result<(), KernelError> {
+        let threads = 256;
+        let n_i = n as i32;
+        let mut args: [*mut c_void; 4] = [
+            slice_ptr(x),
+            slice_ptr_mut(out),
+            scalar_ptr(&n_i),
+            scalar_ptr(&negative_slope),
+        ];
+        unsafe {
+            self.fast.fire(
+                &self.leaky_relu_f16,
+                (n.div_ceil(threads), 1, 1),
+                (threads, 1, 1),
+                0,
+                &mut args,
+            );
+        }
+        Ok(())
+    }
+
+    /// Repeat each position of channel-first [channels, seq_len] input.
+    pub fn repeat_interleave_f16(
+        &self,
+        x: &CudaSlice<half::f16>,
+        out: &mut CudaSlice<half::f16>,
+        channels: u32,
+        seq_len: u32,
+        repeats: u32,
+    ) -> Result<(), KernelError> {
+        let n = channels * seq_len * repeats;
+        let threads = 256;
+        let channels_i = channels as i32;
+        let seq_len_i = seq_len as i32;
+        let repeats_i = repeats as i32;
+        let mut args: [*mut c_void; 5] = [
+            slice_ptr(x),
+            slice_ptr_mut(out),
+            scalar_ptr(&channels_i),
+            scalar_ptr(&seq_len_i),
+            scalar_ptr(&repeats_i),
+        ];
+        unsafe {
+            self.fast.fire(
+                &self.repeat_interleave_f16,
+                (n.div_ceil(threads), 1, 1),
                 (threads, 1, 1),
                 0,
                 &mut args,
@@ -2423,6 +2534,49 @@ impl OpsKernels {
         unsafe {
             self.fast.fire(
                 &self.mha_naive_full,
+                (n_heads, seq_len, 1),
+                (1, 1, 1),
+                smem,
+                &mut args,
+            );
+        }
+        Ok(())
+    }
+
+    /// Full ESPnet relative-position attention used by S3Gen's Conformer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mha_relative_full(
+        &self,
+        q: &CudaSlice<half::f16>,
+        k: &CudaSlice<half::f16>,
+        v: &CudaSlice<half::f16>,
+        pos: &CudaSlice<half::f16>,
+        bias_u: &CudaSlice<half::f16>,
+        bias_v: &CudaSlice<half::f16>,
+        out: &mut CudaSlice<half::f16>,
+        head_dim: u32,
+        n_heads: u32,
+        seq_len: u32,
+    ) -> Result<(), KernelError> {
+        let smem = (2 * seq_len as usize * std::mem::size_of::<f32>()) as u32;
+        let hd = head_dim as i32;
+        let nh = n_heads as i32;
+        let sl = seq_len as i32;
+        let mut args: [*mut c_void; 10] = [
+            slice_ptr(q),
+            slice_ptr(k),
+            slice_ptr(v),
+            slice_ptr(pos),
+            slice_ptr(bias_u),
+            slice_ptr(bias_v),
+            slice_ptr_mut(out),
+            scalar_ptr(&hd),
+            scalar_ptr(&nh),
+            scalar_ptr(&sl),
+        ];
+        unsafe {
+            self.fast.fire(
+                &self.mha_relative_full,
                 (n_heads, seq_len, 1),
                 (1, 1, 1),
                 smem,

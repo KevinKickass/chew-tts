@@ -58,7 +58,12 @@ Implemented:
 - native Chatterbox Multilingual V3 T3, S3Gen, and voice-encoder artifact
   validation;
 - GPU-resident execution of all 30 Chatterbox T3 Llama layers and final norm,
-  checked against the official PyTorch weights on an RTX 3080.
+  with Llama 3 RoPE and persistent multi-token KV caches;
+- native Chatterbox multilingual tokenization, speaker/emotion conditioning,
+  Perceiver prompt encoding, CFG, and autoregressive speech-token generation;
+- the complete native S3Gen token-conditioning encoder: lookahead convolution,
+  6+4 relative-attention Conformer blocks, 2x upsampling, and the 80-bin flow
+  projection, checked against the official FP16 PyTorch path on an RTX 3080.
 
 Next:
 
@@ -66,8 +71,7 @@ Next:
 - optimized one-pass model loading and GPU-resident sampling;
 - arbitrary compressed reference-audio input in addition to native WAV;
 - Kokoro Albert, duration/prosody, and iSTFTNet CUDA inference;
-- Chatterbox T3 multi-token KV cache, conditioning/tokenization, and S3Gen
-  speech decoding.
+- Chatterbox S3Gen conditional-flow decoder and HiFT waveform generator.
 
 ## Why a separate repository?
 
@@ -139,6 +143,18 @@ Run the native Chatterbox T3 CUDA stack:
 cargo run --release -p chew-tts -- \
   cuda-chatterbox-layer-smoke /models/chatterbox-v3 --gpu 0 --stack
 ```
+
+Run the complete native S3Gen token-conditioning encoder:
+
+```bash
+cargo run --release -p chew-tts -- \
+  cuda-chatterbox-s3-encoder-smoke /models/chatterbox-v3 --gpu 0 --tokens 257
+```
+
+For 257 input tokens (157 reference tokens plus a representative 100 generated
+tokens), the encoder produces 514 flow-conditioning frames in about 1.15
+seconds wall time on an RTX 3080, including process startup, model loading, and
+NVRTC kernel loading.
 
 ## CUDA validation
 
