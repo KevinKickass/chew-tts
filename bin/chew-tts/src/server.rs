@@ -11,6 +11,7 @@ use serde::Deserialize;
 use serde_json::json;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
@@ -23,6 +24,7 @@ const SAMPLE_RATE: u32 = 24_000;
 const DEFAULT_INSTRUCTION: &str = "A natural, clear studio voice.";
 const MAX_SYNTHESIS_SEGMENT_CHARS: usize = 350;
 const SEGMENT_GAP_SAMPLES: usize = 1_200;
+static REQUEST_SEED_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 struct Job {
     request: SynthesisRequest,
@@ -119,8 +121,8 @@ struct SpeechRequest {
     temperature: f32,
     #[serde(default = "default_top_k")]
     top_k: usize,
-    #[serde(default = "default_seed")]
-    seed: u64,
+    #[serde(default)]
+    seed: Option<u64>,
     #[serde(default)]
     max_frames: Option<usize>,
     #[serde(default, alias = "reference_audio_base64", alias = "ref_audio")]
@@ -147,8 +149,20 @@ fn default_temperature() -> f32 {
 fn default_top_k() -> usize {
     50
 }
-fn default_seed() -> u64 {
-    42
+fn next_request_seed() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let counter = REQUEST_SEED_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let mut seed = elapsed.as_secs()
+        ^ u64::from(elapsed.subsec_nanos()).rotate_left(32)
+        ^ counter.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    if seed == 0 {
+        seed = counter.max(1);
+    }
+    seed
 }
 
 pub async fn run(
@@ -574,7 +588,7 @@ async fn submit(state: &Arc<AppState>, request: SpeechRequest) -> Result<Generat
         language: normalize_language(&request.language),
         speed: request.speed,
         max_frames: request.max_frames.unwrap_or(state.max_frames),
-        seed: request.seed,
+        seed: request.seed.unwrap_or_else(next_request_seed),
         temperature: request.temperature,
         top_k: request.top_k,
         chunk_frames: 32,
@@ -899,6 +913,25 @@ mod tests {
         assert_eq!(request.reference_text.as_deref(), Some("Guten Abend."));
         assert_eq!(request.speed, 1.1);
         assert!(request.model.is_none());
+        assert!(request.seed.is_none());
+    }
+
+    #[test]
+    fn preserves_an_explicit_sampling_seed() {
+        let request: SpeechRequest = serde_json::from_value(json!({
+            "input": "Guten Abend.",
+            "seed": 42
+        }))
+        .unwrap();
+        assert_eq!(request.seed, Some(42));
+    }
+
+    #[test]
+    fn implicit_sampling_seeds_change_between_requests() {
+        let first = next_request_seed();
+        let second = next_request_seed();
+        assert_ne!(first, 0);
+        assert_ne!(first, second);
     }
 
     #[test]
