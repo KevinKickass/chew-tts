@@ -1,9 +1,10 @@
 use anyhow::Context;
 use chew_model_chatterbox::{
-    ChatterboxConditioning, ChatterboxS3ConformerLayer, ChatterboxS3Encoder, ChatterboxT3Frontend,
-    ChatterboxT3Layer, ChatterboxT3Transformer, ChatterboxTokenizer,
-    HIDDEN_SIZE as CHATTERBOX_HIDDEN_SIZE, INTERMEDIATE_SIZE as CHATTERBOX_INTERMEDIATE_SIZE,
-    S3_HIDDEN_SIZE, inspect_model as inspect_chatterbox_model,
+    ChatterboxConditioning, ChatterboxFlowTransformerBlock, ChatterboxS3ConformerLayer,
+    ChatterboxS3Encoder, ChatterboxT3Frontend, ChatterboxT3Layer, ChatterboxT3Transformer,
+    ChatterboxTokenizer, HIDDEN_SIZE as CHATTERBOX_HIDDEN_SIZE,
+    INTERMEDIATE_SIZE as CHATTERBOX_INTERMEDIATE_SIZE, S3_HIDDEN_SIZE,
+    inspect_model as inspect_chatterbox_model,
 };
 use chew_model_kokoro::{KokoroVoice, inspect_model as inspect_kokoro_model};
 use chew_model_qwen3_tts::{
@@ -148,6 +149,16 @@ enum Command {
         gpu: usize,
         #[arg(long, default_value_t = 8)]
         tokens: usize,
+    },
+    /// Run one transformer block from the S3Gen conditional-flow estimator.
+    CudaChatterboxFlowBlockSmoke {
+        model_dir: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        gpu: usize,
+        #[arg(long, default_value = "flow.decoder.estimator.mid_blocks.0.1.0")]
+        prefix: String,
+        #[arg(long, default_value_t = 8)]
+        seq_len: usize,
     },
     /// Generate native Chatterbox speech tokens through the complete T3 path.
     CudaChatterboxGenerationSmoke {
@@ -733,6 +744,32 @@ fn main() -> anyhow::Result<()> {
             println!(
                 "Chatterbox S3Gen encoder CUDA: frames={}, sum={sum:.9}, sum_sq={sum_sq:.9}, first={:?}",
                 output.len() / 80,
+                &output[..8]
+            );
+        }
+        Command::CudaChatterboxFlowBlockSmoke {
+            model_dir,
+            gpu,
+            prefix,
+            seq_len,
+        } => {
+            anyhow::ensure!(seq_len > 0, "sequence length must be non-zero");
+            let allocator = chew_vram::VramAllocator::init()?;
+            anyhow::ensure!(gpu < allocator.gpu_count(), "GPU index out of range");
+            let stream = std::sync::Arc::clone(allocator.stream(gpu));
+            let mut kernels = chew_kernel::GpuKernels::load(&stream, 256 * 1_024, 1_024)?;
+            let input = (0..seq_len * 256)
+                .map(|i| (i as f32 * 0.013).sin() * 0.2 + 0.01)
+                .collect::<Vec<_>>();
+            let output = ChatterboxFlowTransformerBlock::load(&model_dir, &prefix, &stream)?
+                .forward(&input, seq_len, &mut kernels)?;
+            let sum = output.iter().map(|x| f64::from(*x)).sum::<f64>();
+            let sum_sq = output
+                .iter()
+                .map(|x| f64::from(*x) * f64::from(*x))
+                .sum::<f64>();
+            println!(
+                "Chatterbox flow block CUDA: sum={sum:.9}, sum_sq={sum_sq:.9}, first={:?}",
                 &output[..8]
             );
         }
