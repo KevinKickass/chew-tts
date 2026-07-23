@@ -12,6 +12,22 @@ const HEADS: usize = 8;
 const HEAD_DIM: usize = 64;
 const FF_DIM: usize = 1_024;
 
+pub struct ChatterboxFlowResnetBlock {
+    input_channels: usize,
+    conv1_weight: CudaSlice<f16>,
+    conv1_bias: CudaSlice<f16>,
+    norm1_weight: CudaSlice<f16>,
+    norm1_bias: CudaSlice<f16>,
+    time_weight: CudaSlice<f16>,
+    time_bias: CudaSlice<f16>,
+    conv2_weight: CudaSlice<f16>,
+    conv2_bias: CudaSlice<f16>,
+    norm2_weight: CudaSlice<f16>,
+    norm2_bias: CudaSlice<f16>,
+    residual_weight: CudaSlice<f16>,
+    residual_bias: CudaSlice<f16>,
+}
+
 /// The repeated BasicTransformerBlock in the S3Gen conditional-flow U-Net.
 pub struct ChatterboxFlowTransformerBlock {
     norm1_weight: CudaSlice<f16>,
@@ -176,4 +192,197 @@ impl ChatterboxFlowTransformerBlock {
         stream.memcpy_dtoh(&hidden, &mut output)?;
         Ok(output)
     }
+}
+
+impl ChatterboxFlowResnetBlock {
+    pub fn load(model_dir: &Path, prefix: &str, stream: &Arc<CudaStream>) -> anyhow::Result<Self> {
+        let weights = MappedSafetensors::open(model_dir.join("s3gen_v3.safetensors"))?;
+        let conv1_name = format!("{prefix}.block1.block.0.weight");
+        let (conv1_shape, conv1_values) = weights.tensor_f16(&conv1_name)?;
+        ensure!(
+            conv1_shape.len() == 3 && conv1_shape[0] == DIM && conv1_shape[2] == 3,
+            "{conv1_name} has invalid shape {conv1_shape:?}"
+        );
+        let input_channels = conv1_shape[1];
+        let load = |suffix: &str, shape: &[usize]| -> anyhow::Result<CudaSlice<f16>> {
+            let name = format!("{prefix}.{suffix}");
+            let (actual, values) = weights.tensor_f16(&name)?;
+            ensure!(
+                actual == shape,
+                "{name}: got {actual:?}, expected {shape:?}"
+            );
+            Ok(stream.clone_htod(&values)?)
+        };
+        Ok(Self {
+            input_channels,
+            conv1_weight: stream.clone_htod(&conv1_values)?,
+            conv1_bias: load("block1.block.0.bias", &[DIM])?,
+            norm1_weight: load("block1.block.2.weight", &[DIM])?,
+            norm1_bias: load("block1.block.2.bias", &[DIM])?,
+            time_weight: load("mlp.1.weight", &[DIM, FF_DIM])?,
+            time_bias: load("mlp.1.bias", &[DIM])?,
+            conv2_weight: load("block2.block.0.weight", &[DIM, DIM, 3])?,
+            conv2_bias: load("block2.block.0.bias", &[DIM])?,
+            norm2_weight: load("block2.block.2.weight", &[DIM])?,
+            norm2_bias: load("block2.block.2.bias", &[DIM])?,
+            residual_weight: load("res_conv.weight", &[DIM, input_channels, 1])?,
+            residual_bias: load("res_conv.bias", &[DIM])?,
+        })
+    }
+
+    /// Frame-major input and output. `time_embedding` is the estimator's
+    /// already-expanded 1024-value timestep vector.
+    pub fn forward(
+        &self,
+        input: &[f32],
+        seq_len: usize,
+        time_embedding: &[f32],
+        kernels: &mut GpuKernels,
+    ) -> anyhow::Result<Vec<f32>> {
+        ensure!(
+            input.len() == seq_len * self.input_channels && time_embedding.len() == FF_DIM,
+            "invalid flow ResNet input"
+        );
+        let stream = Arc::clone(kernels.ops.stream());
+        let input_f16 = input.iter().copied().map(f16::from_f32).collect::<Vec<_>>();
+        let input_f16 = stream.clone_htod(&input_f16)?;
+        let mut input_cf = stream.alloc_zeros::<f16>(input.len())?;
+        kernels.ops.transpose_f16(
+            &input_f16,
+            &mut input_cf,
+            seq_len as u32,
+            self.input_channels as u32,
+        )?;
+        let mut first_cf = stream.alloc_zeros::<f16>(seq_len * DIM)?;
+        kernels.ops.conv1d_causal_f16(
+            &input_cf,
+            &self.conv1_weight,
+            &self.conv1_bias,
+            &mut first_cf,
+            self.input_channels as u32,
+            DIM as u32,
+            seq_len as u32,
+            3,
+            1,
+            1,
+        )?;
+        let mut first = stream.alloc_zeros::<f16>(seq_len * DIM)?;
+        kernels
+            .ops
+            .transpose_f16(&first_cf, &mut first, DIM as u32, seq_len as u32)?;
+        first = norm_mish(
+            &first,
+            seq_len,
+            &self.norm1_weight,
+            &self.norm1_bias,
+            kernels,
+        )?;
+
+        let time = time_embedding
+            .iter()
+            .copied()
+            .map(f16::from_f32)
+            .collect::<Vec<_>>();
+        let mut time = stream.clone_htod(&time)?;
+        let mut time_mish = stream.alloc_zeros::<f16>(FF_DIM)?;
+        kernels.ops.mish_f16(&time, &mut time_mish, FF_DIM as u32)?;
+        std::mem::swap(&mut time, &mut time_mish);
+        let mut time_out = stream.alloc_zeros::<f16>(DIM)?;
+        kernels.gemv.gemv_f16(
+            &time,
+            &self.time_weight,
+            &mut time_out,
+            DIM as u32,
+            FF_DIM as u32,
+        )?;
+        kernels
+            .ops
+            .add_bias_f16_inplace(&mut time_out, &self.time_bias, 1, DIM as u32)?;
+        kernels
+            .ops
+            .add_bias_f16_inplace(&mut first, &time_out, seq_len as u32, DIM as u32)?;
+
+        let mut first_cf = stream.alloc_zeros::<f16>(seq_len * DIM)?;
+        kernels
+            .ops
+            .transpose_f16(&first, &mut first_cf, seq_len as u32, DIM as u32)?;
+        let mut second_cf = stream.alloc_zeros::<f16>(seq_len * DIM)?;
+        kernels.ops.conv1d_causal_f16(
+            &first_cf,
+            &self.conv2_weight,
+            &self.conv2_bias,
+            &mut second_cf,
+            DIM as u32,
+            DIM as u32,
+            seq_len as u32,
+            3,
+            1,
+            1,
+        )?;
+        let mut second = stream.alloc_zeros::<f16>(seq_len * DIM)?;
+        kernels
+            .ops
+            .transpose_f16(&second_cf, &mut second, DIM as u32, seq_len as u32)?;
+        second = norm_mish(
+            &second,
+            seq_len,
+            &self.norm2_weight,
+            &self.norm2_bias,
+            kernels,
+        )?;
+
+        let mut residual_cf = stream.alloc_zeros::<f16>(seq_len * DIM)?;
+        kernels.ops.conv1d_causal_f16(
+            &input_cf,
+            &self.residual_weight,
+            &self.residual_bias,
+            &mut residual_cf,
+            self.input_channels as u32,
+            DIM as u32,
+            seq_len as u32,
+            1,
+            1,
+            1,
+        )?;
+        let mut residual = stream.alloc_zeros::<f16>(seq_len * DIM)?;
+        kernels
+            .ops
+            .transpose_f16(&residual_cf, &mut residual, DIM as u32, seq_len as u32)?;
+        let mut output = stream.alloc_zeros::<f16>(seq_len * DIM)?;
+        kernels
+            .ops
+            .add_f16(&second, &residual, &mut output, (seq_len * DIM) as u32)?;
+        stream.synchronize()?;
+        let mut host = vec![f16::ZERO; seq_len * DIM];
+        stream.memcpy_dtoh(&output, &mut host)?;
+        Ok(host.into_iter().map(f16::to_f32).collect())
+    }
+}
+
+fn norm_mish(
+    input: &CudaSlice<f16>,
+    seq_len: usize,
+    weight: &CudaSlice<f16>,
+    bias: &CudaSlice<f16>,
+    kernels: &mut GpuKernels,
+) -> anyhow::Result<CudaSlice<f16>> {
+    let stream = Arc::clone(kernels.ops.stream());
+    let n = seq_len * DIM;
+    let mut input_f32 = stream.alloc_zeros::<f32>(n)?;
+    kernels
+        .ops
+        .copy_f16_to_f32(input, &mut input_f32, n as u32)?;
+    let mut normalized = stream.alloc_zeros::<f16>(n)?;
+    kernels.ops.layer_norm_f32in(
+        &input_f32,
+        weight,
+        bias,
+        &mut normalized,
+        seq_len as u32,
+        DIM as u32,
+        1e-5,
+    )?;
+    let mut output = stream.alloc_zeros::<f16>(n)?;
+    kernels.ops.mish_f16(&normalized, &mut output, n as u32)?;
+    Ok(output)
 }

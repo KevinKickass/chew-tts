@@ -1,8 +1,8 @@
 use anyhow::Context;
 use chew_model_chatterbox::{
-    ChatterboxConditioning, ChatterboxFlowTransformerBlock, ChatterboxS3ConformerLayer,
-    ChatterboxS3Encoder, ChatterboxT3Frontend, ChatterboxT3Layer, ChatterboxT3Transformer,
-    ChatterboxTokenizer, HIDDEN_SIZE as CHATTERBOX_HIDDEN_SIZE,
+    ChatterboxConditioning, ChatterboxFlowResnetBlock, ChatterboxFlowTransformerBlock,
+    ChatterboxS3ConformerLayer, ChatterboxS3Encoder, ChatterboxT3Frontend, ChatterboxT3Layer,
+    ChatterboxT3Transformer, ChatterboxTokenizer, HIDDEN_SIZE as CHATTERBOX_HIDDEN_SIZE,
     INTERMEDIATE_SIZE as CHATTERBOX_INTERMEDIATE_SIZE, S3_HIDDEN_SIZE,
     inspect_model as inspect_chatterbox_model,
 };
@@ -159,6 +159,18 @@ enum Command {
         prefix: String,
         #[arg(long, default_value_t = 8)]
         seq_len: usize,
+    },
+    /// Run one causal ResNet block from the S3Gen flow estimator.
+    CudaChatterboxFlowResnetSmoke {
+        model_dir: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        gpu: usize,
+        #[arg(long, default_value = "flow.decoder.estimator.mid_blocks.0.0")]
+        prefix: String,
+        #[arg(long, default_value_t = 8)]
+        seq_len: usize,
+        #[arg(long, default_value_t = 256)]
+        input_channels: usize,
     },
     /// Generate native Chatterbox speech tokens through the complete T3 path.
     CudaChatterboxGenerationSmoke {
@@ -770,6 +782,40 @@ fn main() -> anyhow::Result<()> {
                 .sum::<f64>();
             println!(
                 "Chatterbox flow block CUDA: sum={sum:.9}, sum_sq={sum_sq:.9}, first={:?}",
+                &output[..8]
+            );
+        }
+        Command::CudaChatterboxFlowResnetSmoke {
+            model_dir,
+            gpu,
+            prefix,
+            seq_len,
+            input_channels,
+        } => {
+            anyhow::ensure!(seq_len > 0, "sequence length must be non-zero");
+            let allocator = chew_vram::VramAllocator::init()?;
+            anyhow::ensure!(gpu < allocator.gpu_count(), "GPU index out of range");
+            let stream = std::sync::Arc::clone(allocator.stream(gpu));
+            let mut kernels = chew_kernel::GpuKernels::load(&stream, 512 * 1_024, 1_024)?;
+            let input = (0..seq_len * input_channels)
+                .map(|i| (i as f32 * 0.013).sin() * 0.2 + 0.01)
+                .collect::<Vec<_>>();
+            let time = (0..1_024)
+                .map(|i| (i as f32 * 0.009).cos() * 0.15)
+                .collect::<Vec<_>>();
+            let output = ChatterboxFlowResnetBlock::load(&model_dir, &prefix, &stream)?.forward(
+                &input,
+                seq_len,
+                &time,
+                &mut kernels,
+            )?;
+            let sum = output.iter().map(|x| f64::from(*x)).sum::<f64>();
+            let sum_sq = output
+                .iter()
+                .map(|x| f64::from(*x) * f64::from(*x))
+                .sum::<f64>();
+            println!(
+                "Chatterbox flow ResNet CUDA: sum={sum:.9}, sum_sq={sum_sq:.9}, first={:?}",
                 &output[..8]
             );
         }

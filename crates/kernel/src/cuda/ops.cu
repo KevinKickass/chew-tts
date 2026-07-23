@@ -2654,6 +2654,18 @@ __global__ void leaky_relu_f16(const __half* __restrict__ x,
     }
 }
 
+__global__ void mish_f16(const __half* __restrict__ x,
+                         __half* __restrict__ out,
+                         int n) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < n) {
+        const float value = __half2float(x[index]);
+        // Stable softplus for large positive inputs.
+        const float softplus = value > 20.0f ? value : log1pf(expf(value));
+        out[index] = __float2half(value * tanhf(softplus));
+    }
+}
+
 __global__ void repeat_interleave_f16(const __half* __restrict__ x,
                                       __half* __restrict__ out,
                                       int channels,

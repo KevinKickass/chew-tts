@@ -87,6 +87,7 @@ pub struct OpsKernels {
     gelu_erf_f16: CudaFunction,
     silu_act_f16: CudaFunction,
     leaky_relu_f16: CudaFunction,
+    mish_f16: CudaFunction,
     repeat_interleave_f16: CudaFunction,
     snake_beta_f16: CudaFunction,
     clamp_f16: CudaFunction,
@@ -170,6 +171,7 @@ impl OpsKernels {
             gelu_erf_f16: loader::get_fn(&module, "gelu_erf_f16")?,
             silu_act_f16: loader::get_fn(&module, "silu_act_f16")?,
             leaky_relu_f16: loader::get_fn(&module, "leaky_relu_f16")?,
+            mish_f16: loader::get_fn(&module, "mish_f16")?,
             repeat_interleave_f16: loader::get_fn(&module, "repeat_interleave_f16")?,
             snake_beta_f16: loader::get_fn(&module, "snake_beta_f16")?,
             clamp_f16: loader::get_fn(&module, "clamp_f16")?,
@@ -537,6 +539,27 @@ impl OpsKernels {
         unsafe {
             self.fast.fire(
                 &self.leaky_relu_f16,
+                (n.div_ceil(threads), 1, 1),
+                (threads, 1, 1),
+                0,
+                &mut args,
+            );
+        }
+        Ok(())
+    }
+
+    pub fn mish_f16(
+        &self,
+        x: &CudaSlice<half::f16>,
+        out: &mut CudaSlice<half::f16>,
+        n: u32,
+    ) -> Result<(), KernelError> {
+        let threads = 256;
+        let n_i = n as i32;
+        let mut args: [*mut c_void; 3] = [slice_ptr(x), slice_ptr_mut(out), scalar_ptr(&n_i)];
+        unsafe {
+            self.fast.fire(
+                &self.mish_f16,
                 (n.div_ceil(threads), 1, 1),
                 (threads, 1, 1),
                 0,
