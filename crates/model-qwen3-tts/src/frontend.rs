@@ -414,8 +414,13 @@ impl TalkerFrontend {
         )
     }
 
-    /// Build the common streaming prompt used by VoiceDesign, CustomVoice,
+    /// Build the common non-streaming prompt used by VoiceDesign, CustomVoice,
     /// and speaker-embedding-only Base generation.
+    ///
+    /// Qwen's public inference API defaults to this layout when the complete
+    /// target text is already available. Keeping target text in a trailing
+    /// lane instead enables its simulated streaming mode, which is less stable
+    /// and can occasionally leak conditioning text into the generated speech.
     pub fn build_conditioned_inputs(
         &self,
         text_ids: &[i32],
@@ -470,9 +475,6 @@ impl TalkerFrontend {
             control_codec.extend_from_slice(speaker);
         }
         control_codec.extend(self.codec_embeddings(&[CODEC_PAD], kernels)?);
-        let first_text = self.project_text_tokens(&text_ids[..1], kernels)?;
-        let codec_bos = self.codec_embeddings(&[CODEC_BOS], kernels)?;
-
         let mut prefill = Vec::with_capacity(instruction.len() + role.len() + 6 * self.hidden_size);
         prefill.extend(instruction);
         prefill.extend(role);
@@ -482,31 +484,49 @@ impl TalkerFrontend {
                 .zip(control_codec)
                 .map(|(text, codec)| text + codec),
         );
+
+        let mut target_ids = text_ids.to_vec();
+        target_ids.push(TTS_EOS);
+        let target_text = self.project_text_tokens(&target_ids, kernels)?;
+        let codec_pad = self.codec_embeddings(&[CODEC_PAD], kernels)?;
+        for token in 0..target_ids.len() {
+            let offset = token * self.hidden_size;
+            prefill.extend(
+                target_text[offset..offset + self.hidden_size]
+                    .iter()
+                    .zip(&codec_pad)
+                    .map(|(text, codec)| text + codec),
+            );
+        }
+
+        let text_pad = self.project_text_tokens(&[TTS_PAD], kernels)?;
+        let codec_bos = self.codec_embeddings(&[CODEC_BOS], kernels)?;
         prefill.extend(
-            first_text
+            text_pad
                 .iter()
                 .zip(codec_bos)
                 .map(|(text, codec)| text + codec),
         );
         let prefill_tokens = prefill.len() / self.hidden_size;
 
-        let mut trailing_ids = text_ids[1..].to_vec();
-        trailing_ids.push(TTS_EOS);
-        let trailing_tokens = trailing_ids.len();
-        let trailing_text = self.project_text_tokens(&trailing_ids, kernels)?;
-        let text_pad = self.project_text_tokens(&[TTS_PAD], kernels)?;
-
         Ok(VoiceDesignInputs {
             prefill,
             prefill_tokens,
-            trailing_text,
-            trailing_tokens,
+            trailing_text: Vec::new(),
+            trailing_tokens: 0,
             text_pad,
         })
     }
 
-    /// Build Qwen's streaming in-context-learning prompt from reference text
-    /// and the reference audio's 16-codebook frames.
+    /// Build Qwen's non-streaming in-context-learning prompt from reference
+    /// text and the reference audio's 16-codebook frames.
+    ///
+    /// The official Base inference path deliberately places the complete
+    /// reference + target text lane first (paired with codec padding), then
+    /// appends the reference codec lane (paired with text padding). Overlapping
+    /// both lanes is the simulated streaming layout and can make the model
+    /// continue the reference/instruction text instead of speaking only the
+    /// requested target.
     #[allow(clippy::too_many_arguments)]
     pub fn build_icl_inputs(
         &self,
@@ -600,36 +620,32 @@ impl TalkerFrontend {
                     .map(|(semantic, acoustic)| semantic + acoustic),
             );
         }
-        let codec_tokens = reference_codes.len() + 1;
-        let overlap = text_tokens.min(codec_tokens);
-        for token in 0..overlap {
+        let codec_pad = self.codec_embeddings(&[CODEC_PAD], kernels)?;
+        for token in 0..text_tokens {
             let offset = token * self.hidden_size;
             prefill.extend(
                 text[offset..offset + self.hidden_size]
+                    .iter()
+                    .zip(&codec_pad)
+                    .map(|(text, codec)| text + codec),
+            );
+        }
+        let codec_tokens = reference_codes.len() + 1;
+        for token in 0..codec_tokens {
+            let offset = token * self.hidden_size;
+            prefill.extend(
+                text_pad
                     .iter()
                     .zip(&codec[offset..offset + self.hidden_size])
                     .map(|(text, codec)| text + codec),
             );
         }
-        if codec_tokens > text_tokens {
-            for token in text_tokens..codec_tokens {
-                let offset = token * self.hidden_size;
-                prefill.extend(
-                    text_pad
-                        .iter()
-                        .zip(&codec[offset..offset + self.hidden_size])
-                        .map(|(text, codec)| text + codec),
-                );
-            }
-        }
-        let trailing_text = text[overlap * self.hidden_size..].to_vec();
-        let trailing_tokens = text_tokens.saturating_sub(overlap);
         let prefill_tokens = prefill.len() / self.hidden_size;
         Ok(VoiceDesignInputs {
             prefill,
             prefill_tokens,
-            trailing_text,
-            trailing_tokens,
+            trailing_text: Vec::new(),
+            trailing_tokens: 0,
             text_pad,
         })
     }
