@@ -3,6 +3,7 @@ mod codec_encoder;
 mod config;
 mod cuda;
 mod frontend;
+mod precision;
 mod predictor;
 mod sampling;
 mod speaker_encoder;
@@ -17,6 +18,7 @@ pub use cuda::{
     TalkerTransformer,
 };
 pub use frontend::{SemanticSamplingSession, TalkerFrontend, VoiceDesignInputs};
+pub use precision::{Bf16, F16, QwenDType};
 pub use predictor::{CodePredictorGenerationSession, CodePredictorTransformer};
 pub use speaker_encoder::SpeakerEncoder;
 
@@ -36,6 +38,11 @@ pub struct ModelInspection {
 pub struct HostF16Tensor {
     pub shape: Vec<usize>,
     pub values: Vec<half::f16>,
+}
+
+pub struct HostBf16Tensor {
+    pub shape: Vec<usize>,
+    pub values: Vec<half::bf16>,
 }
 
 pub struct HostF32Tensor {
@@ -131,6 +138,20 @@ pub fn load_f16_tensor(
         .ok_or_else(|| Error::TensorNotFound(tensor_name.to_string()))?;
     let (shape, values) = weights.files[file_index].tensor_f16(tensor_name)?;
     Ok(HostF16Tensor { shape, values })
+}
+
+pub fn load_bf16_tensor(
+    model_dir: impl AsRef<Path>,
+    tensor_name: &str,
+) -> Result<HostBf16Tensor, Error> {
+    let weights = weight_set(model_dir.as_ref())?;
+    let file_index = weights
+        .locations
+        .get(tensor_name)
+        .copied()
+        .ok_or_else(|| Error::TensorNotFound(tensor_name.to_string()))?;
+    let (shape, values) = weights.files[file_index].tensor_bf16(tensor_name)?;
+    Ok(HostBf16Tensor { shape, values })
 }
 
 pub fn load_f32_tensor(

@@ -1,11 +1,11 @@
 use super::{TalkerDecoderLayer, TalkerLayerKvCache, TalkerLayerScratch};
-use crate::TalkerConfig;
+use crate::{QwenDType, TalkerConfig};
 use anyhow::{Context, ensure};
 use chew_kernel::GpuKernels;
 use cudarc::driver::CudaSlice;
 use half::f16;
 
-impl TalkerDecoderLayer {
+impl<T: QwenDType> TalkerDecoderLayer<T> {
     /// Execute a layer without moving the hidden state through host memory.
     pub fn forward_cached_device(
         &self,
@@ -14,7 +14,7 @@ impl TalkerDecoderLayer {
         config: &TalkerConfig,
         kernels: &mut GpuKernels,
         cache: &mut TalkerLayerKvCache,
-        scratch: &mut TalkerLayerScratch,
+        scratch: &mut TalkerLayerScratch<T>,
     ) -> anyhow::Result<()> {
         let hidden_dim = config.hidden_size;
         let q_dim = config.num_attention_heads * config.head_dim;
@@ -45,7 +45,8 @@ impl TalkerDecoderLayer {
         let total_kv_len =
             u32::try_from(cache.position + seq_len).context("KV length exceeds CUDA limits")?;
 
-        kernels.ops.rms_norm_f32in(
+        T::rms_norm_f32in(
+            kernels,
             hidden,
             &self.input_norm,
             &mut scratch.norm,
@@ -54,53 +55,77 @@ impl TalkerDecoderLayer {
             config.rms_norm_eps as f32,
         )?;
         if seq_len == 1 {
-            kernels.gemv.gemv_f16(
+            T::gemv(
+                kernels,
                 &scratch.norm,
                 &self.q_proj,
-                &mut scratch.q,
+                &mut scratch.q_native,
                 q_dim as u32,
                 hidden_dim as u32,
             )?;
-            kernels.gemv.gemv_f16(
+            T::gemv(
+                kernels,
                 &scratch.norm,
                 &self.k_proj,
-                &mut scratch.k,
+                &mut scratch.k_native,
                 kv_dim as u32,
                 hidden_dim as u32,
             )?;
-            kernels.gemv.gemv_f16(
+            T::gemv(
+                kernels,
                 &scratch.norm,
                 &self.v_proj,
-                &mut scratch.v,
+                &mut scratch.v_native,
                 kv_dim as u32,
                 hidden_dim as u32,
             )?;
         } else {
-            kernels.gemm.matmul_f16(
+            T::matmul(
+                kernels,
                 &scratch.norm,
                 &self.q_proj,
-                &mut scratch.q,
+                &mut scratch.q_native,
                 rows,
                 q_dim as u32,
                 hidden_dim as u32,
             )?;
-            kernels.gemm.matmul_f16(
+            T::matmul(
+                kernels,
                 &scratch.norm,
                 &self.k_proj,
-                &mut scratch.k,
+                &mut scratch.k_native,
                 rows,
                 kv_dim as u32,
                 hidden_dim as u32,
             )?;
-            kernels.gemm.matmul_f16(
+            T::matmul(
+                kernels,
                 &scratch.norm,
                 &self.v_proj,
-                &mut scratch.v,
+                &mut scratch.v_native,
                 rows,
                 kv_dim as u32,
                 hidden_dim as u32,
             )?;
         }
+        T::to_f16(
+            kernels,
+            &scratch.q_native,
+            &mut scratch.q,
+            rows * q_dim as u32,
+        )?;
+        T::to_f16(
+            kernels,
+            &scratch.k_native,
+            &mut scratch.k,
+            rows * kv_dim as u32,
+        )?;
+        T::to_f16(
+            kernels,
+            &scratch.v_native,
+            &mut scratch.v,
+            rows * kv_dim as u32,
+        )?;
 
         // The kernels support an aliased source/destination for per-head Q/K norm.
         unsafe {
@@ -169,17 +194,25 @@ impl TalkerDecoderLayer {
             total_kv_len,
             position,
         )?;
+        T::from_f16(
+            kernels,
+            &scratch.attention,
+            &mut scratch.attention_native,
+            rows * q_dim as u32,
+        )?;
         if seq_len == 1 {
-            kernels.gemv.gemv_f16(
-                &scratch.attention,
+            T::gemv(
+                kernels,
+                &scratch.attention_native,
                 &self.o_proj,
                 &mut scratch.attention_out,
                 hidden_dim as u32,
                 q_dim as u32,
             )?;
         } else {
-            kernels.gemm.matmul_f16(
-                &scratch.attention,
+            T::matmul(
+                kernels,
+                &scratch.attention_native,
                 &self.o_proj,
                 &mut scratch.attention_out,
                 rows,
@@ -187,13 +220,15 @@ impl TalkerDecoderLayer {
                 q_dim as u32,
             )?;
         }
-        kernels.ops.add_inplace_f32_f16(
+        T::add_residual(
+            kernels,
             hidden,
             &scratch.attention_out,
             rows * hidden_dim as u32,
         )?;
 
-        kernels.ops.rms_norm_f32in(
+        T::rms_norm_f32in(
+            kernels,
             hidden,
             &self.post_attention_norm,
             &mut scratch.norm,
@@ -202,7 +237,8 @@ impl TalkerDecoderLayer {
             config.rms_norm_eps as f32,
         )?;
         if seq_len == 1 {
-            kernels.gemv.gemv_dual_f16(
+            T::gemv_dual(
+                kernels,
                 &scratch.norm,
                 &self.gate_proj,
                 &self.up_proj,
@@ -212,7 +248,8 @@ impl TalkerDecoderLayer {
                 hidden_dim as u32,
             )?;
         } else {
-            kernels.gemm.matmul_f16(
+            T::matmul(
+                kernels,
                 &scratch.norm,
                 &self.gate_proj,
                 &mut scratch.gate,
@@ -220,7 +257,8 @@ impl TalkerDecoderLayer {
                 intermediate as u32,
                 hidden_dim as u32,
             )?;
-            kernels.gemm.matmul_f16(
+            T::matmul(
+                kernels,
                 &scratch.norm,
                 &self.up_proj,
                 &mut scratch.up,
@@ -229,14 +267,16 @@ impl TalkerDecoderLayer {
                 hidden_dim as u32,
             )?;
         }
-        kernels.ops.silu(
+        T::silu(
+            kernels,
             &scratch.gate,
             &scratch.up,
             &mut scratch.activation,
             rows * intermediate as u32,
         )?;
         if seq_len == 1 {
-            kernels.gemv.gemv_f16(
+            T::gemv(
+                kernels,
                 &scratch.activation,
                 &self.down_proj,
                 &mut scratch.mlp_out,
@@ -244,7 +284,8 @@ impl TalkerDecoderLayer {
                 intermediate as u32,
             )?;
         } else {
-            kernels.gemm.matmul_f16(
+            T::matmul(
+                kernels,
                 &scratch.activation,
                 &self.down_proj,
                 &mut scratch.mlp_out,
@@ -253,9 +294,7 @@ impl TalkerDecoderLayer {
                 intermediate as u32,
             )?;
         }
-        kernels
-            .ops
-            .add_inplace_f32_f16(hidden, &scratch.mlp_out, rows * hidden_dim as u32)?;
+        T::add_residual(kernels, hidden, &scratch.mlp_out, rows * hidden_dim as u32)?;
         cache.position += seq_len;
         Ok(())
     }

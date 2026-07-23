@@ -2,10 +2,11 @@ use crate::audio_input::{decode_wav, resample, speaker_mel};
 use anyhow::{Context, ensure};
 use chew_model_qwen3_tts::{
     CodePredictorGenerationSession, CodePredictorTransformer, CodecEncoder, CodecQuantizer,
-    CodecTransformerSession, ModelType, SemanticSamplingSession, SpeakerEncoder, TalkerConfig,
-    TalkerFrontend, TalkerTransformer, inspect_model,
+    CodecTransformerSession, ModelType, QwenDType, SemanticSamplingSession, SpeakerEncoder,
+    TalkerConfig, TalkerFrontend, TalkerTransformer, inspect_model,
 };
 use cudarc::driver::CudaStream;
+use half::{bf16, f16};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::Path;
@@ -16,23 +17,34 @@ use tokenizers::pre_tokenizers::byte_level::ByteLevel;
 use tokenizers::{AddedToken, Tokenizer};
 
 pub struct VoiceDesignEngine {
+    inner: VoiceDesignEngineInner,
+    pub load_elapsed: Duration,
+    pub vram_bytes: u64,
+}
+
+enum VoiceDesignEngineInner {
+    F16(Box<VoiceDesignEngineImpl<f16>>),
+    Bf16(Box<VoiceDesignEngineImpl<bf16>>),
+}
+
+struct VoiceDesignEngineImpl<T: QwenDType> {
     model_type: ModelType,
     config: TalkerConfig,
     tokenizer: Tokenizer,
     stream: Arc<CudaStream>,
     kernels: chew_kernel::GpuKernels,
-    talker: TalkerTransformer,
-    frontend: TalkerFrontend,
-    predictor: CodePredictorTransformer,
-    predictor_session: CodePredictorGenerationSession,
-    semantic_session: SemanticSamplingSession,
+    talker: TalkerTransformer<T>,
+    frontend: TalkerFrontend<T>,
+    predictor: CodePredictorTransformer<T>,
+    predictor_session: CodePredictorGenerationSession<T>,
+    semantic_session: SemanticSamplingSession<T>,
     codec: CodecQuantizer,
     speaker_encoder: Option<SpeakerEncoder>,
     codec_encoder: Option<CodecEncoder>,
     reference_cache: HashMap<[u8; 32], CachedReference>,
     max_frames: usize,
-    pub load_elapsed: Duration,
-    pub vram_bytes: u64,
+    load_elapsed: Duration,
+    vram_bytes: u64,
 }
 
 #[derive(Clone)]
@@ -75,6 +87,58 @@ impl SynthesisOutput {
 
 impl VoiceDesignEngine {
     pub fn load(model_dir: &Path, gpu: usize, max_frames: usize) -> anyhow::Result<Self> {
+        let inspection = inspect_model(model_dir)?;
+        if inspection.config.talker_config.hidden_size == 1024 {
+            let allocator = chew_vram::VramAllocator::init()?;
+            ensure!(
+                gpu < allocator.gpu_count(),
+                "GPU index {gpu} is out of range; detected {} device(s)",
+                allocator.gpu_count()
+            );
+            let (major, minor) = allocator.stream(gpu).context().compute_capability()?;
+            ensure!(
+                major >= 8,
+                "Qwen3-TTS 0.6B requires native BF16 (compute capability 8.0+); GPU {gpu} reports {major}.{minor}"
+            );
+            tracing::info!(precision = "bf16", "loading Qwen3-TTS inference path");
+            let engine = VoiceDesignEngineImpl::<bf16>::load(model_dir, gpu, max_frames)?;
+            let load_elapsed = engine.load_elapsed;
+            let vram_bytes = engine.vram_bytes;
+            Ok(Self {
+                inner: VoiceDesignEngineInner::Bf16(Box::new(engine)),
+                load_elapsed,
+                vram_bytes,
+            })
+        } else {
+            tracing::info!(precision = "f16", "loading Qwen3-TTS inference path");
+            let engine = VoiceDesignEngineImpl::<f16>::load(model_dir, gpu, max_frames)?;
+            let load_elapsed = engine.load_elapsed;
+            let vram_bytes = engine.vram_bytes;
+            Ok(Self {
+                inner: VoiceDesignEngineInner::F16(Box::new(engine)),
+                load_elapsed,
+                vram_bytes,
+            })
+        }
+    }
+
+    pub fn model_id(&self) -> &'static str {
+        match &self.inner {
+            VoiceDesignEngineInner::F16(engine) => engine.model_id(),
+            VoiceDesignEngineInner::Bf16(engine) => engine.model_id(),
+        }
+    }
+
+    pub fn synthesize(&mut self, request: &SynthesisRequest) -> anyhow::Result<SynthesisOutput> {
+        match &mut self.inner {
+            VoiceDesignEngineInner::F16(engine) => engine.synthesize(request),
+            VoiceDesignEngineInner::Bf16(engine) => engine.synthesize(request),
+        }
+    }
+}
+
+impl<T: QwenDType> VoiceDesignEngineImpl<T> {
+    fn load(model_dir: &Path, gpu: usize, max_frames: usize) -> anyhow::Result<Self> {
         ensure!(max_frames > 0, "maximum frame count must be non-zero");
         let inspection = inspect_model(model_dir)?;
         let model_type = inspection.config.tts_model_type;
@@ -139,7 +203,7 @@ impl VoiceDesignEngine {
         })
     }
 
-    pub fn model_id(&self) -> &'static str {
+    fn model_id(&self) -> &'static str {
         match self.model_type {
             ModelType::Base => "tts-multilingual-base",
             ModelType::CustomVoice => "tts-multilingual",
@@ -147,7 +211,7 @@ impl VoiceDesignEngine {
         }
     }
 
-    pub fn synthesize(&mut self, request: &SynthesisRequest) -> anyhow::Result<SynthesisOutput> {
+    fn synthesize(&mut self, request: &SynthesisRequest) -> anyhow::Result<SynthesisOutput> {
         ensure!(!request.text.trim().is_empty(), "text must not be empty");
         ensure!(
             request.max_frames > 0 && request.max_frames <= self.max_frames,

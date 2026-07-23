@@ -95,6 +95,39 @@ impl MappedSafetensors {
         })?
     }
 
+    pub fn tensor_bf16(&self, name: &str) -> Result<(Vec<usize>, Vec<half::bf16>), Error> {
+        self.with_tensor(name, |tensor| {
+            let shape = tensor.shape().to_vec();
+            let values = match tensor.dtype() {
+                Dtype::F16 => tensor
+                    .data()
+                    .chunks_exact(2)
+                    .map(|bytes| {
+                        half::bf16::from_f32(
+                            half::f16::from_bits(u16::from_le_bytes([bytes[0], bytes[1]])).to_f32(),
+                        )
+                    })
+                    .collect(),
+                Dtype::BF16 => tensor
+                    .data()
+                    .chunks_exact(2)
+                    .map(|bytes| half::bf16::from_bits(u16::from_le_bytes([bytes[0], bytes[1]])))
+                    .collect(),
+                Dtype::F32 => tensor
+                    .data()
+                    .chunks_exact(4)
+                    .map(|bytes| {
+                        half::bf16::from_f32(f32::from_le_bytes([
+                            bytes[0], bytes[1], bytes[2], bytes[3],
+                        ]))
+                    })
+                    .collect(),
+                dtype => return Err(Error::UnsupportedDtype(dtype)),
+            };
+            Ok((shape, values))
+        })?
+    }
+
     pub fn tensor_f32(&self, name: &str) -> Result<(Vec<usize>, Vec<f32>), Error> {
         self.with_tensor(name, |tensor| {
             let shape = tensor.shape().to_vec();
@@ -162,6 +195,9 @@ mod tests {
         let (shape, values) = mapped.tensor_f16("weight").unwrap();
         assert_eq!(shape, vec![2]);
         assert_eq!(values, vec![half::f16::ZERO; 2]);
+        let (shape, values) = mapped.tensor_bf16("weight").unwrap();
+        assert_eq!(shape, vec![2]);
+        assert_eq!(values, vec![half::bf16::ZERO; 2]);
         let (shape, values) = mapped.tensor_f32("weight").unwrap();
         assert_eq!(shape, vec![2]);
         assert_eq!(values, vec![0.0; 2]);

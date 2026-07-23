@@ -1,5 +1,5 @@
-use crate::{CodePredictorTransformer, TalkerConfig, load_f16_tensor};
-use anyhow::{Context, ensure};
+use crate::{CodePredictorTransformer, QwenDType, TalkerConfig};
+use anyhow::ensure;
 use chew_kernel::GpuKernels;
 use cudarc::driver::{CudaSlice, CudaStream};
 use half::f16;
@@ -7,23 +7,24 @@ use std::path::Path;
 use std::sync::Arc;
 
 /// Reusable GPU storage for semantic speech sampling.
-pub struct SemanticSamplingSession {
-    hidden: CudaSlice<f16>,
-    logits: CudaSlice<f16>,
+pub struct SemanticSamplingSession<T: QwenDType = f16> {
+    hidden: CudaSlice<T>,
+    logits: CudaSlice<T>,
+    logits_f16: CudaSlice<f16>,
     previous: CudaSlice<i32>,
     token: CudaSlice<i32>,
     max_previous: usize,
 }
 
 /// Native text/codec embeddings and projections surrounding the talker stack.
-pub struct TalkerFrontend {
-    text_embedding: CudaSlice<f16>,
-    text_fc1_weight: CudaSlice<f16>,
-    text_fc1_bias: CudaSlice<f16>,
-    text_fc2_weight: CudaSlice<f16>,
-    text_fc2_bias: CudaSlice<f16>,
-    codec_embedding: CudaSlice<f16>,
-    codec_head: CudaSlice<f16>,
+pub struct TalkerFrontend<T: QwenDType = f16> {
+    text_embedding: CudaSlice<T>,
+    text_fc1_weight: CudaSlice<T>,
+    text_fc1_bias: CudaSlice<T>,
+    text_fc2_weight: CudaSlice<T>,
+    text_fc2_bias: CudaSlice<T>,
+    codec_embedding: CudaSlice<T>,
+    codec_head: CudaSlice<T>,
     text_vocab_size: usize,
     text_hidden_size: usize,
     hidden_size: usize,
@@ -39,19 +40,20 @@ pub struct VoiceDesignInputs {
     pub text_pad: Vec<f32>,
 }
 
-impl TalkerFrontend {
+impl<T: QwenDType> TalkerFrontend<T> {
     pub fn start_semantic_sampling_session(
         &self,
         max_previous: usize,
         stream: &Arc<CudaStream>,
-    ) -> anyhow::Result<SemanticSamplingSession> {
+    ) -> anyhow::Result<SemanticSamplingSession<T>> {
         ensure!(
             max_previous > 0,
             "semantic sampler must hold at least one token"
         );
         Ok(SemanticSamplingSession {
-            hidden: stream.alloc_zeros::<f16>(self.hidden_size)?,
-            logits: stream.alloc_zeros::<f16>(self.codec_vocab_size)?,
+            hidden: stream.alloc_zeros::<T>(self.hidden_size)?,
+            logits: stream.alloc_zeros::<T>(self.codec_vocab_size)?,
+            logits_f16: stream.alloc_zeros::<f16>(self.codec_vocab_size)?,
             previous: stream.alloc_zeros::<i32>(max_previous)?,
             token: stream.alloc_zeros::<i32>(1)?,
             max_previous,
@@ -64,15 +66,14 @@ impl TalkerFrontend {
         stream: &Arc<CudaStream>,
     ) -> anyhow::Result<Self> {
         let model_dir = model_dir.as_ref();
-        let load = |name: &str, expected: &[usize]| -> anyhow::Result<CudaSlice<f16>> {
-            let tensor = load_f16_tensor(model_dir, name)
-                .with_context(|| format!("could not load {name}"))?;
+        let load = |name: &str, expected: &[usize]| -> anyhow::Result<CudaSlice<T>> {
+            let (shape, tensor) = T::load(model_dir, name, stream)?;
             ensure!(
-                tensor.shape == expected,
+                shape == expected,
                 "{name} has shape {:?}, expected {expected:?}",
-                tensor.shape
+                shape
             );
-            Ok(stream.clone_htod(&tensor.values)?)
+            Ok(tensor)
         };
         let text_hidden = config.text_hidden_size;
         let hidden = config.hidden_size;
@@ -120,16 +121,18 @@ impl TalkerFrontend {
         let rows = token_ids.len();
         let stream = Arc::clone(kernels.ops.stream());
         let ids = stream.clone_htod(token_ids)?;
-        let mut embeddings = stream.alloc_zeros::<f16>(rows * self.text_hidden_size)?;
-        kernels.ops.gather_rows_f16(
+        let mut embeddings = stream.alloc_zeros::<T>(rows * self.text_hidden_size)?;
+        T::gather(
+            kernels,
             &self.text_embedding,
             &ids,
             &mut embeddings,
             rows as u32,
             self.text_hidden_size as u32,
         )?;
-        let mut fc1 = stream.alloc_zeros::<f16>(rows * self.text_hidden_size)?;
-        kernels.gemm.matmul_f16(
+        let mut fc1 = stream.alloc_zeros::<T>(rows * self.text_hidden_size)?;
+        T::matmul(
+            kernels,
             &embeddings,
             &self.text_fc1_weight,
             &mut fc1,
@@ -137,18 +140,23 @@ impl TalkerFrontend {
             self.text_hidden_size as u32,
             self.text_hidden_size as u32,
         )?;
-        kernels.ops.add_bias_f16_inplace(
+        T::add_bias(
+            kernels,
             &mut fc1,
             &self.text_fc1_bias,
             rows as u32,
             self.text_hidden_size as u32,
         )?;
-        let mut activated = stream.alloc_zeros::<f16>(rows * self.text_hidden_size)?;
-        kernels
-            .ops
-            .silu_act_f16(&fc1, &mut activated, (rows * self.text_hidden_size) as u32)?;
-        let mut projected = stream.alloc_zeros::<f16>(rows * self.hidden_size)?;
-        kernels.gemm.matmul_f16(
+        let mut activated = stream.alloc_zeros::<T>(rows * self.text_hidden_size)?;
+        T::silu_act(
+            kernels,
+            &fc1,
+            &mut activated,
+            (rows * self.text_hidden_size) as u32,
+        )?;
+        let mut projected = stream.alloc_zeros::<T>(rows * self.hidden_size)?;
+        T::matmul(
+            kernels,
             &activated,
             &self.text_fc2_weight,
             &mut projected,
@@ -156,16 +164,17 @@ impl TalkerFrontend {
             self.hidden_size as u32,
             self.text_hidden_size as u32,
         )?;
-        kernels.ops.add_bias_f16_inplace(
+        T::add_bias(
+            kernels,
             &mut projected,
             &self.text_fc2_bias,
             rows as u32,
             self.hidden_size as u32,
         )?;
         stream.synchronize()?;
-        let mut host = vec![f16::ZERO; rows * self.hidden_size];
+        let mut host = vec![T::zero(); rows * self.hidden_size];
         stream.memcpy_dtoh(&projected, &mut host)?;
-        Ok(host.into_iter().map(f16::to_f32).collect())
+        Ok(host.into_iter().map(T::to_f32).collect())
     }
 
     /// Look up talker codec embeddings for semantic or control tokens.
@@ -187,8 +196,9 @@ impl TalkerFrontend {
         }
         let stream = Arc::clone(kernels.ops.stream());
         let ids = stream.clone_htod(token_ids)?;
-        let mut embeddings = stream.alloc_zeros::<f16>(token_ids.len() * self.hidden_size)?;
-        kernels.ops.gather_rows_f16(
+        let mut embeddings = stream.alloc_zeros::<T>(token_ids.len() * self.hidden_size)?;
+        T::gather(
+            kernels,
             &self.codec_embedding,
             &ids,
             &mut embeddings,
@@ -196,9 +206,9 @@ impl TalkerFrontend {
             self.hidden_size as u32,
         )?;
         stream.synchronize()?;
-        let mut host = vec![f16::ZERO; token_ids.len() * self.hidden_size];
+        let mut host = vec![T::zero(); token_ids.len() * self.hidden_size];
         stream.memcpy_dtoh(&embeddings, &mut host)?;
-        Ok(host.into_iter().map(f16::to_f32).collect())
+        Ok(host.into_iter().map(T::to_f32).collect())
     }
 
     /// Project one normalized talker hidden state and return its argmax token.
@@ -210,24 +220,28 @@ impl TalkerFrontend {
             self.hidden_size
         );
         let stream = Arc::clone(kernels.ops.stream());
-        let hidden = hidden
-            .iter()
-            .copied()
-            .map(f16::from_f32)
-            .collect::<Vec<_>>();
+        let hidden = hidden.iter().copied().map(T::from_f32).collect::<Vec<_>>();
         let hidden = stream.clone_htod(&hidden)?;
-        let mut logits = stream.alloc_zeros::<f16>(self.codec_vocab_size)?;
+        let mut logits = stream.alloc_zeros::<T>(self.codec_vocab_size)?;
+        let mut logits_f16 = stream.alloc_zeros::<f16>(self.codec_vocab_size)?;
         let mut token = stream.alloc_zeros::<i32>(1)?;
-        kernels.gemv.gemv_f16(
+        T::gemv(
+            kernels,
             &hidden,
             &self.codec_head,
             &mut logits,
             self.codec_vocab_size as u32,
             self.hidden_size as u32,
         )?;
+        T::to_f16(
+            kernels,
+            &logits,
+            &mut logits_f16,
+            self.codec_vocab_size as u32,
+        )?;
         kernels
             .ops
-            .argmax_f16(&logits, &mut token, self.codec_vocab_size as u32)?;
+            .argmax_f16(&logits_f16, &mut token, self.codec_vocab_size as u32)?;
         stream.synchronize()?;
         let mut host = [0i32];
         stream.memcpy_dtoh(&token, &mut host)?;
@@ -256,14 +270,11 @@ impl TalkerFrontend {
             "codec vocabulary does not contain EOS {CODEC_EOS}"
         );
         let stream = Arc::clone(kernels.ops.stream());
-        let hidden = hidden
-            .iter()
-            .copied()
-            .map(f16::from_f32)
-            .collect::<Vec<_>>();
+        let hidden = hidden.iter().copied().map(T::from_f32).collect::<Vec<_>>();
         let hidden = stream.clone_htod(&hidden)?;
-        let mut logits = stream.alloc_zeros::<f16>(self.codec_vocab_size)?;
-        kernels.gemv.gemv_f16(
+        let mut logits = stream.alloc_zeros::<T>(self.codec_vocab_size)?;
+        T::gemv(
+            kernels,
             &hidden,
             &self.codec_head,
             &mut logits,
@@ -271,12 +282,12 @@ impl TalkerFrontend {
             self.hidden_size as u32,
         )?;
         stream.synchronize()?;
-        let mut host = vec![f16::ZERO; self.codec_vocab_size];
+        let mut host = vec![T::zero(); self.codec_vocab_size];
         stream.memcpy_dtoh(&logits, &mut host)?;
         let mut best_token = CODEC_EOS;
-        let mut best_logit = host[CODEC_EOS].to_f32();
+        let mut best_logit = T::to_f32(host[CODEC_EOS]);
         for (token, logit) in host.iter().take(SPEECH_VOCAB_SIZE).enumerate() {
-            let logit = logit.to_f32();
+            let logit = T::to_f32(*logit);
             if logit > best_logit {
                 best_logit = logit;
                 best_token = token;
@@ -305,23 +316,27 @@ impl TalkerFrontend {
             self.hidden_size
         );
         let stream = Arc::clone(kernels.ops.stream());
-        let hidden = hidden
-            .iter()
-            .copied()
-            .map(f16::from_f32)
-            .collect::<Vec<_>>();
+        let hidden = hidden.iter().copied().map(T::from_f32).collect::<Vec<_>>();
         let hidden = stream.clone_htod(&hidden)?;
-        let mut logits = stream.alloc_zeros::<f16>(self.codec_vocab_size)?;
-        kernels.gemv.gemv_f16(
+        let mut logits = stream.alloc_zeros::<T>(self.codec_vocab_size)?;
+        let mut logits_f16 = stream.alloc_zeros::<f16>(self.codec_vocab_size)?;
+        T::gemv(
+            kernels,
             &hidden,
             &self.codec_head,
             &mut logits,
             self.codec_vocab_size as u32,
             self.hidden_size as u32,
         )?;
+        T::to_f16(
+            kernels,
+            &logits,
+            &mut logits_f16,
+            self.codec_vocab_size as u32,
+        )?;
         stream.synchronize()?;
         let mut host = vec![f16::ZERO; self.codec_vocab_size];
-        stream.memcpy_dtoh(&logits, &mut host)?;
+        stream.memcpy_dtoh(&logits_f16, &mut host)?;
         Ok(crate::sampling::sample_top_k(
             &host,
             |token| token < SPEECH_VOCAB_SIZE || token == CODEC_EOS,
@@ -337,7 +352,7 @@ impl TalkerFrontend {
     #[allow(clippy::too_many_arguments)]
     pub fn semantic_speech_sample_with_session(
         &self,
-        session: &mut SemanticSamplingSession,
+        session: &mut SemanticSamplingSession<T>,
         hidden: &[f32],
         previous: &[i32],
         temperature: f32,
@@ -362,24 +377,27 @@ impl TalkerFrontend {
         );
         ensure!(top_k <= 64, "GPU semantic sampling supports top-k up to 64");
         let stream = Arc::clone(kernels.ops.stream());
-        let hidden = hidden
-            .iter()
-            .copied()
-            .map(f16::from_f32)
-            .collect::<Vec<_>>();
+        let hidden = hidden.iter().copied().map(T::from_f32).collect::<Vec<_>>();
         stream.memcpy_htod(&hidden, &mut session.hidden)?;
         if !previous.is_empty() {
             stream.memcpy_htod(previous, &mut session.previous.slice_mut(..previous.len()))?;
         }
-        kernels.gemv.gemv_f16(
+        T::gemv(
+            kernels,
             &session.hidden,
             &self.codec_head,
             &mut session.logits,
             self.codec_vocab_size as u32,
             self.hidden_size as u32,
         )?;
-        kernels.ops.sample_top_k_small_filtered(
+        T::to_f16(
+            kernels,
             &session.logits,
+            &mut session.logits_f16,
+            self.codec_vocab_size as u32,
+        )?;
+        kernels.ops.sample_top_k_small_filtered(
+            &session.logits_f16,
             &session.previous,
             &mut session.token,
             self.codec_vocab_size as u32,
@@ -536,7 +554,7 @@ impl TalkerFrontend {
         instruction_ids: Option<&[i32]>,
         language_codec_id: i32,
         speaker_embedding: &[f32],
-        predictor: &CodePredictorTransformer,
+        predictor: &CodePredictorTransformer<T>,
         kernels: &mut GpuKernels,
     ) -> anyhow::Result<VoiceDesignInputs> {
         const IM_START: i32 = 151_644;

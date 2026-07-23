@@ -1,5 +1,5 @@
 use super::{TalkerDecoderLayer, TalkerLayerKvCache, TalkerLayerScratch};
-use crate::{TalkerConfig, load_f16_tensor};
+use crate::{QwenDType, TalkerConfig};
 use anyhow::{Context, ensure};
 use chew_kernel::GpuKernels;
 use cudarc::driver::{CudaSlice, CudaStream};
@@ -8,19 +8,19 @@ use std::path::Path;
 use std::sync::Arc;
 
 /// GPU-resident Qwen3-TTS talker transformer.
-pub struct TalkerTransformer {
-    layers: Vec<TalkerDecoderLayer>,
-    final_norm: CudaSlice<f16>,
+pub struct TalkerTransformer<T: QwenDType = f16> {
+    layers: Vec<TalkerDecoderLayer<T>>,
+    final_norm: CudaSlice<T>,
 }
 
 /// Persistent KV caches and scratch buffers for talker generation.
-pub struct TalkerGenerationSession {
+pub struct TalkerGenerationSession<T: QwenDType = f16> {
     caches: Vec<TalkerLayerKvCache>,
-    scratch: TalkerLayerScratch,
+    scratch: TalkerLayerScratch<T>,
     max_seq_len: usize,
 }
 
-impl TalkerTransformer {
+impl<T: QwenDType> TalkerTransformer<T> {
     pub fn load(
         model_dir: impl AsRef<Path>,
         config: &TalkerConfig,
@@ -34,17 +34,14 @@ impl TalkerTransformer {
                     .with_context(|| format!("could not load talker layer {layer_index}"))?,
             );
         }
-        let norm = load_f16_tensor(model_dir, "talker.model.norm.weight")
+        let (norm_shape, final_norm) = T::load(model_dir, "talker.model.norm.weight", stream)
             .context("could not load talker final norm")?;
         ensure!(
-            norm.shape == [config.hidden_size],
+            norm_shape == [config.hidden_size],
             "talker final norm has shape {:?}, expected [{}]",
-            norm.shape,
+            norm_shape,
             config.hidden_size
         );
-        let final_norm = stream
-            .clone_htod(&norm.values)
-            .context("could not upload talker final norm")?;
         Ok(Self { layers, final_norm })
     }
 
@@ -58,7 +55,7 @@ impl TalkerTransformer {
         max_batch_tokens: usize,
         config: &TalkerConfig,
         stream: &Arc<CudaStream>,
-    ) -> anyhow::Result<TalkerGenerationSession> {
+    ) -> anyhow::Result<TalkerGenerationSession<T>> {
         ensure!(max_seq_len > 0, "maximum sequence length must be non-zero");
         ensure!(
             max_batch_tokens > 0,
@@ -77,7 +74,7 @@ impl TalkerTransformer {
     /// Append prepared embeddings to a persistent generation session.
     pub fn forward_session(
         &self,
-        session: &mut TalkerGenerationSession,
+        session: &mut TalkerGenerationSession<T>,
         hidden_host: &[f32],
         seq_len: usize,
         config: &TalkerConfig,
@@ -123,7 +120,8 @@ impl TalkerTransformer {
                 &mut session.scratch,
             )?;
         }
-        kernels.ops.rms_norm_f32in(
+        T::rms_norm_f32in(
+            kernels,
             &hidden,
             &self.final_norm,
             &mut session.scratch.norm,
@@ -132,12 +130,12 @@ impl TalkerTransformer {
             config.rms_norm_eps as f32,
         )?;
         stream.synchronize()?;
-        let mut output = vec![f16::ZERO; seq_len * config.hidden_size];
+        let mut output = vec![T::zero(); seq_len * config.hidden_size];
         stream.memcpy_dtoh(
             &session.scratch.norm.slice(..seq_len * config.hidden_size),
             &mut output,
         )?;
-        Ok(output.into_iter().map(f16::to_f32).collect())
+        Ok(output.into_iter().map(T::to_f32).collect())
     }
 
     /// Correctness-first stack execution from prepared talker embeddings.
@@ -181,7 +179,8 @@ impl TalkerTransformer {
                 &mut scratch,
             )?;
         }
-        kernels.ops.rms_norm_f32in(
+        T::rms_norm_f32in(
+            kernels,
             &hidden,
             &self.final_norm,
             &mut scratch.norm,
@@ -191,16 +190,16 @@ impl TalkerTransformer {
         )?;
         stream.synchronize()?;
 
-        let mut output_f16 = vec![f16::ZERO; seq_len * config.hidden_size];
+        let mut output_f16 = vec![T::zero(); seq_len * config.hidden_size];
         stream.memcpy_dtoh(
             &scratch.norm.slice(..seq_len * config.hidden_size),
             &mut output_f16,
         )?;
-        Ok(output_f16.into_iter().map(f16::to_f32).collect())
+        Ok(output_f16.into_iter().map(T::to_f32).collect())
     }
 }
 
-impl TalkerGenerationSession {
+impl<T: QwenDType> TalkerGenerationSession<T> {
     pub fn position(&self) -> usize {
         self.caches.first().map_or(0, TalkerLayerKvCache::position)
     }

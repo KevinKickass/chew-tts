@@ -49,6 +49,15 @@ pub struct OpsKernels {
     gather_rows_f16: CudaFunction,
     scatter_add_rows_f16: CudaFunction,
     eb_reduce: CudaFunction,
+    rms_norm_f32in_bf16: CudaFunction,
+    add_bias_bf16_inplace: CudaFunction,
+    copy_bf16_to_f32: CudaFunction,
+    copy_bf16_to_f16: CudaFunction,
+    copy_f16_to_bf16: CudaFunction,
+    add_inplace_f32_bf16: CudaFunction,
+    silu_bf16: CudaFunction,
+    silu_act_bf16: CudaFunction,
+    gather_rows_bf16: CudaFunction,
     // CUDA Graph-compatible variants
     rope_graph: CudaFunction,
     copy_f16_with_offset: CudaFunction,
@@ -141,6 +150,15 @@ impl OpsKernels {
             gather_rows_f16: loader::get_fn(&module, "gather_rows_f16")?,
             scatter_add_rows_f16: loader::get_fn(&module, "scatter_add_rows_f16")?,
             eb_reduce: loader::get_fn(&module, "eb_reduce")?,
+            rms_norm_f32in_bf16: loader::get_fn(&module, "rms_norm_f32in_bf16")?,
+            add_bias_bf16_inplace: loader::get_fn(&module, "add_bias_bf16_inplace")?,
+            copy_bf16_to_f32: loader::get_fn(&module, "copy_bf16_to_f32")?,
+            copy_bf16_to_f16: loader::get_fn(&module, "copy_bf16_to_f16")?,
+            copy_f16_to_bf16: loader::get_fn(&module, "copy_f16_to_bf16")?,
+            add_inplace_f32_bf16: loader::get_fn(&module, "add_inplace_f32_bf16")?,
+            silu_bf16: loader::get_fn(&module, "silu_bf16")?,
+            silu_act_bf16: loader::get_fn(&module, "silu_act_bf16")?,
+            gather_rows_bf16: loader::get_fn(&module, "gather_rows_bf16")?,
             rope_graph: loader::get_fn(&module, "rope_graph")?,
             copy_f16_with_offset: loader::get_fn(&module, "copy_f16_with_offset")?,
             mha_fused_graph: loader::get_fn(&module, "mha_fused_graph")?,
@@ -3169,6 +3187,206 @@ impl OpsKernels {
                 (1, 1, 1),
                 (block_size, 1, 1),
                 smem,
+                &mut args,
+            );
+        }
+        Ok(())
+    }
+
+    pub fn rms_norm_f32in_bf16(
+        &self,
+        x: &CudaSlice<f32>,
+        weight: &CudaSlice<half::bf16>,
+        out: &mut CudaSlice<half::bf16>,
+        n_rows: u32,
+        dim: u32,
+        eps: f32,
+    ) -> Result<(), KernelError> {
+        let threads = 256u32.min(dim);
+        let dim_i = dim as i32;
+        let mut args = [
+            slice_ptr(x),
+            slice_ptr(weight),
+            slice_ptr_mut(out),
+            scalar_ptr(&dim_i),
+            scalar_ptr(&eps),
+        ];
+        unsafe {
+            self.fast.fire(
+                &self.rms_norm_f32in_bf16,
+                (n_rows, 1, 1),
+                (threads, 1, 1),
+                threads * 4,
+                &mut args,
+            );
+        }
+        Ok(())
+    }
+
+    pub fn add_bias_bf16_inplace(
+        &self,
+        x: &mut CudaSlice<half::bf16>,
+        bias: &CudaSlice<half::bf16>,
+        n_rows: u32,
+        dim: u32,
+    ) -> Result<(), KernelError> {
+        let threads = 256u32;
+        let dim_i = dim as i32;
+        let mut args = [slice_ptr_mut(x), slice_ptr(bias), scalar_ptr(&dim_i)];
+        unsafe {
+            self.fast.fire(
+                &self.add_bias_bf16_inplace,
+                (n_rows, dim.div_ceil(threads), 1),
+                (threads, 1, 1),
+                0,
+                &mut args,
+            );
+        }
+        Ok(())
+    }
+
+    pub fn copy_bf16_to_f32(
+        &self,
+        src: &CudaSlice<half::bf16>,
+        dst: &mut CudaSlice<f32>,
+        n: u32,
+    ) -> Result<(), KernelError> {
+        self.launch_bf16_copy(&self.copy_bf16_to_f32, src, dst, n)
+    }
+
+    pub fn copy_bf16_to_f16(
+        &self,
+        src: &CudaSlice<half::bf16>,
+        dst: &mut CudaSlice<half::f16>,
+        n: u32,
+    ) -> Result<(), KernelError> {
+        self.launch_bf16_copy(&self.copy_bf16_to_f16, src, dst, n)
+    }
+
+    pub fn copy_f16_to_bf16(
+        &self,
+        src: &CudaSlice<half::f16>,
+        dst: &mut CudaSlice<half::bf16>,
+        n: u32,
+    ) -> Result<(), KernelError> {
+        self.launch_bf16_copy(&self.copy_f16_to_bf16, src, dst, n)
+    }
+
+    fn launch_bf16_copy<S: cudarc::driver::DeviceRepr, D: cudarc::driver::DeviceRepr>(
+        &self,
+        function: &CudaFunction,
+        src: &CudaSlice<S>,
+        dst: &mut CudaSlice<D>,
+        n: u32,
+    ) -> Result<(), KernelError> {
+        let threads = 256u32;
+        let n_i = n as i32;
+        let mut args = [slice_ptr(src), slice_ptr_mut(dst), scalar_ptr(&n_i)];
+        unsafe {
+            self.fast.fire(
+                function,
+                (n.div_ceil(threads), 1, 1),
+                (threads, 1, 1),
+                0,
+                &mut args,
+            );
+        }
+        Ok(())
+    }
+
+    pub fn add_inplace_f32_bf16(
+        &self,
+        hidden: &mut CudaSlice<f32>,
+        delta: &CudaSlice<half::bf16>,
+        n: u32,
+    ) -> Result<(), KernelError> {
+        let threads = 256u32;
+        let n_i = n as i32;
+        let mut args = [slice_ptr_mut(hidden), slice_ptr(delta), scalar_ptr(&n_i)];
+        unsafe {
+            self.fast.fire(
+                &self.add_inplace_f32_bf16,
+                (n.div_ceil(threads), 1, 1),
+                (threads, 1, 1),
+                0,
+                &mut args,
+            );
+        }
+        Ok(())
+    }
+
+    pub fn silu_bf16(
+        &self,
+        gate: &CudaSlice<half::bf16>,
+        up: &CudaSlice<half::bf16>,
+        out: &mut CudaSlice<half::bf16>,
+        n: u32,
+    ) -> Result<(), KernelError> {
+        let threads = 256u32;
+        let n_i = n as i32;
+        let mut args = [
+            slice_ptr(gate),
+            slice_ptr(up),
+            slice_ptr_mut(out),
+            scalar_ptr(&n_i),
+        ];
+        unsafe {
+            self.fast.fire(
+                &self.silu_bf16,
+                (n.div_ceil(threads), 1, 1),
+                (threads, 1, 1),
+                0,
+                &mut args,
+            );
+        }
+        Ok(())
+    }
+
+    pub fn silu_act_bf16(
+        &self,
+        input: &CudaSlice<half::bf16>,
+        output: &mut CudaSlice<half::bf16>,
+        count: u32,
+    ) -> Result<(), KernelError> {
+        let count_i32 = count as i32;
+        let mut args: [*mut c_void; 3] = [
+            slice_ptr(input),
+            slice_ptr_mut(output),
+            scalar_ptr(&count_i32),
+        ];
+        unsafe {
+            self.fast.fire(
+                &self.silu_act_bf16,
+                (count.div_ceil(256), 1, 1),
+                (256, 1, 1),
+                0,
+                &mut args,
+            );
+        }
+        Ok(())
+    }
+
+    pub fn gather_rows_bf16(
+        &self,
+        src: &CudaSlice<half::bf16>,
+        idx: &CudaSlice<i32>,
+        dst: &mut CudaSlice<half::bf16>,
+        n_rows: u32,
+        dim: u32,
+    ) -> Result<(), KernelError> {
+        let dim_i = dim as i32;
+        let mut args = [
+            slice_ptr(src),
+            slice_ptr(idx),
+            slice_ptr_mut(dst),
+            scalar_ptr(&dim_i),
+        ];
+        unsafe {
+            self.fast.fire(
+                &self.gather_rows_bf16,
+                (n_rows, 1, 1),
+                (256, 1, 1),
+                0,
                 &mut args,
             );
         }

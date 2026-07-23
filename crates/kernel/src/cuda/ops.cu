@@ -5,6 +5,7 @@
 // KV cache is f16. Weight/embedding tables are f16.
 
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
 typedef unsigned char  uint8_t;
 typedef signed char    int8_t;
@@ -2985,6 +2986,106 @@ __global__ void clamp_f16(const __half* __restrict__ x,
     if (index < n) {
         const float value = __half2float(x[index]);
         out[index] = __float2half(fminf(maximum, fmaxf(minimum, value)));
+    }
+}
+
+// --- Qwen BF16 primitives -------------------------------------------------
+
+__global__ void rms_norm_f32in_bf16(const float* __restrict__ x,
+                                     const __nv_bfloat16* __restrict__ weight,
+                                     __nv_bfloat16* __restrict__ out,
+                                     int dim,
+                                     float eps) {
+    int row = blockIdx.x;
+    const float* x_row = x + row * dim;
+    __nv_bfloat16* out_row = out + row * dim;
+    extern __shared__ float sdata[];
+    float local_sum = 0.0f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        float v = x_row[i];
+        local_sum += v * v;
+    }
+    sdata[threadIdx.x] = local_sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
+        __syncthreads();
+    }
+    float rms = sqrtf(sdata[0] / (float)dim + eps);
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        out_row[i] = __float2bfloat16(
+            x_row[i] / rms * __bfloat162float(weight[i]));
+    }
+}
+
+__global__ void add_bias_bf16_inplace(__nv_bfloat16* __restrict__ x,
+                                       const __nv_bfloat16* __restrict__ bias,
+                                       int dim) {
+    int row = blockIdx.x;
+    int col = blockIdx.y * blockDim.x + threadIdx.x;
+    if (col >= dim) return;
+    int idx = row * dim + col;
+    x[idx] = __float2bfloat16(
+        __bfloat162float(x[idx]) + __bfloat162float(bias[col]));
+}
+
+__global__ void copy_bf16_to_f32(const __nv_bfloat16* __restrict__ src,
+                                  float* __restrict__ dst,
+                                  int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) dst[idx] = __bfloat162float(src[idx]);
+}
+
+__global__ void copy_bf16_to_f16(const __nv_bfloat16* __restrict__ src,
+                                  __half* __restrict__ dst,
+                                  int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) dst[idx] = __float2half(__bfloat162float(src[idx]));
+}
+
+__global__ void copy_f16_to_bf16(const __half* __restrict__ src,
+                                  __nv_bfloat16* __restrict__ dst,
+                                  int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) dst[idx] = __float2bfloat16(__half2float(src[idx]));
+}
+
+__global__ void add_inplace_f32_bf16(float* __restrict__ hidden,
+                                      const __nv_bfloat16* __restrict__ delta,
+                                      int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) hidden[idx] += __bfloat162float(delta[idx]);
+}
+
+__global__ void silu_bf16(const __nv_bfloat16* __restrict__ gate,
+                           const __nv_bfloat16* __restrict__ up,
+                           __nv_bfloat16* __restrict__ out,
+                           int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    float g = __bfloat162float(gate[idx]);
+    float u = __bfloat162float(up[idx]);
+    out[idx] = __float2bfloat16((g / (1.0f + expf(-g))) * u);
+}
+
+__global__ void silu_act_bf16(const __nv_bfloat16* __restrict__ x,
+                              __nv_bfloat16* __restrict__ out,
+                              int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    float value = __bfloat162float(x[idx]);
+    out[idx] = __float2bfloat16(value / (1.0f + expf(-value)));
+}
+
+__global__ void gather_rows_bf16(const __nv_bfloat16* __restrict__ src,
+                                  const int* __restrict__ idx,
+                                  __nv_bfloat16* __restrict__ dst,
+                                  int dim) {
+    int row = blockIdx.x;
+    int s = idx[row] * dim;
+    int d = row * dim;
+    for (int j = threadIdx.x; j < dim; j += blockDim.x) {
+        dst[d + j] = src[s + j];
     }
 }
 

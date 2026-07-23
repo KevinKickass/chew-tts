@@ -1778,7 +1778,7 @@ fn cuda_talker_frontend_smoke(
         config.text_hidden_size,
     )?;
     let load_started = std::time::Instant::now();
-    let frontend = TalkerFrontend::load(model_dir, config, stream)?;
+    let frontend = TalkerFrontend::<half::f16>::load(model_dir, config, stream)?;
     let free_loaded = allocator.free_bytes(gpu)?;
     let started = std::time::Instant::now();
     let projected = frontend.project_text_tokens(&text_ids, &mut kernels)?;
@@ -1835,7 +1835,7 @@ fn cuda_predictor_codec_smoke(
         config.intermediate_size * config.hidden_size,
         config.intermediate_size,
     )?;
-    let predictor = CodePredictorTransformer::load(model_dir, talker_config, stream)?;
+    let predictor = CodePredictorTransformer::<half::f16>::load(model_dir, talker_config, stream)?;
     let codec = CodecQuantizer::load(model_dir.join("speech_tokenizer"), stream)?;
     let free_loaded = allocator.free_bytes(gpu)?;
 
@@ -1943,9 +1943,9 @@ fn cuda_voice_design_smoke(
     let mut kernels = chew_kernel::GpuKernels::load(stream, max_matrix, max_vector)?;
 
     let load_started = std::time::Instant::now();
-    let talker = TalkerTransformer::load(model_dir, config, stream)?;
-    let frontend = TalkerFrontend::load(model_dir, config, stream)?;
-    let predictor = CodePredictorTransformer::load(model_dir, config, stream)?;
+    let talker = TalkerTransformer::<half::f16>::load(model_dir, config, stream)?;
+    let frontend = TalkerFrontend::<half::f16>::load(model_dir, config, stream)?;
+    let predictor = CodePredictorTransformer::<half::f16>::load(model_dir, config, stream)?;
     let mut predictor_session = predictor.start_generation_session(stream)?;
     let mut semantic_session = frontend.start_semantic_sampling_session(max_frames, stream)?;
     let codec = CodecQuantizer::load(model_dir.join("speech_tokenizer"), stream)?;
@@ -2460,7 +2460,7 @@ fn cuda_predictor_smoke(
         config.intermediate_size,
     )?;
     let load_started = std::time::Instant::now();
-    let predictor = CodePredictorTransformer::load(model_dir, talker_config, stream)?;
+    let predictor = CodePredictorTransformer::<half::f16>::load(model_dir, talker_config, stream)?;
     let mut predictor_session = predictor.start_generation_session(stream)?;
     let load_elapsed = load_started.elapsed();
     let free_loaded = allocator.free_bytes(gpu)?;
@@ -2546,7 +2546,7 @@ fn cuda_talker_smoke(
         config.intermediate_size,
     )?;
     let load_started = std::time::Instant::now();
-    let talker = TalkerTransformer::load(model_dir, config, stream)?;
+    let talker = TalkerTransformer::<half::f16>::load(model_dir, config, stream)?;
     let load_elapsed = load_started.elapsed();
     let free_loaded = allocator.free_bytes(gpu)?;
 
@@ -2809,7 +2809,7 @@ fn cuda_layer_smoke(
         config.intermediate_size * config.hidden_size,
         config.intermediate_size,
     )?;
-    let decoder = TalkerDecoderLayer::load(model_dir, layer, config, stream)?;
+    let decoder = TalkerDecoderLayer::<half::f16>::load(model_dir, layer, config, stream)?;
     if seq_len == 0 {
         anyhow::bail!("sequence length must be non-zero");
     }

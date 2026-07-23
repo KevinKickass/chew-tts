@@ -18,6 +18,8 @@ pub struct GemvKernels {
     q8_0: CudaFunction,
     f16: CudaFunction,
     dual_f16: CudaFunction,
+    bf16: CudaFunction,
+    dual_bf16: CudaFunction,
     /// Pre-allocated Q8_1 buffer for input vector (max_k / 32 * 36 bytes)
     /// Q8_1 format: half2 ds (4 bytes) + int8_t qs[32] = 36 bytes per block
     x_q8: CudaSlice<u8>,
@@ -42,6 +44,8 @@ impl GemvKernels {
             q8_0: loader::get_fn(&module, "gemv_q8_0")?,
             f16: loader::get_fn(&module, "gemv_f16")?,
             dual_f16: loader::get_fn(&module, "gemv_dual_f16")?,
+            bf16: loader::get_fn(&module, "gemv_bf16")?,
+            dual_bf16: loader::get_fn(&module, "gemv_dual_bf16")?,
             _module: module,
             x_q8,
         })
@@ -252,6 +256,59 @@ impl GemvKernels {
         unsafe {
             self.fast
                 .fire(&self.dual_f16, (n, 1, 1), (256, 1, 1), 0, &mut args);
+        }
+        Ok(())
+    }
+
+    pub fn gemv_bf16(
+        &self,
+        x: &CudaSlice<half::bf16>,
+        weight: &CudaSlice<half::bf16>,
+        out: &mut CudaSlice<half::bf16>,
+        n: u32,
+        k: u32,
+    ) -> Result<(), KernelError> {
+        let n_i32 = n as i32;
+        let k_i32 = k as i32;
+        let mut args = [
+            slice_ptr(x),
+            slice_ptr(weight),
+            slice_ptr_mut(out),
+            scalar_ptr(&n_i32),
+            scalar_ptr(&k_i32),
+        ];
+        unsafe {
+            self.fast
+                .fire(&self.bf16, (n, 1, 1), (256, 1, 1), 0, &mut args);
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_dual_bf16(
+        &self,
+        x: &CudaSlice<half::bf16>,
+        gate_weight: &CudaSlice<half::bf16>,
+        up_weight: &CudaSlice<half::bf16>,
+        gate_out: &mut CudaSlice<half::bf16>,
+        up_out: &mut CudaSlice<half::bf16>,
+        n: u32,
+        k: u32,
+    ) -> Result<(), KernelError> {
+        let n_i32 = n as i32;
+        let k_i32 = k as i32;
+        let mut args = [
+            slice_ptr(x),
+            slice_ptr(gate_weight),
+            slice_ptr(up_weight),
+            slice_ptr_mut(gate_out),
+            slice_ptr_mut(up_out),
+            scalar_ptr(&n_i32),
+            scalar_ptr(&k_i32),
+        ];
+        unsafe {
+            self.fast
+                .fire(&self.dual_bf16, (n, 1, 1), (256, 1, 1), 0, &mut args);
         }
         Ok(())
     }

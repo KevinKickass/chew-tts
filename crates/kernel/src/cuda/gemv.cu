@@ -11,6 +11,7 @@
 // Grid: (N,), Block: (256,)
 
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
 typedef unsigned char  uint8_t;
 typedef signed char    int8_t;
@@ -451,6 +452,38 @@ __global__ void gemv_f16(const __half* __restrict__ x,
     }
 }
 
+__global__ void gemv_bf16(const __nv_bfloat16* __restrict__ x,
+                          const __nv_bfloat16* __restrict__ weight,
+                          __nv_bfloat16* __restrict__ out,
+                          int N,
+                          int K) {
+    const int row = blockIdx.x;
+    if (row >= N) return;
+    const int tid = threadIdx.x;
+    const __nv_bfloat16* w = weight + (long long)row * K;
+    float sum = 0.0f;
+    for (int col = tid; col < K; col += blockDim.x) {
+        sum += __bfloat162float(x[col]) * __bfloat162float(w[col]);
+    }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+    }
+    __shared__ float warp_sums[8];
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    if (lane == 0) warp_sums[warp] = sum;
+    __syncthreads();
+    if (warp == 0) {
+        sum = lane < 8 ? warp_sums[lane] : 0.0f;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+        }
+        if (lane == 0) out[row] = __float2bfloat16(sum);
+    }
+}
+
 // Gate and up projections share the input read and launch overhead.
 __global__ void gemv_dual_f16(const __half* __restrict__ x,
                               const __half* __restrict__ gate_weight,
@@ -496,6 +529,54 @@ __global__ void gemv_dual_f16(const __half* __restrict__ x,
         if (lane == 0) {
             gate_out[row] = __float2half(gate_sum);
             up_out[row] = __float2half(up_sum);
+        }
+    }
+}
+
+__global__ void gemv_dual_bf16(const __nv_bfloat16* __restrict__ x,
+                               const __nv_bfloat16* __restrict__ gate_weight,
+                               const __nv_bfloat16* __restrict__ up_weight,
+                               __nv_bfloat16* __restrict__ gate_out,
+                               __nv_bfloat16* __restrict__ up_out,
+                               int N,
+                               int K) {
+    const int row = blockIdx.x;
+    if (row >= N) return;
+    const int tid = threadIdx.x;
+    const __nv_bfloat16* gate = gate_weight + (long long)row * K;
+    const __nv_bfloat16* up = up_weight + (long long)row * K;
+    float gate_sum = 0.0f;
+    float up_sum = 0.0f;
+    for (int col = tid; col < K; col += blockDim.x) {
+        const float value = __bfloat162float(x[col]);
+        gate_sum += value * __bfloat162float(gate[col]);
+        up_sum += value * __bfloat162float(up[col]);
+    }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        gate_sum += __shfl_down_sync(0xFFFFFFFF, gate_sum, offset);
+        up_sum += __shfl_down_sync(0xFFFFFFFF, up_sum, offset);
+    }
+    __shared__ float gate_warp_sums[8];
+    __shared__ float up_warp_sums[8];
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    if (lane == 0) {
+        gate_warp_sums[warp] = gate_sum;
+        up_warp_sums[warp] = up_sum;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        gate_sum = lane < 8 ? gate_warp_sums[lane] : 0.0f;
+        up_sum = lane < 8 ? up_warp_sums[lane] : 0.0f;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            gate_sum += __shfl_down_sync(0xFFFFFFFF, gate_sum, offset);
+            up_sum += __shfl_down_sync(0xFFFFFFFF, up_sum, offset);
+        }
+        if (lane == 0) {
+            gate_out[row] = __float2bfloat16(gate_sum);
+            up_out[row] = __float2bfloat16(up_sum);
         }
     }
 }

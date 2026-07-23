@@ -1,4 +1,4 @@
-use crate::{TalkerConfig, load_f16_tensor};
+use crate::{QwenDType, TalkerConfig, load_f16_tensor};
 use anyhow::{Context, ensure};
 use chew_kernel::GpuKernels;
 use cudarc::driver::{CudaSlice, CudaStream};
@@ -16,18 +16,18 @@ pub use stack::{TalkerGenerationSession, TalkerTransformer};
 /// This intentionally owns unquantized f16 weights first. It gives us a small,
 /// exact correctness target before adding the full model, KV cache, CUDA graphs,
 /// and quantized weight formats.
-pub struct TalkerDecoderLayer {
-    input_norm: CudaSlice<f16>,
-    q_proj: CudaSlice<f16>,
-    k_proj: CudaSlice<f16>,
-    v_proj: CudaSlice<f16>,
+pub struct TalkerDecoderLayer<T: QwenDType = f16> {
+    input_norm: CudaSlice<T>,
+    q_proj: CudaSlice<T>,
+    k_proj: CudaSlice<T>,
+    v_proj: CudaSlice<T>,
     q_norm: CudaSlice<f16>,
     k_norm: CudaSlice<f16>,
-    o_proj: CudaSlice<f16>,
-    post_attention_norm: CudaSlice<f16>,
-    gate_proj: CudaSlice<f16>,
-    up_proj: CudaSlice<f16>,
-    down_proj: CudaSlice<f16>,
+    o_proj: CudaSlice<T>,
+    post_attention_norm: CudaSlice<T>,
+    gate_proj: CudaSlice<T>,
+    up_proj: CudaSlice<T>,
+    down_proj: CudaSlice<T>,
 }
 
 /// K/V state for one talker layer.
@@ -40,21 +40,25 @@ pub struct TalkerLayerKvCache {
 }
 
 /// Reusable device buffers shared by every talker layer.
-pub struct TalkerLayerScratch {
+pub struct TalkerLayerScratch<T: QwenDType = f16> {
     max_tokens: usize,
-    pub(crate) norm: CudaSlice<f16>,
+    pub(crate) norm: CudaSlice<T>,
+    q_native: CudaSlice<T>,
+    k_native: CudaSlice<T>,
+    v_native: CudaSlice<T>,
     q: CudaSlice<f16>,
     k: CudaSlice<f16>,
     v: CudaSlice<f16>,
     attention: CudaSlice<f16>,
-    attention_out: CudaSlice<f16>,
-    gate: CudaSlice<f16>,
-    up: CudaSlice<f16>,
-    activation: CudaSlice<f16>,
-    mlp_out: CudaSlice<f16>,
+    attention_native: CudaSlice<T>,
+    attention_out: CudaSlice<T>,
+    gate: CudaSlice<T>,
+    up: CudaSlice<T>,
+    activation: CudaSlice<T>,
+    mlp_out: CudaSlice<T>,
 }
 
-impl TalkerLayerScratch {
+impl<T: QwenDType> TalkerLayerScratch<T> {
     pub fn allocate(
         max_tokens: usize,
         config: &TalkerConfig,
@@ -67,16 +71,20 @@ impl TalkerLayerScratch {
         let intermediate = config.intermediate_size;
         Ok(Self {
             max_tokens,
-            norm: stream.alloc_zeros::<f16>(max_tokens * hidden)?,
+            norm: stream.alloc_zeros::<T>(max_tokens * hidden)?,
+            q_native: stream.alloc_zeros::<T>(max_tokens * q_dim)?,
+            k_native: stream.alloc_zeros::<T>(max_tokens * kv_dim)?,
+            v_native: stream.alloc_zeros::<T>(max_tokens * kv_dim)?,
             q: stream.alloc_zeros::<f16>(max_tokens * q_dim)?,
             k: stream.alloc_zeros::<f16>(max_tokens * kv_dim)?,
             v: stream.alloc_zeros::<f16>(max_tokens * kv_dim)?,
             attention: stream.alloc_zeros::<f16>(max_tokens * q_dim)?,
-            attention_out: stream.alloc_zeros::<f16>(max_tokens * hidden)?,
-            gate: stream.alloc_zeros::<f16>(max_tokens * intermediate)?,
-            up: stream.alloc_zeros::<f16>(max_tokens * intermediate)?,
-            activation: stream.alloc_zeros::<f16>(max_tokens * intermediate)?,
-            mlp_out: stream.alloc_zeros::<f16>(max_tokens * hidden)?,
+            attention_native: stream.alloc_zeros::<T>(max_tokens * q_dim)?,
+            attention_out: stream.alloc_zeros::<T>(max_tokens * hidden)?,
+            gate: stream.alloc_zeros::<T>(max_tokens * intermediate)?,
+            up: stream.alloc_zeros::<T>(max_tokens * intermediate)?,
+            activation: stream.alloc_zeros::<T>(max_tokens * intermediate)?,
+            mlp_out: stream.alloc_zeros::<T>(max_tokens * hidden)?,
         })
     }
 }
@@ -107,7 +115,7 @@ impl TalkerLayerKvCache {
     }
 }
 
-impl TalkerDecoderLayer {
+impl<T: QwenDType> TalkerDecoderLayer<T> {
     pub fn load(
         model_dir: impl AsRef<Path>,
         layer_index: usize,
@@ -128,7 +136,17 @@ impl TalkerDecoderLayer {
         config: &TalkerConfig,
         stream: &Arc<CudaStream>,
     ) -> anyhow::Result<Self> {
-        let load = |suffix: &str, expected: &[usize]| -> anyhow::Result<CudaSlice<f16>> {
+        let load = |suffix: &str, expected: &[usize]| -> anyhow::Result<CudaSlice<T>> {
+            let name = format!("{prefix}.{suffix}");
+            let (shape, tensor) = T::load(model_dir.as_ref(), &name, stream)?;
+            ensure!(
+                shape == expected,
+                "{name} has shape {:?}, expected {expected:?}",
+                shape
+            );
+            Ok(tensor)
+        };
+        let load_f16 = |suffix: &str, expected: &[usize]| -> anyhow::Result<CudaSlice<f16>> {
             let name = format!("{prefix}.{suffix}");
             let tensor = load_f16_tensor(model_dir.as_ref(), &name)
                 .with_context(|| format!("could not load {name}"))?;
@@ -137,9 +155,7 @@ impl TalkerDecoderLayer {
                 "{name} has shape {:?}, expected {expected:?}",
                 tensor.shape
             );
-            stream
-                .clone_htod(&tensor.values)
-                .with_context(|| format!("could not upload {name}"))
+            Ok(stream.clone_htod(&tensor.values)?)
         };
 
         let hidden = config.hidden_size;
@@ -151,8 +167,8 @@ impl TalkerDecoderLayer {
             q_proj: load("self_attn.q_proj.weight", &[q_dim, hidden])?,
             k_proj: load("self_attn.k_proj.weight", &[kv_dim, hidden])?,
             v_proj: load("self_attn.v_proj.weight", &[kv_dim, hidden])?,
-            q_norm: load("self_attn.q_norm.weight", &[config.head_dim])?,
-            k_norm: load("self_attn.k_norm.weight", &[config.head_dim])?,
+            q_norm: load_f16("self_attn.q_norm.weight", &[config.head_dim])?,
+            k_norm: load_f16("self_attn.k_norm.weight", &[config.head_dim])?,
             o_proj: load("self_attn.o_proj.weight", &[hidden, q_dim])?,
             post_attention_norm: load("post_attention_layernorm.weight", &[hidden])?,
             gate_proj: load("mlp.gate_proj.weight", &[intermediate, hidden])?,
@@ -197,9 +213,7 @@ impl TalkerDecoderLayer {
         cache: &mut TalkerLayerKvCache,
     ) -> anyhow::Result<Vec<f32>> {
         let hidden_dim = config.hidden_size;
-        let q_dim = config.num_attention_heads * config.head_dim;
         let kv_dim = config.num_key_value_heads * config.head_dim;
-        let intermediate = config.intermediate_size;
         ensure!(seq_len > 0, "sequence length must be non-zero");
         ensure!(
             cache.kv_dim == kv_dim,
@@ -217,174 +231,10 @@ impl TalkerDecoderLayer {
             hidden_host.len(),
             seq_len * hidden_dim
         );
-        let rows = u32::try_from(seq_len).context("sequence length exceeds CUDA limits")?;
-        let position = u32::try_from(cache.position).context("KV position exceeds CUDA limits")?;
-        let total_kv_len =
-            u32::try_from(cache.position + seq_len).context("KV length exceeds CUDA limits")?;
-
         let stream = Arc::clone(kernels.ops.stream());
         let mut hidden = stream.clone_htod(hidden_host)?;
-        let mut norm = stream.alloc_zeros::<f16>(seq_len * hidden_dim)?;
-        let mut q = stream.alloc_zeros::<f16>(seq_len * q_dim)?;
-        let mut k = stream.alloc_zeros::<f16>(seq_len * kv_dim)?;
-        let mut v = stream.alloc_zeros::<f16>(seq_len * kv_dim)?;
-        let mut attention = stream.alloc_zeros::<f16>(seq_len * q_dim)?;
-        let mut attention_out = stream.alloc_zeros::<f16>(seq_len * hidden_dim)?;
-        let mut gate = stream.alloc_zeros::<f16>(seq_len * intermediate)?;
-        let mut up = stream.alloc_zeros::<f16>(seq_len * intermediate)?;
-        let mut activation = stream.alloc_zeros::<f16>(seq_len * intermediate)?;
-        let mut mlp_out = stream.alloc_zeros::<f16>(seq_len * hidden_dim)?;
-
-        kernels.ops.rms_norm_f32in(
-            &hidden,
-            &self.input_norm,
-            &mut norm,
-            rows,
-            hidden_dim as u32,
-            config.rms_norm_eps as f32,
-        )?;
-        kernels.gemm.matmul_f16(
-            &norm,
-            &self.q_proj,
-            &mut q,
-            rows,
-            q_dim as u32,
-            hidden_dim as u32,
-        )?;
-        kernels.gemm.matmul_f16(
-            &norm,
-            &self.k_proj,
-            &mut k,
-            rows,
-            kv_dim as u32,
-            hidden_dim as u32,
-        )?;
-        kernels.gemm.matmul_f16(
-            &norm,
-            &self.v_proj,
-            &mut v,
-            rows,
-            kv_dim as u32,
-            hidden_dim as u32,
-        )?;
-
-        // The CUDA RMSNorm kernel permits the same allocation as input/output,
-        // matching Qwen's per-head Q/K normalization.
-        unsafe {
-            let q_in = &q as *const CudaSlice<f16>;
-            let q_out = &mut q as *mut CudaSlice<f16>;
-            kernels.ops.rms_norm(
-                &*q_in,
-                &self.q_norm,
-                &mut *q_out,
-                rows * config.num_attention_heads as u32,
-                config.head_dim as u32,
-                config.rms_norm_eps as f32,
-            )?;
-            let k_in = &k as *const CudaSlice<f16>;
-            let k_out = &mut k as *mut CudaSlice<f16>;
-            kernels.ops.rms_norm(
-                &*k_in,
-                &self.k_norm,
-                &mut *k_out,
-                rows * config.num_key_value_heads as u32,
-                config.head_dim as u32,
-                config.rms_norm_eps as f32,
-            )?;
-        }
-
-        kernels.ops.rope_neox(
-            &mut q,
-            rows,
-            config.num_attention_heads as u32,
-            config.head_dim as u32,
-            position,
-            config.rope_theta as f32,
-        )?;
-        kernels.ops.rope_neox(
-            &mut k,
-            rows,
-            config.num_key_value_heads as u32,
-            config.head_dim as u32,
-            position,
-            config.rope_theta as f32,
-        )?;
-        let cache_offset = cache.position * kv_dim;
-        let cache_end = cache_offset + seq_len * kv_dim;
-        {
-            let mut destination = cache.k.slice_mut(cache_offset..cache_end);
-            kernels
-                .ops
-                .copy_f16(&k, &mut destination, rows * kv_dim as u32)?;
-        }
-        {
-            let mut destination = cache.v.slice_mut(cache_offset..cache_end);
-            kernels
-                .ops
-                .copy_f16(&v, &mut destination, rows * kv_dim as u32)?;
-        }
-        kernels.ops.mha_fused(
-            &q,
-            &cache.k.slice(..cache_end),
-            &cache.v.slice(..cache_end),
-            &mut attention,
-            config.head_dim as u32,
-            config.num_attention_heads as u32,
-            config.num_key_value_heads as u32,
-            rows,
-            total_kv_len,
-            position,
-        )?;
-        kernels.gemm.matmul_f16(
-            &attention,
-            &self.o_proj,
-            &mut attention_out,
-            rows,
-            hidden_dim as u32,
-            q_dim as u32,
-        )?;
-        kernels
-            .ops
-            .add_inplace_f32_f16(&mut hidden, &attention_out, rows * hidden_dim as u32)?;
-
-        kernels.ops.rms_norm_f32in(
-            &hidden,
-            &self.post_attention_norm,
-            &mut norm,
-            rows,
-            hidden_dim as u32,
-            config.rms_norm_eps as f32,
-        )?;
-        kernels.gemm.matmul_f16(
-            &norm,
-            &self.gate_proj,
-            &mut gate,
-            rows,
-            intermediate as u32,
-            hidden_dim as u32,
-        )?;
-        kernels.gemm.matmul_f16(
-            &norm,
-            &self.up_proj,
-            &mut up,
-            rows,
-            intermediate as u32,
-            hidden_dim as u32,
-        )?;
-        kernels
-            .ops
-            .silu(&gate, &up, &mut activation, rows * intermediate as u32)?;
-        kernels.gemm.matmul_f16(
-            &activation,
-            &self.down_proj,
-            &mut mlp_out,
-            rows,
-            hidden_dim as u32,
-            intermediate as u32,
-        )?;
-        kernels
-            .ops
-            .add_inplace_f32_f16(&mut hidden, &mlp_out, rows * hidden_dim as u32)?;
+        let mut scratch = TalkerLayerScratch::<T>::allocate(seq_len, config, &stream)?;
+        self.forward_cached_device(&mut hidden, seq_len, config, kernels, cache, &mut scratch)?;
         stream.synchronize()?;
 
         let mut output = vec![0.0f32; seq_len * hidden_dim];

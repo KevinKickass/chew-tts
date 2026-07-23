@@ -375,6 +375,36 @@ impl Gemm {
         Ok(())
     }
 
+    /// C = A @ B^T for native BF16 model weights and activations.
+    pub fn matmul_bf16(
+        &self,
+        a: &CudaSlice<half::bf16>,
+        b: &CudaSlice<half::bf16>,
+        c: &mut CudaSlice<half::bf16>,
+        m: u32,
+        n: u32,
+        k: u32,
+    ) -> Result<(), KernelError> {
+        let cfg = GemmConfig {
+            transa: cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_T,
+            transb: cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N,
+            m: n as i32,
+            n: m as i32,
+            k: k as i32,
+            alpha: half::bf16::from_f32(1.0),
+            lda: k as i32,
+            ldb: k as i32,
+            beta: half::bf16::from_f32(0.0),
+            ldc: n as i32,
+        };
+        unsafe {
+            self.blas
+                .gemm(cfg, b, a, c)
+                .map_err(|e| KernelError::Cublas(e.to_string()))?;
+        }
+        Ok(())
+    }
+
     /// C = A @ B (both f16, B NOT transposed).
     ///
     /// A: [m, k] row-major
