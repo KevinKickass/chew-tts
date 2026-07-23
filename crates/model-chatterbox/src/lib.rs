@@ -4,9 +4,11 @@ use chew_safetensors::{MappedSafetensors, TensorInfo};
 use std::path::{Path, PathBuf};
 
 mod cuda;
+mod frontend;
 mod tokenizer;
 
 pub use cuda::{ChatterboxT3Layer, ChatterboxT3Transformer};
+pub use frontend::{ChatterboxT3Frontend, ChatterboxT3Prefix};
 pub use tokenizer::{ChatterboxTokenizer, normalize_multilingual_text};
 
 pub const TEXT_VOCAB_SIZE: usize = 2_454;
@@ -33,6 +35,41 @@ pub struct ChatterboxInspection {
     pub s3gen_tensor_count: usize,
     pub voice_encoder_tensor_count: usize,
     pub total_weight_bytes: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChatterboxConditioning {
+    pub speaker_embedding: Vec<f32>,
+    pub prompt_speech_tokens: Vec<i32>,
+    pub emotion_exaggeration: f32,
+    pub s3_prompt_tokens: Vec<i32>,
+    pub s3_prompt_features: Vec<f32>,
+    pub s3_prompt_feature_frames: usize,
+    pub s3_embedding: Vec<f32>,
+}
+
+impl ChatterboxConditioning {
+    pub fn load(path: &Path) -> anyhow::Result<Self> {
+        let t3 = PthTensors::new(path, Some("t3"))
+            .with_context(|| format!("could not read T3 conditioning {}", path.display()))?;
+        let s3 = PthTensors::new(path, Some("gen"))
+            .with_context(|| format!("could not read S3Gen conditioning {}", path.display()))?;
+        let speaker_embedding = pth_f32(&t3, "speaker_emb", &[1, 256])?;
+        let prompt_speech_tokens = pth_i32(&t3, "cond_prompt_speech_tokens", &[1, 150])?;
+        let emotion = pth_f32(&t3, "emotion_adv", &[1, 1, 1])?;
+        let s3_prompt_tokens = pth_i32(&s3, "prompt_token", &[1, 157])?;
+        let s3_prompt_features = pth_f32(&s3, "prompt_feat", &[1, 314, 80])?;
+        let s3_embedding = pth_f32(&s3, "embedding", &[1, 192])?;
+        Ok(Self {
+            speaker_embedding,
+            prompt_speech_tokens,
+            emotion_exaggeration: emotion[0],
+            s3_prompt_tokens,
+            s3_prompt_features,
+            s3_prompt_feature_frames: 314,
+            s3_embedding,
+        })
+    }
 }
 
 pub fn inspect_model(model_dir: &Path) -> anyhow::Result<ChatterboxInspection> {
@@ -189,4 +226,37 @@ fn validate_s3gen_names<'a>(names: impl Iterator<Item = &'a str>) -> anyhow::Res
         );
     }
     Ok(())
+}
+
+fn pth_f32(tensors: &PthTensors, name: &str, expected: &[usize]) -> anyhow::Result<Vec<f32>> {
+    let tensor = tensors
+        .get(name)?
+        .with_context(|| format!("conditioning tensor {name} is missing"))?;
+    ensure!(
+        tensor.dims() == expected,
+        "conditioning tensor {name} has shape {:?}, expected {expected:?}",
+        tensor.dims()
+    );
+    Ok(tensor
+        .to_dtype(DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?)
+}
+
+fn pth_i32(tensors: &PthTensors, name: &str, expected: &[usize]) -> anyhow::Result<Vec<i32>> {
+    let tensor = tensors
+        .get(name)?
+        .with_context(|| format!("conditioning tensor {name} is missing"))?;
+    ensure!(
+        tensor.dims() == expected,
+        "conditioning tensor {name} has shape {:?}, expected {expected:?}",
+        tensor.dims()
+    );
+    tensor
+        .to_dtype(DType::I64)?
+        .flatten_all()?
+        .to_vec1::<i64>()?
+        .into_iter()
+        .map(|value| i32::try_from(value).context("conditioning token exceeds i32"))
+        .collect()
 }

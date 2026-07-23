@@ -1,8 +1,8 @@
 use anyhow::Context;
 use chew_model_chatterbox::{
-    ChatterboxT3Layer, ChatterboxT3Transformer, ChatterboxTokenizer,
-    HIDDEN_SIZE as CHATTERBOX_HIDDEN_SIZE, INTERMEDIATE_SIZE as CHATTERBOX_INTERMEDIATE_SIZE,
-    inspect_model as inspect_chatterbox_model,
+    ChatterboxConditioning, ChatterboxT3Frontend, ChatterboxT3Layer, ChatterboxT3Transformer,
+    ChatterboxTokenizer, HIDDEN_SIZE as CHATTERBOX_HIDDEN_SIZE,
+    INTERMEDIATE_SIZE as CHATTERBOX_INTERMEDIATE_SIZE, inspect_model as inspect_chatterbox_model,
 };
 use chew_model_kokoro::{KokoroVoice, inspect_model as inspect_kokoro_model};
 use chew_model_qwen3_tts::{
@@ -122,6 +122,26 @@ enum Command {
         /// Compare a split cached decode against one-pass prefill.
         #[arg(long)]
         compare_cache: bool,
+    },
+    /// Generate native Chatterbox speech tokens through the complete T3 path.
+    CudaChatterboxGenerationSmoke {
+        /// Directory containing Chatterbox V3 weights, tokenizer, and conds.pt.
+        model_dir: PathBuf,
+        /// Zero-based CUDA device index.
+        #[arg(long, default_value_t = 0)]
+        gpu: usize,
+        /// ISO language code such as de or en.
+        #[arg(long, default_value = "de")]
+        language: String,
+        /// Text to synthesize into speech tokens.
+        #[arg(long)]
+        text: String,
+        /// Maximum number of greedy speech tokens.
+        #[arg(long, default_value_t = 8)]
+        max_tokens: usize,
+        /// Classifier-free guidance strength.
+        #[arg(long, default_value_t = 0.5)]
+        cfg_weight: f32,
     },
     /// Tokenize text with the model's local Qwen2 BPE files.
     Tokenize {
@@ -519,6 +539,16 @@ fn main() -> anyhow::Result<()> {
                 "weights: {:.2} GiB",
                 inspection.total_weight_bytes as f64 / 1024.0_f64.powi(3),
             );
+            let conditioning_path = model_dir.join("conds.pt");
+            if conditioning_path.is_file() {
+                let conditioning = ChatterboxConditioning::load(&conditioning_path)?;
+                println!(
+                    "conditioning: {} T3 prompt tokens, {} S3 prompt tokens, {} S3 feature frames",
+                    conditioning.prompt_speech_tokens.len(),
+                    conditioning.s3_prompt_tokens.len(),
+                    conditioning.s3_prompt_feature_frames,
+                );
+            }
         }
         Command::TokenizeChatterbox {
             model_dir,
@@ -619,6 +649,91 @@ fn main() -> anyhow::Result<()> {
                 "Chatterbox T3 {} CUDA: sum={sum:.9}, sum_sq={sum_sq:.9}, first={:?}",
                 if stack { "stack" } else { "layer" },
                 &output[..8]
+            );
+        }
+        Command::CudaChatterboxGenerationSmoke {
+            model_dir,
+            gpu,
+            language,
+            text,
+            max_tokens,
+            cfg_weight,
+        } => {
+            anyhow::ensure!(max_tokens > 0, "max tokens must be non-zero");
+            let allocator = chew_vram::VramAllocator::init()?;
+            anyhow::ensure!(
+                gpu < allocator.gpu_count(),
+                "GPU index {gpu} is out of range; detected {} device(s)",
+                allocator.gpu_count()
+            );
+            let stream = std::sync::Arc::clone(allocator.stream(gpu));
+            let mut kernels = chew_kernel::GpuKernels::load(
+                &stream,
+                CHATTERBOX_HIDDEN_SIZE * CHATTERBOX_INTERMEDIATE_SIZE,
+                CHATTERBOX_INTERMEDIATE_SIZE,
+            )?;
+            let tokenizer = ChatterboxTokenizer::load(&model_dir)?;
+            let text_tokens = tokenizer.encode(&text, &language)?;
+            let conditioning = ChatterboxConditioning::load(&model_dir.join("conds.pt"))?;
+            let frontend = ChatterboxT3Frontend::load(&model_dir, &stream)?;
+            let prefix = frontend.build_prefix(&text_tokens, &conditioning, &mut kernels)?;
+            let transformer = ChatterboxT3Transformer::load(&model_dir, &stream)?;
+            let capacity = prefix.tokens + max_tokens;
+            let mut conditional = transformer.start_session(capacity, prefix.tokens, &stream)?;
+            let mut unconditional = transformer.start_session(capacity, prefix.tokens, &stream)?;
+            let mut conditional_hidden = transformer.forward_session(
+                &mut conditional,
+                &prefix.conditional,
+                prefix.tokens,
+                &mut kernels,
+            )?;
+            let mut unconditional_hidden = transformer.forward_session(
+                &mut unconditional,
+                &prefix.unconditional,
+                prefix.tokens,
+                &mut kernels,
+            )?;
+            let mut generated = Vec::new();
+            for position in 0..max_tokens {
+                let conditional_logits = frontend.speech_logits(
+                    &conditional_hidden[conditional_hidden.len() - CHATTERBOX_HIDDEN_SIZE..],
+                    &mut kernels,
+                )?;
+                let unconditional_logits = frontend.speech_logits(
+                    &unconditional_hidden[unconditional_hidden.len() - CHATTERBOX_HIDDEN_SIZE..],
+                    &mut kernels,
+                )?;
+                let token = conditional_logits
+                    .iter()
+                    .zip(&unconditional_logits)
+                    .enumerate()
+                    .max_by(
+                        |(_, (cond_left, uncond_left)), (_, (cond_right, uncond_right))| {
+                            let left = cond_left.to_f32()
+                                + cfg_weight * (cond_left.to_f32() - uncond_left.to_f32());
+                            let right = cond_right.to_f32()
+                                + cfg_weight * (cond_right.to_f32() - uncond_right.to_f32());
+                            left.total_cmp(&right)
+                        },
+                    )
+                    .map(|(token, _)| token as i32)
+                    .context("Chatterbox speech head returned no logits")?;
+                generated.push(token);
+                if token == 6_562 {
+                    break;
+                }
+                let embedding = frontend.speech_embedding(token, position + 1, &mut kernels)?;
+                conditional_hidden =
+                    transformer.forward_session(&mut conditional, &embedding, 1, &mut kernels)?;
+                unconditional_hidden =
+                    transformer.forward_session(&mut unconditional, &embedding, 1, &mut kernels)?;
+            }
+            println!(
+                "Chatterbox T3 generated {} token(s) from {} text tokens and {} prefix tokens: {:?}",
+                generated.len(),
+                text_tokens.len(),
+                prefix.tokens,
+                generated,
             );
         }
         Command::Tokenize { model_dir, text } => {
