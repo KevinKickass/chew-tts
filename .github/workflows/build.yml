@@ -16,7 +16,9 @@ env:
 jobs:
   build:
     name: Linux x86-64
-    runs-on: ubuntu-24.04
+    # Build against an older glibc so the binary also runs on Debian 12 and
+    # GPU hosts that have not moved to Ubuntu 24.04 yet.
+    runs-on: ubuntu-22.04
     timeout-minutes: 45
 
     steps:
