@@ -315,6 +315,7 @@ async fn submit(state: &Arc<AppState>, request: SpeechRequest) -> Result<Generat
             },
             None => None,
         },
+        reference_text: request.reference_text,
         language: normalize_language(&request.language),
         max_frames: request.max_frames.unwrap_or(state.max_frames),
         seed: request.seed,
@@ -323,12 +324,6 @@ async fn submit(state: &Arc<AppState>, request: SpeechRequest) -> Result<Generat
         chunk_frames: 32,
         chunk_context: 4,
     };
-    if request.reference_text.is_some() {
-        return Err(error_response(
-            StatusCode::BAD_REQUEST,
-            "reference_text ICL mode is not implemented yet; omit it for speaker-embedding mode",
-        ));
-    }
     let (response_tx, response_rx) = oneshot::channel();
     state
         .jobs

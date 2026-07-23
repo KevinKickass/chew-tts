@@ -1,4 +1,5 @@
 mod codec;
+mod codec_encoder;
 mod config;
 mod cuda;
 mod frontend;
@@ -7,6 +8,7 @@ mod sampling;
 mod speaker_encoder;
 
 pub use codec::{CodecQuantizer, CodecTransformerSession};
+pub use codec_encoder::CodecEncoder;
 pub use config::{
     CodePredictorConfig, ModelType, Qwen3TtsConfig, SpeakerEncoderConfig, TalkerConfig,
 };

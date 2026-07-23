@@ -28,9 +28,40 @@ __global__ void unfold_reflect_f16(const __half* __restrict__ input,
     output[index] = input[channel * seq_len + source];
 }
 
+__global__ void unfold_causal_stride_f16(const __half* __restrict__ input,
+                                         __half* __restrict__ output,
+                                         int channels,
+                                         int input_len,
+                                         int output_len,
+                                         int kernel_size,
+                                         int stride,
+                                         int dilation) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    const int width = channels * kernel_size;
+    const int total = output_len * width;
+    if (index >= total) return;
+    const int output_position = index / width;
+    const int item = index % width;
+    const int channel = item / kernel_size;
+    const int tap = item % kernel_size;
+    const int padding_left = (kernel_size - 1) * dilation + 1 - stride;
+    const int source = output_position * stride + tap * dilation - padding_left;
+    output[index] = source >= 0 && source < input_len
+        ? input[channel * input_len + source]
+        : __float2half(0.0f);
+}
+
 __global__ void relu_f16(__half* values, int n) {
     const int index = blockIdx.x * blockDim.x + threadIdx.x;
     if (index < n) values[index] = __float2half(fmaxf(0.0f, __half2float(values[index])));
+}
+
+__global__ void elu_f16(__half* values, int n) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < n) {
+        const float value = __half2float(values[index]);
+        values[index] = __float2half(value >= 0.0f ? value : expf(value) - 1.0f);
+    }
 }
 
 __global__ void tanh_f16(__half* values, int n) {
@@ -233,6 +264,61 @@ __global__ void softmax_channels_f16(__half* values, int channels, int seq_len) 
     sum = warp_values[0];
     for (int position = threadIdx.x; position < seq_len; position += blockDim.x) {
         row[position] = __float2half(expf(__half2float(row[position]) - maximum) / sum);
+    }
+}
+
+__global__ void nearest_codebook_f16(const __half* __restrict__ input,
+                                     const __half* __restrict__ codebook,
+                                     int* __restrict__ indices,
+                                     int frames,
+                                     int codebook_size,
+                                     int dim) {
+    const int frame = blockIdx.x;
+    if (frame >= frames) return;
+    float best_distance = 3.402823466e+38F;
+    int best_index = 0;
+    for (int code = threadIdx.x; code < codebook_size; code += blockDim.x) {
+        float distance = 0.0f;
+        for (int feature = 0; feature < dim; ++feature) {
+            const float delta =
+                __half2float(input[frame * dim + feature])
+                - __half2float(codebook[code * dim + feature]);
+            distance += delta * delta;
+        }
+        if (distance < best_distance) {
+            best_distance = distance;
+            best_index = code;
+        }
+    }
+    __shared__ float distances[256];
+    __shared__ int candidates[256];
+    distances[threadIdx.x] = best_distance;
+    candidates[threadIdx.x] = best_index;
+    __syncthreads();
+    for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
+        if (threadIdx.x < offset
+            && distances[threadIdx.x + offset] < distances[threadIdx.x]) {
+            distances[threadIdx.x] = distances[threadIdx.x + offset];
+            candidates[threadIdx.x] = candidates[threadIdx.x + offset];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) indices[frame] = candidates[0];
+}
+
+__global__ void subtract_codebook_f16(__half* residual,
+                                      const __half* __restrict__ codebook,
+                                      const int* __restrict__ indices,
+                                      int frames,
+                                      int dim) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = frames * dim;
+    if (index < total) {
+        const int frame = index / dim;
+        const int feature = index % dim;
+        residual[index] = __hsub(
+            residual[index],
+            codebook[indices[frame] * dim + feature]);
     }
 }
 

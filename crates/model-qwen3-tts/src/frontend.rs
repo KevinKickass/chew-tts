@@ -1,4 +1,4 @@
-use crate::{TalkerConfig, load_f16_tensor};
+use crate::{CodePredictorTransformer, TalkerConfig, load_f16_tensor};
 use anyhow::{Context, ensure};
 use chew_kernel::GpuKernels;
 use cudarc::driver::{CudaSlice, CudaStream};
@@ -496,6 +496,135 @@ impl TalkerFrontend {
         let trailing_text = self.project_text_tokens(&trailing_ids, kernels)?;
         let text_pad = self.project_text_tokens(&[TTS_PAD], kernels)?;
 
+        Ok(VoiceDesignInputs {
+            prefill,
+            prefill_tokens,
+            trailing_text,
+            trailing_tokens,
+            text_pad,
+        })
+    }
+
+    /// Build Qwen's streaming in-context-learning prompt from reference text
+    /// and the reference audio's 16-codebook frames.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_icl_inputs(
+        &self,
+        text_ids: &[i32],
+        reference_text_ids: &[i32],
+        reference_codes: &[Vec<i32>],
+        instruction_ids: Option<&[i32]>,
+        language_codec_id: i32,
+        speaker_embedding: &[f32],
+        predictor: &CodePredictorTransformer,
+        kernels: &mut GpuKernels,
+    ) -> anyhow::Result<VoiceDesignInputs> {
+        const IM_START: i32 = 151_644;
+        const ASSISTANT: i32 = 77_091;
+        const NEWLINE: i32 = 198;
+        const TTS_PAD: i32 = 151_671;
+        const TTS_BOS: i32 = 151_672;
+        const TTS_EOS: i32 = 151_673;
+        const CODEC_PAD: i32 = 2_148;
+        const CODEC_BOS: i32 = 2_149;
+        const CODEC_THINK: i32 = 2_154;
+        const CODEC_THINK_BOS: i32 = 2_156;
+        const CODEC_THINK_EOS: i32 = 2_157;
+
+        ensure!(!text_ids.is_empty(), "TTS text must not be empty");
+        ensure!(
+            !reference_text_ids.is_empty(),
+            "reference text must not be empty"
+        );
+        ensure!(
+            !reference_codes.is_empty(),
+            "reference audio produced no codec frames"
+        );
+        ensure!(
+            speaker_embedding.len() == self.hidden_size,
+            "speaker embedding has {} values, expected {}",
+            speaker_embedding.len(),
+            self.hidden_size
+        );
+        ensure!(
+            reference_codes.iter().all(|frame| frame.len() == 16),
+            "each reference codec frame must contain 16 codes"
+        );
+
+        let instruction = instruction_ids
+            .map(|ids| self.project_text_tokens(ids, kernels))
+            .transpose()?
+            .unwrap_or_default();
+        let role = self.project_text_tokens(&[IM_START, ASSISTANT, NEWLINE], kernels)?;
+        let mut control_text_ids = vec![TTS_PAD; 5];
+        control_text_ids.push(TTS_BOS);
+        let control_text = self.project_text_tokens(&control_text_ids, kernels)?;
+        let mut control_codec = self.codec_embeddings(
+            &[
+                CODEC_THINK,
+                CODEC_THINK_BOS,
+                language_codec_id,
+                CODEC_THINK_EOS,
+            ],
+            kernels,
+        )?;
+        control_codec.extend_from_slice(speaker_embedding);
+        control_codec.extend(self.codec_embeddings(&[CODEC_PAD], kernels)?);
+
+        let mut prefill = Vec::new();
+        prefill.extend(instruction);
+        prefill.extend(role);
+        prefill.extend(
+            control_text
+                .iter()
+                .zip(control_codec)
+                .map(|(text, codec)| text + codec),
+        );
+
+        let mut all_text_ids = Vec::with_capacity(reference_text_ids.len() + text_ids.len() + 1);
+        all_text_ids.extend_from_slice(reference_text_ids);
+        all_text_ids.extend_from_slice(text_ids);
+        all_text_ids.push(TTS_EOS);
+        let text = self.project_text_tokens(&all_text_ids, kernels)?;
+        let text_tokens = all_text_ids.len();
+        let text_pad = self.project_text_tokens(&[TTS_PAD], kernels)?;
+
+        let mut codec = self.codec_embeddings(&[CODEC_BOS], kernels)?;
+        for frame in reference_codes {
+            let semantic = self.codec_embeddings(&frame[..1], kernels)?;
+            let acoustic = predictor.acoustic_embeddings_sum(&frame[1..], kernels)?;
+            codec.extend(
+                semantic
+                    .into_iter()
+                    .zip(acoustic)
+                    .map(|(semantic, acoustic)| semantic + acoustic),
+            );
+        }
+        let codec_tokens = reference_codes.len() + 1;
+        let overlap = text_tokens.min(codec_tokens);
+        for token in 0..overlap {
+            let offset = token * self.hidden_size;
+            prefill.extend(
+                text[offset..offset + self.hidden_size]
+                    .iter()
+                    .zip(&codec[offset..offset + self.hidden_size])
+                    .map(|(text, codec)| text + codec),
+            );
+        }
+        if codec_tokens > text_tokens {
+            for token in text_tokens..codec_tokens {
+                let offset = token * self.hidden_size;
+                prefill.extend(
+                    text_pad
+                        .iter()
+                        .zip(&codec[offset..offset + self.hidden_size])
+                        .map(|(text, codec)| text + codec),
+                );
+            }
+        }
+        let trailing_text = text[overlap * self.hidden_size..].to_vec();
+        let trailing_tokens = text_tokens.saturating_sub(overlap);
+        let prefill_tokens = prefill.len() / self.hidden_size;
         Ok(VoiceDesignInputs {
             prefill,
             prefill_tokens,

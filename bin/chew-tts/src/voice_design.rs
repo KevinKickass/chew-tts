@@ -1,7 +1,7 @@
 use crate::audio_input::{decode_wav, resample, speaker_mel};
 use anyhow::{Context, ensure};
 use chew_model_qwen3_tts::{
-    CodePredictorGenerationSession, CodePredictorTransformer, CodecQuantizer,
+    CodePredictorGenerationSession, CodePredictorTransformer, CodecEncoder, CodecQuantizer,
     CodecTransformerSession, ModelType, SemanticSamplingSession, SpeakerEncoder, TalkerConfig,
     TalkerFrontend, TalkerTransformer, inspect_model,
 };
@@ -26,6 +26,7 @@ pub struct VoiceDesignEngine {
     semantic_session: SemanticSamplingSession,
     codec: CodecQuantizer,
     speaker_encoder: Option<SpeakerEncoder>,
+    codec_encoder: Option<CodecEncoder>,
     max_frames: usize,
     pub load_elapsed: Duration,
     pub vram_bytes: u64,
@@ -37,6 +38,7 @@ pub struct SynthesisRequest {
     pub voice: String,
     pub instruction: Option<String>,
     pub reference_audio_wav: Option<Vec<u8>>,
+    pub reference_text: Option<String>,
     pub language: String,
     pub max_frames: usize,
     pub seed: u64,
@@ -93,6 +95,14 @@ impl VoiceDesignEngine {
         } else {
             None
         };
+        let codec_encoder = if model_type == ModelType::Base {
+            Some(CodecEncoder::load(
+                &model_dir.join("speech_tokenizer"),
+                &stream,
+            )?)
+        } else {
+            None
+        };
         let load_elapsed = started.elapsed();
         let free_loaded = allocator.free_bytes(gpu)?;
 
@@ -111,6 +121,7 @@ impl VoiceDesignEngine {
             semantic_session,
             codec,
             speaker_encoder,
+            codec_encoder,
             max_frames,
             load_elapsed,
             vram_bytes: free_before.saturating_sub(free_loaded),
@@ -180,6 +191,7 @@ impl VoiceDesignEngine {
             self.model_type != ModelType::VoiceDesign || instruction_ids.is_some(),
             "instruction must not be empty for a VoiceDesign model"
         );
+        let mut base_samples = None;
         let speaker_embedding = match self.model_type {
             ModelType::CustomVoice => {
                 let speaker = normalize_speaker_name(&request.voice);
@@ -204,25 +216,58 @@ impl VoiceDesignEngine {
                 let (samples, sample_rate) = decode_wav(wav)?;
                 let samples = resample(&samples, sample_rate, 24_000);
                 let (mel, frames) = speaker_mel(&samples)?;
-                Some(
-                    self.speaker_encoder
-                        .as_ref()
-                        .context("Base speaker encoder was not loaded")?
-                        .encode_mel(&mel, frames, &mut self.kernels)?,
-                )
+                let embedding = self
+                    .speaker_encoder
+                    .as_ref()
+                    .context("Base speaker encoder was not loaded")?
+                    .encode_mel(&mel, frames, &mut self.kernels)?;
+                base_samples = Some(samples);
+                Some(embedding)
             }
             ModelType::VoiceDesign => None,
         };
         let mut seed = request.seed;
 
         let prompt_started = Instant::now();
-        let inputs = self.frontend.build_conditioned_inputs(
-            &text_ids,
-            instruction_ids.as_deref(),
-            language_codec_id,
-            speaker_embedding.as_deref(),
-            &mut self.kernels,
-        )?;
+        let inputs = if self.model_type == ModelType::Base
+            && request
+                .reference_text
+                .as_deref()
+                .is_some_and(|text| !text.trim().is_empty())
+        {
+            let reference_text_ids =
+                encode(request.reference_text.as_deref().expect("checked above"))?;
+            let reference_codes = self
+                .codec_encoder
+                .as_ref()
+                .context("Base codec encoder was not loaded")?
+                .encode(
+                    base_samples
+                        .as_deref()
+                        .context("Base reference waveform is unavailable")?,
+                    &mut self.kernels,
+                )?;
+            self.frontend.build_icl_inputs(
+                &text_ids,
+                &reference_text_ids,
+                &reference_codes,
+                instruction_ids.as_deref(),
+                language_codec_id,
+                speaker_embedding
+                    .as_deref()
+                    .context("Base speaker embedding is unavailable")?,
+                &self.predictor,
+                &mut self.kernels,
+            )?
+        } else {
+            self.frontend.build_conditioned_inputs(
+                &text_ids,
+                instruction_ids.as_deref(),
+                language_codec_id,
+                speaker_embedding.as_deref(),
+                &mut self.kernels,
+            )?
+        };
         let max_seq_len = inputs.prefill_tokens + request.max_frames;
         ensure!(
             max_seq_len <= self.config.max_position_embeddings,

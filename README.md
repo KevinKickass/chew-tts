@@ -45,13 +45,15 @@ Implemented:
 - native CustomVoice speaker selection with optional instructions;
 - native WAV decoding, 24-kHz resampling, Slaney log-mel preprocessing, and a
   CUDA ECAPA-TDNN speaker encoder for Base x-vector voice cloning;
+- native SEANet/Transformer speech-tokenizer encoding, 16-codebook residual
+  vector quantization, and Base ICL prompts with reference text;
 - PyTorch parity checks for real Qwen weights, RoPE, GQA, and cached decoding.
 
 Next:
 
 - one CUDA graph for a complete 16-codebook audio frame;
 - optimized one-pass model loading and GPU-resident sampling;
-- Base ICL prompting with reference text and speech-tokenizer codes;
+- cached reusable Base reference prompts;
 - arbitrary compressed reference-audio input in addition to native WAV;
 - Kokoro as the second model family.
 
@@ -299,11 +301,13 @@ contain a free-form voice description. CustomVoice accepts Qwen speaker names
 (`serena`, `vivian`, `uncle_fu`, `ryan`, `aiden`, `ono_anna`, `sohee`,
 `eric`, and `dylan`) and maps the common OpenAI voice names onto them.
 
-Base x-vector cloning accepts the non-OpenAI `reference_audio` extension as a
-base64 WAV or WAV data URL. An instruction can be supplied at the same time.
-Reference extraction is completely native and takes approximately 0.13
-seconds for a 8.7-second clip on an RTX 3080. `reference_text` is reserved for
-the not-yet-complete ICL path and currently returns an explicit error.
+Base cloning accepts the non-OpenAI `reference_audio` extension as a base64
+WAV or WAV data URL. An instruction can be supplied at the same time. Without
+`reference_text`, the engine uses x-vector-only cloning. Supplying the exact
+transcript in `reference_text` enables the stronger ICL path with native
+speech-tokenizer codes. Reference extraction is completely native; an
+end-to-end ICL request producing 4.24 seconds of audio takes approximately
+1.16 seconds on an RTX 3080.
 
 Supported `response_format` values are `wav`, `pcm`, `mp3`, `opus`, `aac`,
 and `flac`. Compressed formats and non-default `speed` use FFmpeg.

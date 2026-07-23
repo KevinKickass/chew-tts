@@ -11,7 +11,9 @@ pub struct SpeakerKernels {
     fast: FastStream,
     _module: Arc<CudaModule>,
     unfold_reflect: CudaFunction,
+    unfold_causal_stride: CudaFunction,
     relu: CudaFunction,
+    elu: CudaFunction,
     tanh: CudaFunction,
     sigmoid: CudaFunction,
     channel_mean: CudaFunction,
@@ -20,6 +22,8 @@ pub struct SpeakerKernels {
     append_context: CudaFunction,
     channel_stats: CudaFunction,
     softmax_channels: CudaFunction,
+    nearest_codebook: CudaFunction,
+    subtract_codebook: CudaFunction,
 }
 
 impl SpeakerKernels {
@@ -29,7 +33,9 @@ impl SpeakerKernels {
             stream: Arc::clone(stream),
             fast: FastStream::new(stream),
             unfold_reflect: loader::get_fn(&module, "unfold_reflect_f16")?,
+            unfold_causal_stride: loader::get_fn(&module, "unfold_causal_stride_f16")?,
             relu: loader::get_fn(&module, "relu_f16")?,
+            elu: loader::get_fn(&module, "elu_f16")?,
             tanh: loader::get_fn(&module, "tanh_f16")?,
             sigmoid: loader::get_fn(&module, "sigmoid_f16")?,
             channel_mean: loader::get_fn(&module, "channel_mean_f16")?,
@@ -38,6 +44,8 @@ impl SpeakerKernels {
             append_context: loader::get_fn(&module, "append_context_f16")?,
             channel_stats: loader::get_fn(&module, "channel_stats_f16")?,
             softmax_channels: loader::get_fn(&module, "softmax_channels_f16")?,
+            nearest_codebook: loader::get_fn(&module, "nearest_codebook_f16")?,
+            subtract_codebook: loader::get_fn(&module, "subtract_codebook_f16")?,
             _module: module,
         })
     }
@@ -58,6 +66,10 @@ impl SpeakerKernels {
 
     pub fn relu(&self, values: &mut CudaSlice<half::f16>) {
         self.elementwise(&self.relu, values)
+    }
+
+    pub fn elu(&self, values: &mut CudaSlice<half::f16>) {
+        self.elementwise(&self.elu, values)
     }
 
     pub fn tanh(&self, values: &mut CudaSlice<half::f16>) {
@@ -93,6 +105,46 @@ impl SpeakerKernels {
         unsafe {
             self.fast.fire(
                 &self.unfold_reflect,
+                (total.div_ceil(256), 1, 1),
+                (256, 1, 1),
+                0,
+                &mut args,
+            )
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn unfold_causal_stride(
+        &self,
+        input: &CudaSlice<half::f16>,
+        output: &mut CudaSlice<half::f16>,
+        channels: u32,
+        input_len: u32,
+        output_len: u32,
+        kernel_size: u32,
+        stride: u32,
+        dilation: u32,
+    ) {
+        let channels_i = channels as i32;
+        let input_len_i = input_len as i32;
+        let output_len_i = output_len as i32;
+        let kernel_size_i = kernel_size as i32;
+        let stride_i = stride as i32;
+        let dilation_i = dilation as i32;
+        let total = output_len * channels * kernel_size;
+        let mut args: [*mut c_void; 8] = [
+            slice_ptr(input),
+            slice_ptr_mut(output),
+            scalar_ptr(&channels_i),
+            scalar_ptr(&input_len_i),
+            scalar_ptr(&output_len_i),
+            scalar_ptr(&kernel_size_i),
+            scalar_ptr(&stride_i),
+            scalar_ptr(&dilation_i),
+        ];
+        unsafe {
+            self.fast.fire(
+                &self.unfold_causal_stride,
                 (total.div_ceil(256), 1, 1),
                 (256, 1, 1),
                 0,
@@ -271,6 +323,66 @@ impl SpeakerKernels {
             self.fast.fire(
                 &self.softmax_channels,
                 (channels, 1, 1),
+                (256, 1, 1),
+                0,
+                &mut args,
+            )
+        }
+    }
+
+    pub fn nearest_codebook(
+        &self,
+        input: &CudaSlice<half::f16>,
+        codebook: &CudaSlice<half::f16>,
+        indices: &mut CudaSlice<i32>,
+        frames: u32,
+        codebook_size: u32,
+        dim: u32,
+    ) {
+        let frames_i = frames as i32;
+        let codebook_size_i = codebook_size as i32;
+        let dim_i = dim as i32;
+        let mut args = [
+            slice_ptr(input),
+            slice_ptr(codebook),
+            slice_ptr_mut(indices),
+            scalar_ptr(&frames_i),
+            scalar_ptr(&codebook_size_i),
+            scalar_ptr(&dim_i),
+        ];
+        unsafe {
+            self.fast.fire(
+                &self.nearest_codebook,
+                (frames, 1, 1),
+                (256, 1, 1),
+                0,
+                &mut args,
+            )
+        }
+    }
+
+    pub fn subtract_codebook(
+        &self,
+        residual: &mut CudaSlice<half::f16>,
+        codebook: &CudaSlice<half::f16>,
+        indices: &CudaSlice<i32>,
+        frames: u32,
+        dim: u32,
+    ) {
+        let frames_i = frames as i32;
+        let dim_i = dim as i32;
+        let total = frames * dim;
+        let mut args = [
+            slice_ptr_mut(residual),
+            slice_ptr(codebook),
+            slice_ptr(indices),
+            scalar_ptr(&frames_i),
+            scalar_ptr(&dim_i),
+        ];
+        unsafe {
+            self.fast.fire(
+                &self.subtract_codebook,
+                (total.div_ceil(256), 1, 1),
                 (256, 1, 1),
                 0,
                 &mut args,

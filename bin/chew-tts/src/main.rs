@@ -1,8 +1,8 @@
 use anyhow::Context;
 use chew_model_qwen3_tts::{
-    CodePredictorTransformer, CodecQuantizer, CodecTransformerSession, SpeakerEncoder,
-    TalkerDecoderLayer, TalkerFrontend, TalkerLayerKvCache, TalkerTransformer, inspect_model,
-    load_f16_tensor,
+    CodePredictorTransformer, CodecEncoder, CodecQuantizer, CodecTransformerSession,
+    SpeakerEncoder, TalkerDecoderLayer, TalkerFrontend, TalkerLayerKvCache, TalkerTransformer,
+    inspect_model, load_f16_tensor,
 };
 use clap::{Parser, Subcommand};
 use std::io::{Seek, SeekFrom, Write};
@@ -228,6 +228,23 @@ enum Command {
         #[arg(long)]
         mel_output: Option<PathBuf>,
         /// Compare against a raw little-endian f32 reference embedding.
+        #[arg(long)]
+        reference: Option<PathBuf>,
+    },
+    /// Encode reference audio into native 16-codebook Qwen codec frames.
+    CudaCodecEncoderSmoke {
+        /// Qwen3-TTS model directory containing speech_tokenizer.
+        model_dir: PathBuf,
+        /// Reference WAV.
+        #[arg(long)]
+        wav: PathBuf,
+        /// Zero-based CUDA device index.
+        #[arg(long, default_value_t = 0)]
+        gpu: usize,
+        /// Write frame-major little-endian i32 codec IDs.
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// Compare with frame-major little-endian i32 codec IDs.
         #[arg(long)]
         reference: Option<PathBuf>,
     },
@@ -459,6 +476,19 @@ fn main() -> anyhow::Result<()> {
             mel_output.as_deref(),
             reference.as_deref(),
         )?,
+        Command::CudaCodecEncoderSmoke {
+            model_dir,
+            wav,
+            gpu,
+            output,
+            reference,
+        } => cuda_codec_encoder_smoke(
+            &model_dir,
+            &wav,
+            gpu,
+            output.as_deref(),
+            reference.as_deref(),
+        )?,
         Command::CudaVoiceDesignSmoke {
             model_dir,
             gpu,
@@ -487,6 +517,79 @@ fn main() -> anyhow::Result<()> {
             &wav,
         )?,
     }
+    Ok(())
+}
+
+fn cuda_codec_encoder_smoke(
+    model_dir: &std::path::Path,
+    wav: &std::path::Path,
+    gpu: usize,
+    output: Option<&std::path::Path>,
+    reference: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    let bytes = std::fs::read(wav).with_context(|| format!("could not read {}", wav.display()))?;
+    let (samples, sample_rate) = audio_input::decode_wav(&bytes)?;
+    let samples = audio_input::resample(&samples, sample_rate, 24_000);
+    let allocator = chew_vram::VramAllocator::init()?;
+    anyhow::ensure!(
+        gpu < allocator.gpu_count(),
+        "GPU index {gpu} is out of range; detected {} device(s)",
+        allocator.gpu_count()
+    );
+    let stream = allocator.stream(gpu);
+    let inspection = inspect_model(model_dir)?;
+    let config = &inspection.config.talker_config;
+    let max_matrix = (config.intermediate_size * config.hidden_size)
+        .max(config.text_hidden_size * config.text_hidden_size);
+    let max_vector = config.intermediate_size.max(config.text_hidden_size);
+    let mut kernels = chew_kernel::GpuKernels::load(stream, max_matrix, max_vector)?;
+    let encoder = CodecEncoder::load(&model_dir.join("speech_tokenizer"), stream)?;
+    let started = std::time::Instant::now();
+    let frames = encoder.encode(&samples, &mut kernels)?;
+    let elapsed = started.elapsed();
+    let flat = frames.iter().flatten().copied().collect::<Vec<_>>();
+    if let Some(output) = output {
+        let mut bytes = Vec::with_capacity(flat.len() * 4);
+        for value in &flat {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        std::fs::write(output, bytes)
+            .with_context(|| format!("could not write {}", output.display()))?;
+    }
+    if let Some(reference) = reference {
+        let bytes = std::fs::read(reference)
+            .with_context(|| format!("could not read {}", reference.display()))?;
+        anyhow::ensure!(
+            bytes.len() % 4 == 0,
+            "codec reference length is not divisible by four"
+        );
+        let expected = bytes
+            .chunks_exact(4)
+            .map(|bytes| i32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        anyhow::ensure!(
+            expected.len() == flat.len(),
+            "codec reference has {} IDs, native encoder produced {}",
+            expected.len(),
+            flat.len()
+        );
+        let matches = flat
+            .iter()
+            .zip(&expected)
+            .filter(|(left, right)| left == right)
+            .count();
+        println!(
+            "codec parity: {matches}/{} IDs ({:.3}%)",
+            flat.len(),
+            matches as f64 * 100.0 / flat.len() as f64
+        );
+        anyhow::ensure!(matches == flat.len(), "codec ID parity failed");
+    }
+    println!(
+        "codec encoder: {} frame(s), {:.3}s",
+        frames.len(),
+        elapsed.as_secs_f64()
+    );
     Ok(())
 }
 
