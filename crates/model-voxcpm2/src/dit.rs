@@ -4,9 +4,10 @@ use anyhow::ensure;
 use chew_kernel::GpuKernels;
 use chew_model_qwen3_tts::{Bf16, QwenDType};
 use cudarc::driver::CudaStream;
+use std::collections::HashMap;
 use std::f32::consts::FRAC_PI_2;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 pub struct VoxCpm2FlowDecoder {
     input: Bf16Linear,
@@ -21,6 +22,7 @@ pub struct VoxCpm2FlowDecoder {
     hidden: usize,
     cfg: f32,
     stream: Arc<CudaStream>,
+    time_cache: Mutex<HashMap<u32, Vec<f32>>>,
 }
 
 impl VoxCpm2FlowDecoder {
@@ -94,6 +96,7 @@ impl VoxCpm2FlowDecoder {
             hidden,
             cfg: config.dit_config.cfm_config.inference_cfg_rate as f32,
             stream: Arc::clone(stream),
+            time_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -126,13 +129,16 @@ impl VoxCpm2FlowDecoder {
                 2.0 * t + (FRAC_PI_2 * t).cos() - 1.0
             })
             .collect::<Vec<_>>();
+        let projected_condition =
+            self.linear_host(&self.condition, condition, self.patch_size, kernels)?;
         for step in 1..=steps {
             let dt = t_span[step - 1] - t_span[step];
             if step == 1 {
                 continue;
             }
+            let time = self.time_condition(t_span[step - 1], kernels)?;
             let (positive, negative) =
-                self.estimate_pair(backbones, &x, mu, t_span[step - 1], condition, kernels)?;
+                self.estimate_pair(backbones, &x, mu, &time, &projected_condition, kernels)?;
             let dot = positive
                 .iter()
                 .zip(&negative)
@@ -157,30 +163,20 @@ impl VoxCpm2FlowDecoder {
         backbones: &VoxCpm2TransformerBackbones,
         x: &[f32],
         mu: &[f32],
-        t: f32,
-        condition: &[f32],
+        time: &[f32],
+        projected_condition: &[f32],
         kernels: &mut GpuKernels,
     ) -> anyhow::Result<(Vec<f32>, Vec<f32>)> {
         let x = self.linear_host(&self.input, x, self.patch_size, kernels)?;
-        let condition = self.linear_host(&self.condition, condition, self.patch_size, kernels)?;
-        let time = self.time_embedding(t);
-        let delta = self.time_embedding(0.0);
-        let time = self.mlp(&self.time_1, &self.time_2, &time, kernels)?;
-        let delta = self.mlp(&self.delta_1, &self.delta_2, &delta, kernels)?;
-        let time = time
-            .into_iter()
-            .zip(delta)
-            .map(|(left, right)| left + right)
-            .collect::<Vec<_>>();
         let tokens = 2 + 1 + self.patch_size * 2;
         let mut sequence = Vec::with_capacity(tokens * self.hidden * 2);
         sequence.extend_from_slice(mu);
-        sequence.extend_from_slice(&time);
-        sequence.extend_from_slice(&condition);
+        sequence.extend_from_slice(time);
+        sequence.extend_from_slice(projected_condition);
         sequence.extend_from_slice(&x);
         sequence.resize(sequence.len() + mu.len(), 0.0);
-        sequence.extend_from_slice(&time);
-        sequence.extend_from_slice(&condition);
+        sequence.extend_from_slice(time);
+        sequence.extend_from_slice(projected_condition);
         sequence.extend_from_slice(&x);
         let hidden = backbones.dit_forward_batched(&sequence, tokens, 2, kernels)?;
         let first_tail = (tokens - self.patch_size) * self.hidden;
@@ -191,6 +187,33 @@ impl VoxCpm2FlowDecoder {
         let output = self.linear_host(&self.output, &tails, self.patch_size * 2, kernels)?;
         let split = self.patch_size * self.feature_dim;
         Ok((output[..split].to_vec(), output[split..].to_vec()))
+    }
+
+    fn time_condition(&self, timestep: f32, kernels: &mut GpuKernels) -> anyhow::Result<Vec<f32>> {
+        let key = timestep.to_bits();
+        if let Some(cached) = self
+            .time_cache
+            .lock()
+            .expect("VoxCPM2 time cache poisoned")
+            .get(&key)
+            .cloned()
+        {
+            return Ok(cached);
+        }
+        let time = self.time_embedding(timestep);
+        let delta = self.time_embedding(0.0);
+        let time = self.mlp(&self.time_1, &self.time_2, &time, kernels)?;
+        let delta = self.mlp(&self.delta_1, &self.delta_2, &delta, kernels)?;
+        let combined = time
+            .into_iter()
+            .zip(delta)
+            .map(|(left, right)| left + right)
+            .collect::<Vec<_>>();
+        self.time_cache
+            .lock()
+            .expect("VoxCPM2 time cache poisoned")
+            .insert(key, combined.clone());
+        Ok(combined)
     }
 
     fn mlp(

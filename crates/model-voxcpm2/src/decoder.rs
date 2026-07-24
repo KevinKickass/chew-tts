@@ -18,11 +18,10 @@ struct Conv1d {
 }
 
 struct ConvTranspose1d {
-    weight: CudaSlice<f16>,
+    phase_weights: Vec<CudaSlice<f16>>,
     bias: CudaSlice<f16>,
     input_channels: usize,
     output_channels: usize,
-    kernel: usize,
     stride: usize,
 }
 
@@ -496,18 +495,33 @@ impl VoxCpm2AudioDecoder {
         let mut output = self
             .stream
             .alloc_zeros::<f16>(conv.output_channels * frames)?;
-        kernels.ops.conv1d_causal_f16(
-            input,
-            &conv.weight,
-            &conv.bias,
-            &mut output,
-            conv.input_channels as u32,
-            conv.output_channels as u32,
-            frames as u32,
-            conv.kernel as u32,
-            conv.dilation as u32,
-            conv.groups as u32,
-        )?;
+        if conv.groups == 1 && conv.output_channels >= 32 {
+            conv1d_causal_gemm(
+                input,
+                &conv.weight,
+                &conv.bias,
+                &mut output,
+                conv.input_channels as u32,
+                conv.output_channels as u32,
+                frames as u32,
+                conv.kernel as u32,
+                conv.dilation as u32,
+                kernels,
+            )?;
+        } else {
+            kernels.ops.conv1d_causal_f16(
+                input,
+                &conv.weight,
+                &conv.bias,
+                &mut output,
+                conv.input_channels as u32,
+                conv.output_channels as u32,
+                frames as u32,
+                conv.kernel as u32,
+                conv.dilation as u32,
+                conv.groups as u32,
+            )?;
+        }
         Ok(output)
     }
 
@@ -521,19 +535,106 @@ impl VoxCpm2AudioDecoder {
         let mut output = self
             .stream
             .alloc_zeros::<f16>(conv.output_channels * frames * conv.stride)?;
-        kernels.ops.conv_transpose1d_causal_f16(
+        conv_transpose1d_causal_gemm(
             input,
-            &conv.weight,
+            &conv.phase_weights,
             &conv.bias,
             &mut output,
             conv.input_channels as u32,
             conv.output_channels as u32,
             frames as u32,
-            conv.kernel as u32,
             conv.stride as u32,
+            kernels,
         )?;
         Ok(output)
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn conv1d_causal_gemm(
+    input: &CudaSlice<f16>,
+    weight: &CudaSlice<f16>,
+    bias: &CudaSlice<f16>,
+    output: &mut CudaSlice<f16>,
+    in_channels: u32,
+    out_channels: u32,
+    frames: u32,
+    kernel_size: u32,
+    dilation: u32,
+    kernels: &mut GpuKernels,
+) -> anyhow::Result<()> {
+    let stream = Arc::clone(kernels.ops.stream());
+    let width = in_channels * kernel_size;
+    let mut unfolded = stream.alloc_zeros::<f16>((frames * width) as usize)?;
+    kernels.ops.unfold_causal_f16(
+        input,
+        &mut unfolded,
+        in_channels,
+        frames,
+        kernel_size,
+        dilation,
+    )?;
+    let mut channel_last = stream.alloc_zeros::<f16>((frames * out_channels) as usize)?;
+    kernels.gemm.matmul_f16(
+        &unfolded,
+        weight,
+        &mut channel_last,
+        frames,
+        out_channels,
+        width,
+    )?;
+    kernels
+        .ops
+        .add_bias_f16_inplace(&mut channel_last, bias, frames, out_channels)?;
+    kernels
+        .ops
+        .transpose_f16(&channel_last, output, frames, out_channels)?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn conv_transpose1d_causal_gemm(
+    input: &CudaSlice<f16>,
+    phase_weights: &[CudaSlice<f16>],
+    bias: &CudaSlice<f16>,
+    output: &mut CudaSlice<f16>,
+    in_channels: u32,
+    out_channels: u32,
+    input_len: u32,
+    stride: u32,
+    kernels: &mut GpuKernels,
+) -> anyhow::Result<()> {
+    ensure!(
+        phase_weights.len() == stride as usize,
+        "VoxCPM2 transposed convolution phase count disagrees"
+    );
+    let stream = Arc::clone(kernels.ops.stream());
+    let width = in_channels * 2;
+    let mut unfolded = stream.alloc_zeros::<f16>((input_len * width) as usize)?;
+    kernels
+        .ops
+        .unfold_causal_f16(input, &mut unfolded, in_channels, input_len, 2, 1)?;
+    let mut phase_output = stream.alloc_zeros::<f16>((input_len * out_channels) as usize)?;
+    for (phase, weight) in phase_weights.iter().enumerate() {
+        kernels.gemm.matmul_f16(
+            &unfolded,
+            weight,
+            &mut phase_output,
+            input_len,
+            out_channels,
+            width,
+        )?;
+        kernels.ops.scatter_conv_transpose_phase_f16(
+            &phase_output,
+            bias,
+            output,
+            input_len,
+            out_channels,
+            stride,
+            phase as u32,
+        )?;
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -594,13 +695,30 @@ fn load_transpose(
     stream: &Arc<CudaStream>,
 ) -> anyhow::Result<ConvTranspose1d> {
     let weight = load_weight_norm(model_dir, prefix, input, input, output, kernel)?;
+    ensure!(
+        kernel == stride * 2,
+        "{prefix} requires a two-tap polyphase kernel"
+    );
+    let phase_weights = (0..stride)
+        .map(|phase| {
+            let mut packed = vec![f16::ZERO; output * input * 2];
+            for output_channel in 0..output {
+                for input_channel in 0..input {
+                    let source = (input_channel * output + output_channel) * kernel;
+                    let destination = (output_channel * input + input_channel) * 2;
+                    packed[destination] = weight[source + phase + stride];
+                    packed[destination + 1] = weight[source + phase];
+                }
+            }
+            Ok(stream.clone_htod(&packed)?)
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
     let bias = load_bias(model_dir, prefix, output)?;
     Ok(ConvTranspose1d {
-        weight: stream.clone_htod(&weight)?,
+        phase_weights,
         bias: stream.clone_htod(&bias)?,
         input_channels: input,
         output_channels: output,
-        kernel,
         stride,
     })
 }

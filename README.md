@@ -96,10 +96,15 @@ Implemented:
 - native VibeVoice-Realtime BF16 text/TTS backbones, cached voice prompts,
   diffusion sampling, causal streaming codec, German/English presets, and the
   `tts-realtime` server alias;
+- batched positive/negative VibeVoice CFG, batched synchronous codec decoding,
+  and Tensor-Core dense/polyphase codec convolutions;
 - native VoxCPM2 with all 60 MiniCPM4/local-DiT layers, LongRoPE, FSQ,
   CFG-Zero* Euler flow, FP32 reference encoder, mixed-precision 48-kHz
   AudioVAE decoder, zero-shot synthesis, reference-voice cloning, and the
   `tts-studio` server alias;
+- Tensor-Core VoxCPM2 AudioVAE convolutions plus cached Euler time conditions
+  and one-per-patch conditioning projections;
+- startup inference warm-up for predictable first-request latency;
 - model-native HTTP sample rates, including VoxCPM2 at 48 kHz, while Fleet's
   existing raw transport remains wire-compatible at mono 24-kHz f32le.
 
@@ -155,18 +160,20 @@ RTX 3080 10 GB:
 | Qwen3-TTS 1.7B VoiceDesign | designed voice | 4.14 s | 3,901 MiB | 8.320 s | 1.967 s | 0.2364 | 4.23x |
 | Qwen3-TTS 1.7B CustomVoice | `serena` | 4.13 s | 3,948 MiB | 9.200 s | 2.148 s | 0.2334 | 4.28x |
 | Qwen3-TTS 1.7B Base | cached ICL clone | 4.36 s | 4,040 MiB | 13.280 s | 3.191 s | 0.2403 | 4.16x |
-| VoxCPM2 | zero-shot | 1.88 s | 4,444 MiB | 5.760 s | 2.333 s | 0.4050 | 2.47x |
-| VibeVoice-Realtime 0.5B | German preset | 1.62 s | 1,452 MiB | 4.267 s | 1.003 s | 0.2351 | 4.25x |
+| VoxCPM2 | German zero-shot, 48 kHz | 3.06 s | 4,709 MiB | 2.560 s | 0.601 s | 0.2349 | 4.26x |
+| VibeVoice-Realtime 0.5B | German preset | 1.99 s | 1,560 MiB | 4.267 s | 0.404 s | 0.0946 | 10.57x |
 
 Unless the mode says otherwise, rows use the same English input, seed 4242,
 native mono WAV output, and one worker. The established model rows use one
 discarded warm-up and the median of five sequential localhost requests; the
-VibeVoice German row is an initial end-to-end HTTP validation. Timings include
-HTTP handling and the complete text-to-waveform path, but exclude model loading
-and MP3 encoding. The card ran under its normal desktop workload with CUDA 13.2
-and driver 595.58. Base uses a 2.96-second reference and measures the normal
-cached-reference path after warm-up. RTF is wall time divided by generated
-audio duration, so lower is better.
+VoxCPM2 and VibeVoice use their listed German validation inputs and the median
+of five warm sequential HTTP requests. Timings include HTTP handling and the
+complete text-to-waveform path, but exclude model loading and MP3 encoding.
+Load and VRAM include the deliberate startup warm-up. The card ran under its
+normal desktop workload with CUDA 13.2 and driver 595.58. Base uses a
+2.96-second reference and measures the normal cached-reference path after
+warm-up. RTF is wall time divided by generated audio duration, so lower is
+better.
 
 ### Audio samples
 
@@ -563,8 +570,8 @@ curl http://127.0.0.1:18001/v1/audio/speech \
 
 Responses include `server-timing`, `x-sllm-audio-duration-ms`,
 `x-sllm-audio-sample-rate`, and `x-sllm-generation-frames`. On an RTX 3080,
-local HTTP validation produced a 48-kHz VoxCPM2 WAV at RTF 0.43 and a German
-VibeVoice WAV at RTF 0.24 without Python or model reloads.
+local HTTP validation produced a 48-kHz VoxCPM2 WAV at RTF 0.235 and a German
+VibeVoice WAV at RTF 0.095 without Python or model reloads.
 
 For a Fleet GPU host, the same native engine can speak the existing
 JSON-over-TCP worker protocol directly:
@@ -594,10 +601,11 @@ On an RTX 3080, a 45.675-second Kokoro result arrived in three progressive
 segments: first audio after 2.586 seconds and completion after 5.572 seconds.
 Most engines currently stream at segment boundaries. VibeVoice-Realtime uses
 the same wire format at codec-frame granularity: a local German request emitted
-32 audio frames, delivered first audio after 272 ms, and completed 4.267
-seconds of audio after 1.018 seconds. This is the worker-side data path needed
-for a gateway-held realtime session; no OpenAI synchronous endpoint behavior
-changes.
+32 audio frames and completed 4.267 seconds of audio in roughly 730 ms warm.
+Startup warm-up reduced first-request TTFA from 270 ms to 63 ms; subsequent
+requests delivered first audio in about 30 ms. This is the worker-side data
+path needed for a gateway-held realtime session; no OpenAI synchronous endpoint
+behavior changes.
 
 ## Requirements
 

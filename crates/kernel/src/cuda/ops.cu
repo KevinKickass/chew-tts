@@ -3654,6 +3654,42 @@ __global__ void gated_residual_bf16(__nv_bfloat16* __restrict__ hidden,
     }
 }
 
+__global__ void modulate_bf16_batched(
+    const __nv_bfloat16* __restrict__ input,
+    const __nv_bfloat16* __restrict__ modulation,
+    __nv_bfloat16* __restrict__ output,
+    int rows,
+    int hidden,
+    int fields) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int n = rows * hidden;
+    if (idx >= n) return;
+    int row = idx / hidden;
+    int col = idx - row * hidden;
+    int base = row * fields * hidden;
+    float x = __bfloat162float(input[idx]);
+    float shift = __bfloat162float(modulation[base + col]);
+    float scale = __bfloat162float(modulation[base + hidden + col]);
+    output[idx] = __float2bfloat16(x * (1.0f + scale) + shift);
+}
+
+__global__ void gated_residual_bf16_batched(
+    __nv_bfloat16* __restrict__ hidden_values,
+    const __nv_bfloat16* __restrict__ modulation,
+    const __nv_bfloat16* __restrict__ delta,
+    int rows,
+    int hidden) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int n = rows * hidden;
+    if (idx >= n) return;
+    int row = idx / hidden;
+    int col = idx - row * hidden;
+    int gate_idx = row * 3 * hidden + 2 * hidden + col;
+    hidden_values[idx] = __float2bfloat16(
+        __bfloat162float(hidden_values[idx])
+        + __bfloat162float(modulation[gate_idx]) * __bfloat162float(delta[idx]));
+}
+
 __global__ void gather_rows_bf16(const __nv_bfloat16* __restrict__ src,
                                   const int* __restrict__ idx,
                                   __nv_bfloat16* __restrict__ dst,

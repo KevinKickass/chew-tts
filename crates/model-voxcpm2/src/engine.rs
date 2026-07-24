@@ -36,6 +36,9 @@ pub struct VoxCpm2Generation {
     pub sample_rate: u32,
     pub patches: usize,
     pub elapsed: Duration,
+    pub prompt_elapsed: Duration,
+    pub generation_elapsed: Duration,
+    pub codec_elapsed: Duration,
 }
 
 impl VoxCpm2Engine {
@@ -223,6 +226,8 @@ impl VoxCpm2Engine {
         let mut previous_patch = vec![0.0; self.patch_size * self.feature_dim];
         let mut generated = Vec::with_capacity(max_patches * self.patch_size * self.feature_dim);
         let mut patches = 0usize;
+        let prompt_elapsed = started.elapsed();
+        let generation_started = Instant::now();
         for patch_index in 0..max_patches {
             let mu = self
                 .projections
@@ -253,12 +258,18 @@ impl VoxCpm2Engine {
                 .backbones
                 .residual_forward(&mut session, &fused, 1, kernels)?;
         }
+        let generation_elapsed = generation_started.elapsed();
+        let codec_started = Instant::now();
         let audio = self.decoder.decode(&generated, kernels)?;
+        let codec_elapsed = codec_started.elapsed();
         Ok(VoxCpm2Generation {
             audio,
             sample_rate: 48_000,
             patches,
             elapsed: started.elapsed(),
+            prompt_elapsed,
+            generation_elapsed,
+            codec_elapsed,
         })
     }
 

@@ -68,6 +68,8 @@ pub struct OpsKernels {
     add_bf16: CudaFunction,
     modulate_bf16: CudaFunction,
     gated_residual_bf16: CudaFunction,
+    modulate_bf16_batched: CudaFunction,
+    gated_residual_bf16_batched: CudaFunction,
     gather_rows_bf16: CudaFunction,
     // CUDA Graph-compatible variants
     rope_graph: CudaFunction,
@@ -194,6 +196,8 @@ impl OpsKernels {
             add_bf16: loader::get_fn(&module, "add_bf16")?,
             modulate_bf16: loader::get_fn(&module, "modulate_bf16")?,
             gated_residual_bf16: loader::get_fn(&module, "gated_residual_bf16")?,
+            modulate_bf16_batched: loader::get_fn(&module, "modulate_bf16_batched")?,
+            gated_residual_bf16_batched: loader::get_fn(&module, "gated_residual_bf16_batched")?,
             gather_rows_bf16: loader::get_fn(&module, "gather_rows_bf16")?,
             rope_graph: loader::get_fn(&module, "rope_graph")?,
             copy_f16_with_offset: loader::get_fn(&module, "copy_f16_with_offset")?,
@@ -4210,6 +4214,69 @@ impl OpsKernels {
         unsafe {
             self.fast.fire(
                 &self.gated_residual_bf16,
+                (count.div_ceil(256), 1, 1),
+                (256, 1, 1),
+                0,
+                &mut args,
+            );
+        }
+        Ok(())
+    }
+
+    pub fn modulate_bf16_batched(
+        &self,
+        input: &CudaSlice<half::bf16>,
+        modulation: &CudaSlice<half::bf16>,
+        output: &mut CudaSlice<half::bf16>,
+        rows: u32,
+        hidden: u32,
+        fields: u32,
+    ) -> Result<(), KernelError> {
+        let count = rows * hidden;
+        let rows_i = rows as i32;
+        let hidden_i = hidden as i32;
+        let fields_i = fields as i32;
+        let mut args = [
+            slice_ptr(input),
+            slice_ptr(modulation),
+            slice_ptr_mut(output),
+            scalar_ptr(&rows_i),
+            scalar_ptr(&hidden_i),
+            scalar_ptr(&fields_i),
+        ];
+        unsafe {
+            self.fast.fire(
+                &self.modulate_bf16_batched,
+                (count.div_ceil(256), 1, 1),
+                (256, 1, 1),
+                0,
+                &mut args,
+            );
+        }
+        Ok(())
+    }
+
+    pub fn gated_residual_bf16_batched(
+        &self,
+        hidden_values: &mut CudaSlice<half::bf16>,
+        modulation: &CudaSlice<half::bf16>,
+        delta: &CudaSlice<half::bf16>,
+        rows: u32,
+        hidden: u32,
+    ) -> Result<(), KernelError> {
+        let count = rows * hidden;
+        let rows_i = rows as i32;
+        let hidden_i = hidden as i32;
+        let mut args = [
+            slice_ptr_mut(hidden_values),
+            slice_ptr(modulation),
+            slice_ptr(delta),
+            scalar_ptr(&rows_i),
+            scalar_ptr(&hidden_i),
+        ];
+        unsafe {
+            self.fast.fire(
+                &self.gated_residual_bf16_batched,
                 (count.div_ceil(256), 1, 1),
                 (256, 1, 1),
                 0,

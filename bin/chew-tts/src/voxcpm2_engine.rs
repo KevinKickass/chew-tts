@@ -27,13 +27,14 @@ impl VoxCpm2Engine {
         let free_before = allocator.free_bytes(gpu)?;
         let stream = Arc::clone(allocator.stream(gpu));
         let lm = &inspection.config.lm_config;
-        let kernels = chew_kernel::GpuKernels::load(
+        let mut kernels = chew_kernel::GpuKernels::load(
             &stream,
             lm.intermediate_size * lm.hidden_size,
             lm.intermediate_size,
         )?;
         let started = Instant::now();
         let engine = NativeVoxCpm2Engine::load(model_dir, &inspection.config, &stream)?;
+        let _warmup = engine.generate_zero_shot(".", 2, 4, 0x564f_5843_504d_3201, &mut kernels)?;
         kernels.ops.stream().synchronize()?;
         let load_elapsed = started.elapsed();
         let free_loaded = allocator.free_bytes(gpu)?;
@@ -94,9 +95,9 @@ impl VoxCpm2Engine {
             samples: generation.audio,
             sample_rate: generation.sample_rate,
             generated_frames: generation.patches,
-            prompt_elapsed,
-            generation_elapsed: generation.elapsed,
-            codec_elapsed: Duration::ZERO,
+            prompt_elapsed: prompt_elapsed + generation.prompt_elapsed,
+            generation_elapsed: generation.generation_elapsed,
+            codec_elapsed: generation.codec_elapsed,
         })
     }
 }

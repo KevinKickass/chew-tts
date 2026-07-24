@@ -59,10 +59,7 @@ impl VibeVoiceEngine {
         let diffusion = VibeVoiceDiffusionHead::load(model_dir, &inspection.config, &stream)?;
         let decoder = VibeVoiceAcousticDecoder::load(model_dir, &inspection.config, &stream)?;
         let generation = VibeVoiceGenerationWeights::load(model_dir, &inspection.config, &stream)?;
-        stream.synchronize()?;
-        let load_elapsed = started.elapsed();
-        let free_loaded = allocator.free_bytes(gpu)?;
-        Ok(Self {
+        let mut engine = Self {
             model_dir: model_dir.to_owned(),
             config: inspection.config,
             tokenizer,
@@ -74,9 +71,29 @@ impl VibeVoiceEngine {
             kernels,
             stream,
             max_frames,
-            load_elapsed,
-            vram_bytes: free_before.saturating_sub(free_loaded),
-        })
+            load_elapsed: Duration::ZERO,
+            vram_bytes: 0,
+        };
+        let _warmup = engine.synthesize(&SynthesisRequest {
+            text: ".".into(),
+            voice: "alloy".into(),
+            instruction: None,
+            reference_audio_wav: None,
+            reference_text: None,
+            language: "english".into(),
+            speed: 1.0,
+            max_frames: 1,
+            seed: 0x5649_4245_564f_4943,
+            temperature: 1.0,
+            top_k: 1,
+            chunk_frames: 1,
+            chunk_context: 0,
+        })?;
+        engine.stream.synchronize()?;
+        engine.load_elapsed = started.elapsed();
+        let free_loaded = allocator.free_bytes(gpu)?;
+        engine.vram_bytes = free_before.saturating_sub(free_loaded);
+        Ok(engine)
     }
 
     pub fn model_id(&self) -> &'static str {
@@ -132,6 +149,7 @@ impl VibeVoiceEngine {
         let mut previous_emit = generation_started;
         let mut rng = VibeVoiceRng::new(request.seed);
         let mut decoder_state = VibeVoiceDecoderState::default();
+        let mut decoder_latents = Vec::new();
         let mut samples = Vec::new();
         let mut speech_frames = 0usize;
         let mut text_offset = 0usize;
@@ -161,15 +179,10 @@ impl VibeVoiceEngine {
                 let mut scheduler =
                     VibeVoiceScheduler::new(&self.config.diffusion_head_config, DIFFUSION_STEPS)?;
                 for timestep in scheduler.timesteps().to_vec() {
-                    let positive = self.diffusion.forward(
+                    let (positive, negative) = self.diffusion.forward_cfg(
                         &speech,
                         timestep as f32,
                         session.positive_condition(),
-                        &mut self.kernels,
-                    )?;
-                    let negative = self.diffusion.forward(
-                        &speech,
-                        timestep as f32,
                         session.negative_condition(),
                         &mut self.kernels,
                     )?;
@@ -181,20 +194,20 @@ impl VibeVoiceEngine {
                     speech = scheduler.step(&guided, timestep, &speech)?;
                 }
                 let decoder_latent = self.generation.decoder_latent(&speech)?;
-                let codec_started = Instant::now();
-                let chunk = self.decoder.decode_streaming(
-                    &decoder_latent,
-                    &mut decoder_state,
-                    &mut self.kernels,
-                )?;
-                let frame_codec_elapsed = codec_started.elapsed();
-                codec_elapsed += frame_codec_elapsed;
                 speech_frames += 1;
-                ensure!(
-                    chunk.iter().all(|sample| sample.is_finite()),
-                    "VibeVoice generated non-finite audio"
-                );
                 if let Some(callback) = emit.as_mut() {
+                    let codec_started = Instant::now();
+                    let chunk = self.decoder.decode_streaming(
+                        &decoder_latent,
+                        &mut decoder_state,
+                        &mut self.kernels,
+                    )?;
+                    let frame_codec_elapsed = codec_started.elapsed();
+                    codec_elapsed += frame_codec_elapsed;
+                    ensure!(
+                        chunk.iter().all(|sample| sample.is_finite()),
+                        "VibeVoice generated non-finite audio"
+                    );
                     let now = Instant::now();
                     let frame_elapsed = now.duration_since(previous_emit);
                     previous_emit = now;
@@ -214,7 +227,7 @@ impl VibeVoiceEngine {
                         return Ok(None);
                     }
                 } else {
-                    samples.extend(chunk);
+                    decoder_latents.extend(decoder_latent);
                 }
                 let acoustic = self.generation.connect_latent(&speech, &mut self.kernels)?;
                 self.backbones.push_speech(
@@ -233,6 +246,11 @@ impl VibeVoiceEngine {
             if text_offset == text_ids.len() && eos > 0.5 {
                 break;
             }
+        }
+        if emit.is_none() {
+            let codec_started = Instant::now();
+            samples = self.decoder.decode(&decoder_latents, &mut self.kernels)?;
+            codec_elapsed = codec_started.elapsed();
         }
         ensure!(
             samples.iter().all(|sample| sample.is_finite()),
