@@ -1,9 +1,11 @@
 mod backbone;
 mod config;
+mod diffusion;
 mod voice;
 
 pub use backbone::VibeVoiceBackbones;
 pub use config::{AcousticTokenizerConfig, DecoderConfig, DiffusionHeadConfig, VibeVoiceConfig};
+pub use diffusion::VibeVoiceDiffusionHead;
 pub use voice::{VibeVoicePrompt, VibeVoicePromptBranch, VibeVoicePromptKv};
 
 use chew_safetensors::{MappedSafetensors, TensorInfo};

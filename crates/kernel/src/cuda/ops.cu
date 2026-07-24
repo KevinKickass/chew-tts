@@ -3377,6 +3377,43 @@ __global__ void silu_act_bf16(const __nv_bfloat16* __restrict__ x,
     out[idx] = __float2bfloat16(value / (1.0f + expf(-value)));
 }
 
+__global__ void add_bf16(const __nv_bfloat16* __restrict__ left,
+                         const __nv_bfloat16* __restrict__ right,
+                         __nv_bfloat16* __restrict__ output,
+                         int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        output[idx] = __float2bfloat16(
+            __bfloat162float(left[idx]) + __bfloat162float(right[idx]));
+    }
+}
+
+__global__ void modulate_bf16(const __nv_bfloat16* __restrict__ input,
+                              const __nv_bfloat16* __restrict__ shift,
+                              const __nv_bfloat16* __restrict__ scale,
+                              __nv_bfloat16* __restrict__ output,
+                              int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        float x = __bfloat162float(input[idx]);
+        output[idx] = __float2bfloat16(
+            x * (1.0f + __bfloat162float(scale[idx]))
+            + __bfloat162float(shift[idx]));
+    }
+}
+
+__global__ void gated_residual_bf16(__nv_bfloat16* __restrict__ hidden,
+                                    const __nv_bfloat16* __restrict__ gate,
+                                    const __nv_bfloat16* __restrict__ delta,
+                                    int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        hidden[idx] = __float2bfloat16(
+            __bfloat162float(hidden[idx])
+            + __bfloat162float(gate[idx]) * __bfloat162float(delta[idx]));
+    }
+}
+
 __global__ void gather_rows_bf16(const __nv_bfloat16* __restrict__ src,
                                   const int* __restrict__ idx,
                                   __nv_bfloat16* __restrict__ dst,

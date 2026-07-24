@@ -18,7 +18,8 @@ use chew_model_qwen3_tts::{
     inspect_model, load_f16_tensor,
 };
 use chew_model_vibevoice::{
-    VibeVoiceBackbones, VibeVoicePrompt, inspect_model as inspect_vibevoice_model,
+    VibeVoiceBackbones, VibeVoiceDiffusionHead, VibeVoicePrompt,
+    inspect_model as inspect_vibevoice_model,
 };
 use clap::{Parser, Subcommand};
 use std::io::{Seek, SeekFrom, Write};
@@ -106,6 +107,14 @@ enum Command {
         model_dir: PathBuf,
         #[arg(long, default_value_t = 0)]
         gpu: usize,
+    },
+    /// Execute the native VibeVoice diffusion velocity head on CUDA.
+    CudaVibeVoiceDiffusionSmoke {
+        model_dir: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        gpu: usize,
+        #[arg(long, default_value_t = 999.0)]
+        timestep: f32,
     },
     /// Validate a Kokoro model and print its native checkpoint geometry.
     InspectKokoro {
@@ -701,6 +710,38 @@ fn main() -> anyhow::Result<()> {
                 text.iter().map(|value| f64::from(*value)).sum::<f64>(),
                 tts.iter().map(|value| f64::from(*value)).sum::<f64>(),
                 &tts[..8],
+            );
+        }
+        Command::CudaVibeVoiceDiffusionSmoke {
+            model_dir,
+            gpu,
+            timestep,
+        } => {
+            let inspection = inspect_vibevoice_model(&model_dir)?;
+            let allocator = chew_vram::VramAllocator::init()?;
+            anyhow::ensure!(gpu < allocator.gpu_count(), "GPU index out of range");
+            let stream = std::sync::Arc::clone(allocator.stream(gpu));
+            let hidden = inspection.config.decoder_config.hidden_size;
+            let mut kernels =
+                chew_kernel::GpuKernels::load(&stream, hidden * hidden * 3, hidden * 3)?;
+            let head = VibeVoiceDiffusionHead::load(&model_dir, &inspection.config, &stream)?;
+            let noisy = (0..inspection.config.acoustic_vae_dim)
+                .map(|index| ((index as f32 + 1.0) * 0.031).sin())
+                .collect::<Vec<_>>();
+            let condition = (0..hidden)
+                .map(|index| ((index as f32 + 1.0) * 0.007).cos() * 0.25)
+                .collect::<Vec<_>>();
+            let started = std::time::Instant::now();
+            let output = head.forward(&noisy, timestep, &condition, &mut kernels)?;
+            println!(
+                "VibeVoice diffusion CUDA: {:.3}ms, sum={:.9}, sum_sq={:.9}, first={:?}",
+                started.elapsed().as_secs_f64() * 1_000.0,
+                output.iter().map(|value| f64::from(*value)).sum::<f64>(),
+                output
+                    .iter()
+                    .map(|value| f64::from(*value) * f64::from(*value))
+                    .sum::<f64>(),
+                &output[..8],
             );
         }
         Command::InspectKokoro {

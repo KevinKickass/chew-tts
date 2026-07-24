@@ -61,6 +61,9 @@ pub struct OpsKernels {
     add_inplace_f32_bf16: CudaFunction,
     silu_bf16: CudaFunction,
     silu_act_bf16: CudaFunction,
+    add_bf16: CudaFunction,
+    modulate_bf16: CudaFunction,
+    gated_residual_bf16: CudaFunction,
     gather_rows_bf16: CudaFunction,
     // CUDA Graph-compatible variants
     rope_graph: CudaFunction,
@@ -174,6 +177,9 @@ impl OpsKernels {
             add_inplace_f32_bf16: loader::get_fn(&module, "add_inplace_f32_bf16")?,
             silu_bf16: loader::get_fn(&module, "silu_bf16")?,
             silu_act_bf16: loader::get_fn(&module, "silu_act_bf16")?,
+            add_bf16: loader::get_fn(&module, "add_bf16")?,
+            modulate_bf16: loader::get_fn(&module, "modulate_bf16")?,
+            gated_residual_bf16: loader::get_fn(&module, "gated_residual_bf16")?,
             gather_rows_bf16: loader::get_fn(&module, "gather_rows_bf16")?,
             rope_graph: loader::get_fn(&module, "rope_graph")?,
             copy_f16_with_offset: loader::get_fn(&module, "copy_f16_with_offset")?,
@@ -3720,6 +3726,151 @@ impl OpsKernels {
         unsafe {
             self.fast.fire(
                 &self.silu_act_bf16,
+                (count.div_ceil(256), 1, 1),
+                (256, 1, 1),
+                0,
+                &mut args,
+            );
+        }
+        Ok(())
+    }
+
+    pub fn add_bf16(
+        &self,
+        left: &CudaSlice<half::bf16>,
+        right: &CudaSlice<half::bf16>,
+        output: &mut CudaSlice<half::bf16>,
+        count: u32,
+    ) -> Result<(), KernelError> {
+        self.launch_bf16_binary(&self.add_bf16, left, right, output, count)
+    }
+
+    pub fn modulate_bf16(
+        &self,
+        input: &CudaSlice<half::bf16>,
+        shift: &CudaSlice<half::bf16>,
+        scale: &CudaSlice<half::bf16>,
+        output: &mut CudaSlice<half::bf16>,
+        count: u32,
+    ) -> Result<(), KernelError> {
+        let count_i32 = count as i32;
+        let mut args = [
+            slice_ptr(input),
+            slice_ptr(shift),
+            slice_ptr(scale),
+            slice_ptr_mut(output),
+            scalar_ptr(&count_i32),
+        ];
+        unsafe {
+            self.fast.fire(
+                &self.modulate_bf16,
+                (count.div_ceil(256), 1, 1),
+                (256, 1, 1),
+                0,
+                &mut args,
+            );
+        }
+        Ok(())
+    }
+
+    pub fn modulate_bf16_views(
+        &self,
+        input: &CudaSlice<half::bf16>,
+        shift: &CudaView<'_, half::bf16>,
+        scale: &CudaView<'_, half::bf16>,
+        output: &mut CudaSlice<half::bf16>,
+        count: u32,
+    ) -> Result<(), KernelError> {
+        let count_i32 = count as i32;
+        let mut args = [
+            slice_ptr(input),
+            view_ptr(shift),
+            view_ptr(scale),
+            slice_ptr_mut(output),
+            scalar_ptr(&count_i32),
+        ];
+        unsafe {
+            self.fast.fire(
+                &self.modulate_bf16,
+                (count.div_ceil(256), 1, 1),
+                (256, 1, 1),
+                0,
+                &mut args,
+            );
+        }
+        Ok(())
+    }
+
+    pub fn gated_residual_bf16(
+        &self,
+        hidden: &mut CudaSlice<half::bf16>,
+        gate: &CudaSlice<half::bf16>,
+        delta: &CudaSlice<half::bf16>,
+        count: u32,
+    ) -> Result<(), KernelError> {
+        let count_i32 = count as i32;
+        let mut args = [
+            slice_ptr_mut(hidden),
+            slice_ptr(gate),
+            slice_ptr(delta),
+            scalar_ptr(&count_i32),
+        ];
+        unsafe {
+            self.fast.fire(
+                &self.gated_residual_bf16,
+                (count.div_ceil(256), 1, 1),
+                (256, 1, 1),
+                0,
+                &mut args,
+            );
+        }
+        Ok(())
+    }
+
+    pub fn gated_residual_bf16_view(
+        &self,
+        hidden: &mut CudaSlice<half::bf16>,
+        gate: &CudaView<'_, half::bf16>,
+        delta: &CudaSlice<half::bf16>,
+        count: u32,
+    ) -> Result<(), KernelError> {
+        let count_i32 = count as i32;
+        let mut args = [
+            slice_ptr_mut(hidden),
+            view_ptr(gate),
+            slice_ptr(delta),
+            scalar_ptr(&count_i32),
+        ];
+        unsafe {
+            self.fast.fire(
+                &self.gated_residual_bf16,
+                (count.div_ceil(256), 1, 1),
+                (256, 1, 1),
+                0,
+                &mut args,
+            );
+        }
+        Ok(())
+    }
+
+    fn launch_bf16_binary(
+        &self,
+        function: &CudaFunction,
+        left: &CudaSlice<half::bf16>,
+        right: &CudaSlice<half::bf16>,
+        output: &mut CudaSlice<half::bf16>,
+        count: u32,
+    ) -> Result<(), KernelError> {
+        let count_i32 = count as i32;
+        let mut args = [
+            slice_ptr(left),
+            slice_ptr(right),
+            slice_ptr_mut(output),
+            scalar_ptr(&count_i32),
+        ];
+        unsafe {
+            self.fast.fire(
+                function,
                 (count.div_ceil(256), 1, 1),
                 (256, 1, 1),
                 0,
