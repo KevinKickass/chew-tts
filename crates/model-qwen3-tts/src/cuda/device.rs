@@ -108,6 +108,15 @@ impl<T: QwenDType> TalkerDecoderLayer<T> {
                 hidden_dim as u32,
             )?;
         }
+        if let Some(bias) = &self.q_bias {
+            T::add_bias(kernels, &mut scratch.q_native, bias, rows, q_dim as u32)?;
+        }
+        if let Some(bias) = &self.k_bias {
+            T::add_bias(kernels, &mut scratch.k_native, bias, rows, kv_dim as u32)?;
+        }
+        if let Some(bias) = &self.v_bias {
+            T::add_bias(kernels, &mut scratch.v_native, bias, rows, kv_dim as u32)?;
+        }
         T::to_f16(
             kernels,
             &scratch.q_native,

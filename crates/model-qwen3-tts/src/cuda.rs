@@ -21,6 +21,9 @@ pub struct TalkerDecoderLayer<T: QwenDType = f16> {
     q_proj: CudaSlice<T>,
     k_proj: CudaSlice<T>,
     v_proj: CudaSlice<T>,
+    q_bias: Option<CudaSlice<T>>,
+    k_bias: Option<CudaSlice<T>>,
+    v_bias: Option<CudaSlice<T>>,
     q_norm: Option<CudaSlice<f16>>,
     k_norm: Option<CudaSlice<f16>>,
     o_proj: CudaSlice<T>,
@@ -183,11 +186,30 @@ impl<T: QwenDType> TalkerDecoderLayer<T> {
         let q_dim = config.num_attention_heads * config.head_dim;
         let kv_dim = config.num_key_value_heads * config.head_dim;
         let intermediate = config.intermediate_size;
+        let load_attention_bias = |suffix: &str, expected: &[usize]| {
+            let name = format!("{prefix}.{suffix}");
+            let (shape, tensor) = T::load(model_dir.as_ref(), &name, stream)?;
+            ensure!(
+                shape == expected,
+                "{name} has shape {:?}, expected {expected:?}",
+                shape
+            );
+            Ok::<_, anyhow::Error>(tensor)
+        };
         Ok(Self {
             input_norm: load("input_layernorm.weight", &[hidden])?,
             q_proj: load("self_attn.q_proj.weight", &[q_dim, hidden])?,
             k_proj: load("self_attn.k_proj.weight", &[kv_dim, hidden])?,
             v_proj: load("self_attn.v_proj.weight", &[kv_dim, hidden])?,
+            q_bias: (!qk_norm)
+                .then(|| load_attention_bias("self_attn.q_proj.bias", &[q_dim]))
+                .transpose()?,
+            k_bias: (!qk_norm)
+                .then(|| load_attention_bias("self_attn.k_proj.bias", &[kv_dim]))
+                .transpose()?,
+            v_bias: (!qk_norm)
+                .then(|| load_attention_bias("self_attn.v_proj.bias", &[kv_dim]))
+                .transpose()?,
             q_norm: qk_norm
                 .then(|| load_f16("self_attn.q_norm.weight", &[config.head_dim]))
                 .transpose()?,
