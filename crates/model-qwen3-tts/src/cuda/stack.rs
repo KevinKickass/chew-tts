@@ -87,6 +87,57 @@ impl<T: QwenDType> TalkerTransformer<T> {
         Ok(Self { layers, final_norm })
     }
 
+    /// Load a MiniCPM4 stack. MiniCPM4 uses bias-free projections and
+    /// per-frequency LongRoPE factors, but otherwise shares the same GQA and
+    /// SwiGLU geometry as the native Qwen path.
+    pub fn load_minicpm(
+        model_dir: impl AsRef<Path>,
+        prefix: &str,
+        config: &TalkerConfig,
+        stream: &Arc<CudaStream>,
+        rope_factors: Option<&[f32]>,
+        apply_rope: bool,
+        causal_attention: bool,
+    ) -> anyhow::Result<Self> {
+        let model_dir = model_dir.as_ref();
+        if let Some(factors) = rope_factors {
+            ensure!(
+                factors.len() == config.head_dim / 2,
+                "MiniCPM LongRoPE has {} factors, expected {}",
+                factors.len(),
+                config.head_dim / 2
+            );
+        }
+        let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        for layer_index in 0..config.num_hidden_layers {
+            layers.push(
+                TalkerDecoderLayer::load_minicpm_from_prefix(
+                    model_dir,
+                    &format!("{prefix}.layers.{layer_index}"),
+                    config,
+                    stream,
+                    rope_factors,
+                    apply_rope,
+                    causal_attention,
+                )
+                .with_context(|| format!("could not load MiniCPM layer {layer_index}"))?,
+            );
+        }
+        let name = format!("{prefix}.norm.weight");
+        let (norm_shape, final_norm) =
+            T::load(model_dir, &name, stream).with_context(|| format!("could not load {name}"))?;
+        ensure!(
+            norm_shape == [config.hidden_size],
+            "{name} has shape {:?}, expected [{}]",
+            norm_shape,
+            config.hidden_size
+        );
+        Ok(Self {
+            layers,
+            final_norm: Some(final_norm),
+        })
+    }
+
     pub fn layer_count(&self) -> usize {
         self.layers.len()
     }

@@ -31,6 +31,9 @@ pub struct TalkerDecoderLayer<T: QwenDType = f16> {
     gate_proj: CudaSlice<T>,
     up_proj: CudaSlice<T>,
     down_proj: CudaSlice<T>,
+    rope_factors: Option<CudaSlice<f32>>,
+    apply_rope: bool,
+    causal_attention: bool,
 }
 
 /// K/V state for one talker layer.
@@ -184,7 +187,9 @@ impl<T: QwenDType> TalkerDecoderLayer<T> {
         config: &TalkerConfig,
         stream: &Arc<CudaStream>,
     ) -> anyhow::Result<Self> {
-        Self::load_architecture(model_dir, prefix, config, stream, true)
+        Self::load_architecture(
+            model_dir, prefix, config, stream, true, false, None, true, true,
+        )
     }
 
     /// Load a standard Qwen2 decoder layer. Qwen2 does not have Q/K RMSNorm,
@@ -195,7 +200,33 @@ impl<T: QwenDType> TalkerDecoderLayer<T> {
         config: &TalkerConfig,
         stream: &Arc<CudaStream>,
     ) -> anyhow::Result<Self> {
-        Self::load_architecture(model_dir, prefix, config, stream, false)
+        Self::load_architecture(
+            model_dir, prefix, config, stream, false, true, None, true, true,
+        )
+    }
+
+    /// Load a bias-free MiniCPM4 decoder layer with optional LongRoPE
+    /// frequency factors.
+    pub fn load_minicpm_from_prefix(
+        model_dir: impl AsRef<Path>,
+        prefix: &str,
+        config: &TalkerConfig,
+        stream: &Arc<CudaStream>,
+        rope_factors: Option<&[f32]>,
+        apply_rope: bool,
+        causal_attention: bool,
+    ) -> anyhow::Result<Self> {
+        Self::load_architecture(
+            model_dir,
+            prefix,
+            config,
+            stream,
+            false,
+            false,
+            rope_factors,
+            apply_rope,
+            causal_attention,
+        )
     }
 
     fn load_architecture(
@@ -204,6 +235,10 @@ impl<T: QwenDType> TalkerDecoderLayer<T> {
         config: &TalkerConfig,
         stream: &Arc<CudaStream>,
         qk_norm: bool,
+        attention_bias: bool,
+        rope_factors: Option<&[f32]>,
+        apply_rope: bool,
+        causal_attention: bool,
     ) -> anyhow::Result<Self> {
         let load = |suffix: &str, expected: &[usize]| -> anyhow::Result<CudaSlice<T>> {
             let name = format!("{prefix}.{suffix}");
@@ -246,13 +281,13 @@ impl<T: QwenDType> TalkerDecoderLayer<T> {
             q_proj: load("self_attn.q_proj.weight", &[q_dim, hidden])?,
             k_proj: load("self_attn.k_proj.weight", &[kv_dim, hidden])?,
             v_proj: load("self_attn.v_proj.weight", &[kv_dim, hidden])?,
-            q_bias: (!qk_norm)
+            q_bias: attention_bias
                 .then(|| load_attention_bias("self_attn.q_proj.bias", &[q_dim]))
                 .transpose()?,
-            k_bias: (!qk_norm)
+            k_bias: attention_bias
                 .then(|| load_attention_bias("self_attn.k_proj.bias", &[kv_dim]))
                 .transpose()?,
-            v_bias: (!qk_norm)
+            v_bias: attention_bias
                 .then(|| load_attention_bias("self_attn.v_proj.bias", &[kv_dim]))
                 .transpose()?,
             q_norm: qk_norm
@@ -266,6 +301,11 @@ impl<T: QwenDType> TalkerDecoderLayer<T> {
             gate_proj: load("mlp.gate_proj.weight", &[intermediate, hidden])?,
             up_proj: load("mlp.up_proj.weight", &[intermediate, hidden])?,
             down_proj: load("mlp.down_proj.weight", &[hidden, intermediate])?,
+            rope_factors: rope_factors
+                .map(|values| stream.clone_htod(values))
+                .transpose()?,
+            apply_rope,
+            causal_attention,
         })
     }
 

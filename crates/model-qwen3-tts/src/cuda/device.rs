@@ -162,22 +162,45 @@ impl<T: QwenDType> TalkerDecoderLayer<T> {
             }
         }
 
-        kernels.ops.rope_neox(
-            &mut scratch.q,
-            rows,
-            config.num_attention_heads as u32,
-            config.head_dim as u32,
-            position,
-            config.rope_theta as f32,
-        )?;
-        kernels.ops.rope_neox(
-            &mut scratch.k,
-            rows,
-            config.num_key_value_heads as u32,
-            config.head_dim as u32,
-            position,
-            config.rope_theta as f32,
-        )?;
+        if self.apply_rope {
+            if let Some(factors) = &self.rope_factors {
+                kernels.ops.rope_neox_freqs(
+                    &mut scratch.q,
+                    factors,
+                    rows,
+                    config.num_attention_heads as u32,
+                    config.head_dim as u32,
+                    position,
+                    config.rope_theta as f32,
+                )?;
+                kernels.ops.rope_neox_freqs(
+                    &mut scratch.k,
+                    factors,
+                    rows,
+                    config.num_key_value_heads as u32,
+                    config.head_dim as u32,
+                    position,
+                    config.rope_theta as f32,
+                )?;
+            } else {
+                kernels.ops.rope_neox(
+                    &mut scratch.q,
+                    rows,
+                    config.num_attention_heads as u32,
+                    config.head_dim as u32,
+                    position,
+                    config.rope_theta as f32,
+                )?;
+                kernels.ops.rope_neox(
+                    &mut scratch.k,
+                    rows,
+                    config.num_key_value_heads as u32,
+                    config.head_dim as u32,
+                    position,
+                    config.rope_theta as f32,
+                )?;
+            }
+        }
 
         let cache_offset = cache.position * kv_dim;
         let cache_end = cache_offset + seq_len * kv_dim;
@@ -193,18 +216,38 @@ impl<T: QwenDType> TalkerDecoderLayer<T> {
                 .ops
                 .copy_f16(&scratch.v, &mut destination, rows * kv_dim as u32)?;
         }
-        kernels.ops.mha_fused(
-            &scratch.q,
-            &cache.k.slice(..cache_end),
-            &cache.v.slice(..cache_end),
-            &mut scratch.attention,
-            config.head_dim as u32,
-            config.num_attention_heads as u32,
-            config.num_key_value_heads as u32,
-            rows,
-            total_kv_len,
-            position,
-        )?;
+        if self.causal_attention {
+            kernels.ops.mha_fused(
+                &scratch.q,
+                &cache.k.slice(..cache_end),
+                &cache.v.slice(..cache_end),
+                &mut scratch.attention,
+                config.head_dim as u32,
+                config.num_attention_heads as u32,
+                config.num_key_value_heads as u32,
+                rows,
+                total_kv_len,
+                position,
+            )?;
+        } else {
+            ensure!(
+                position == 0 && total_kv_len == rows,
+                "bidirectional attention cannot append to a KV cache"
+            );
+            kernels.ops.mha_naive_full(
+                &scratch.q,
+                &cache.k.slice(..cache_end),
+                &cache.v.slice(..cache_end),
+                &mut scratch.attention,
+                config.head_dim as u32,
+                config.num_attention_heads as u32,
+                config.num_key_value_heads as u32,
+                rows,
+                total_kv_len,
+                1.0 / (config.head_dim as f32).sqrt(),
+                0.0,
+            )?;
+        }
         T::from_f16(
             kernels,
             &scratch.attention,

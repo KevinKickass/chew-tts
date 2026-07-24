@@ -344,6 +344,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "chew-model-voxcpm2"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chew-kernel",
+ "chew-model-qwen3-tts",
+ "chew-safetensors",
+ "cudarc",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "chew-safetensors"
 version = "0.1.0"
 dependencies = [
@@ -365,6 +379,7 @@ dependencies = [
  "chew-model-kokoro",
  "chew-model-qwen3-tts",
  "chew-model-vibevoice",
+ "chew-model-voxcpm2",
  "chew-vram",
  "clap",
  "cudarc",

@@ -22,6 +22,7 @@ use chew_model_vibevoice::{
     VibeVoiceGenerationWeights, VibeVoicePrompt, VibeVoiceScheduler,
     inspect_model as inspect_vibevoice_model,
 };
+use chew_model_voxcpm2::{VoxCpm2TransformerBackbones, inspect_model as inspect_voxcpm2_model};
 use clap::{Parser, Subcommand};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::PathBuf;
@@ -102,6 +103,17 @@ enum Command {
         /// Optional Chew-converted voice-prompt Safetensors file.
         #[arg(long)]
         voice: Option<PathBuf>,
+    },
+    /// Validate a VoxCPM2 checkpoint and print its native geometry.
+    InspectVoxCpm2 {
+        /// Directory containing config.json, model.safetensors, and audiovae.pth.
+        model_dir: PathBuf,
+    },
+    /// Load and execute the native VoxCPM2 MiniCPM4 base LM on CUDA.
+    CudaVoxCpm2BackboneSmoke {
+        model_dir: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        gpu: usize,
     },
     /// Load and execute both native VibeVoice Qwen2 backbones on CUDA.
     CudaVibeVoiceBackboneSmoke {
@@ -713,6 +725,84 @@ fn main() -> anyhow::Result<()> {
                     prompt.negative_tts_lm.tokens,
                 );
             }
+        }
+        Command::InspectVoxCpm2 { model_dir } => {
+            let inspection = inspect_voxcpm2_model(&model_dir)
+                .with_context(|| format!("could not inspect {}", model_dir.display()))?;
+            let config = &inspection.config;
+            let lm = &config.lm_config;
+            println!("VoxCPM2 native BF16");
+            println!(
+                "MiniCPM4: {} base + {} residual layers, hidden {}, {} Q heads / {} KV heads",
+                lm.num_hidden_layers,
+                config.residual_lm_num_layers,
+                lm.hidden_size,
+                lm.num_attention_heads,
+                lm.num_key_value_heads,
+            );
+            println!(
+                "audio: {} local encoder + {} DiT layers, {}-dim features, {} -> {} Hz",
+                config.encoder_config.num_layers,
+                config.dit_config.num_layers,
+                config.feat_dim,
+                config.audio_vae_config.sample_rate,
+                config.audio_vae_config.out_sample_rate,
+            );
+            println!(
+                "weights: {} tensors, {:.2} GiB; AudioVAE {:.2} MiB",
+                inspection.tensors.len(),
+                inspection.total_weight_bytes as f64 / 1024.0_f64.powi(3),
+                std::fs::metadata(&inspection.audio_vae_path)?.len() as f64 / 1024.0_f64.powi(2),
+            );
+        }
+        Command::CudaVoxCpm2BackboneSmoke { model_dir, gpu } => {
+            let inspection = inspect_voxcpm2_model(&model_dir)?;
+            let allocator = chew_vram::VramAllocator::init()?;
+            anyhow::ensure!(gpu < allocator.gpu_count(), "GPU index out of range");
+            let stream = std::sync::Arc::clone(allocator.stream(gpu));
+            let lm = &inspection.config.lm_config;
+            let mut kernels = chew_kernel::GpuKernels::load(
+                &stream,
+                lm.intermediate_size * lm.hidden_size,
+                lm.intermediate_size,
+            )?;
+            let free_before = allocator.free_bytes(gpu)?;
+            let started = std::time::Instant::now();
+            let backbones =
+                VoxCpm2TransformerBackbones::load(&model_dir, &inspection.config, &stream)?;
+            let load_elapsed = started.elapsed();
+            let free_loaded = allocator.free_bytes(gpu)?;
+            let forward_started = std::time::Instant::now();
+            let output = backbones.smoke(&mut kernels)?;
+            println!(
+                "VoxCPM2 transformers CUDA: load={:.3}s, forward={:.3}ms, VRAM={:.2} GiB",
+                load_elapsed.as_secs_f64(),
+                forward_started.elapsed().as_secs_f64() * 1_000.0,
+                free_before.saturating_sub(free_loaded) as f64 / 1024.0_f64.powi(3),
+            );
+            println!(
+                "base={:.9}, residual={:.9}, encoder={:.9}, DiT={:.9}",
+                output
+                    .base
+                    .iter()
+                    .map(|value| f64::from(*value))
+                    .sum::<f64>(),
+                output
+                    .residual
+                    .iter()
+                    .map(|value| f64::from(*value))
+                    .sum::<f64>(),
+                output
+                    .encoder
+                    .iter()
+                    .map(|value| f64::from(*value))
+                    .sum::<f64>(),
+                output
+                    .dit
+                    .iter()
+                    .map(|value| f64::from(*value))
+                    .sum::<f64>(),
+            );
         }
         Command::CudaVibeVoiceBackboneSmoke { model_dir, gpu } => {
             let inspection = inspect_vibevoice_model(&model_dir)?;
