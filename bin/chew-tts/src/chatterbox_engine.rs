@@ -191,6 +191,7 @@ impl ChatterboxEngine {
         );
         Ok(SynthesisOutput {
             samples,
+            sample_rate: 24_000,
             generated_frames: generated.len(),
             prompt_elapsed,
             generation_elapsed,

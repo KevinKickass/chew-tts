@@ -30,8 +30,8 @@ without carrying an LLM API or llama.cpp dependency.
 ## Status
 
 Qwen3-TTS, Kokoro, Chatterbox Multilingual V3, VibeVoice-Realtime, and
-VoxCPM2 have native end-to-end CUDA paths. VoxCPM2 currently exposes its
-generation CLI while its HTTP/Fleet adapter is being connected.
+VoxCPM2 have native end-to-end CUDA paths. All five model families can be
+served through the OpenAI-compatible HTTP endpoint and Fleet protocol.
 
 Implemented:
 
@@ -94,10 +94,14 @@ Implemented:
   harmonic source, GPU upsampling and Snake ResBlocks, 16-point STFT/ISTFT,
   and 24-kHz waveform output.
 - native VibeVoice-Realtime BF16 text/TTS backbones, cached voice prompts,
-  diffusion sampling, causal streaming codec, and German/English generation;
+  diffusion sampling, causal streaming codec, German/English presets, and the
+  `tts-realtime` server alias;
 - native VoxCPM2 with all 60 MiniCPM4/local-DiT layers, LongRoPE, FSQ,
   CFG-Zero* Euler flow, FP32 reference encoder, mixed-precision 48-kHz
-  AudioVAE decoder, zero-shot synthesis, and reference-voice cloning.
+  AudioVAE decoder, zero-shot synthesis, reference-voice cloning, and the
+  `tts-studio` server alias;
+- model-native HTTP sample rates, including VoxCPM2 at 48 kHz, while Fleet's
+  existing raw transport remains wire-compatible at mono 24-kHz f32le.
 
 Next:
 
@@ -152,14 +156,17 @@ RTX 3080 10 GB:
 | Qwen3-TTS 1.7B CustomVoice | `serena` | 4.13 s | 3,948 MiB | 9.200 s | 2.148 s | 0.2334 | 4.28x |
 | Qwen3-TTS 1.7B Base | cached ICL clone | 4.36 s | 4,040 MiB | 13.280 s | 3.191 s | 0.2403 | 4.16x |
 | VoxCPM2 | zero-shot | 1.88 s | 4,444 MiB | 5.760 s | 2.333 s | 0.4050 | 2.47x |
+| VibeVoice-Realtime 0.5B | German preset | 1.62 s | 1,452 MiB | 4.267 s | 1.003 s | 0.2351 | 4.25x |
 
-All rows use the same English input, seed 4242, native mono WAV output, one
-worker, one discarded warm-up, and the median of five sequential requests
-over localhost. Timings include HTTP handling and the complete text-to-waveform
-path, but exclude model loading and MP3 encoding. The card ran under its normal
-desktop workload with CUDA 13.2 and driver 595.58. Base uses a 2.96-second
-reference and measures the normal cached-reference path after warm-up. RTF is
-wall time divided by generated audio duration, so lower is better.
+Unless the mode says otherwise, rows use the same English input, seed 4242,
+native mono WAV output, and one worker. The established model rows use one
+discarded warm-up and the median of five sequential localhost requests; the
+VibeVoice German row is an initial end-to-end HTTP validation. Timings include
+HTTP handling and the complete text-to-waveform path, but exclude model loading
+and MP3 encoding. The card ran under its normal desktop workload with CUDA 13.2
+and driver 595.58. Base uses a 2.96-second reference and measures the normal
+cached-reference path after warm-up. RTF is wall time divided by generated
+audio duration, so lower is better.
 
 ### Audio samples
 
@@ -174,6 +181,7 @@ include a German example:
 | Qwen3-TTS 1.7B CustomVoice | [MP3](samples/qwen3-custom-en.mp3) | [MP3](samples/qwen3-custom-de.mp3) |
 | Qwen3-TTS 1.7B Base | [MP3](samples/qwen3-base-en.mp3) | [MP3](samples/qwen3-base-de.mp3) |
 | VoxCPM2 | — | [zero-shot](samples/voxcpm2-de.mp3), [reference voice](samples/voxcpm2-reference-de.mp3) |
+| VibeVoice-Realtime 0.5B | [MP3](samples/vibevoice-en.mp3) | [MP3](samples/vibevoice-de.mp3) |
 
 ### Kokoro concurrency
 
@@ -487,7 +495,7 @@ returns an explicit truncation error instead of silently accepting it.
 
 ## HTTP server
 
-Run a persistent worker for a VoiceDesign, CustomVoice, or Base checkpoint:
+Run a persistent worker for any supported model directory:
 
 ```bash
 CARGO_TARGET_DIR=/tmp/chew-tts-target \
@@ -502,7 +510,14 @@ places concurrent requests in a bounded queue. It exposes:
 - `POST /v1/audio/speech` (OpenAI-compatible synchronous speech);
 - `GET /v1/models`;
 - `GET /health`;
-- `POST /internal/audio/raw` (24-kHz mono float32 for SimpleLLM/Fleet).
+- `POST /internal/audio/raw` (model-native-rate mono float32).
+
+The server identifies the checkpoint from its configuration and model
+artifacts. Product aliases are `tts-fast` for Kokoro, `tts-expressive` for
+Chatterbox, `tts-multilingual`/`tts-premium` for Qwen3-TTS, `tts-studio` for
+VoxCPM2, and `tts-realtime` for VibeVoice-Realtime. VoxCPM2 HTTP responses
+remain at the model's native 48 kHz. VibeVoice maps OpenAI's female and male
+voice aliases to the bundled German presets when `language` is `de`.
 
 VoiceDesign uses the optional `instruct` field. `instruction` and OpenAI's
 `instructions` are accepted as aliases; if none is present, `voice` may
@@ -546,10 +561,10 @@ curl http://127.0.0.1:18001/v1/audio/speech \
   --output speech.mp3
 ```
 
-Responses include `server-timing`, `x-sllm-audio-duration-ms`, and
-`x-sllm-generation-frames`. On an RTX 3080, two sequential HTTP validation
-requests completed without model reload; the WAV response was byte-identical
-to the validated CLI output.
+Responses include `server-timing`, `x-sllm-audio-duration-ms`,
+`x-sllm-audio-sample-rate`, and `x-sllm-generation-frames`. On an RTX 3080,
+local HTTP validation produced a 48-kHz VoxCPM2 WAV at RTF 0.43 and a German
+VibeVoice WAV at RTF 0.24 without Python or model reloads.
 
 For a Fleet GPU host, the same native engine can speak the existing
 JSON-over-TCP worker protocol directly:

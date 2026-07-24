@@ -37,7 +37,9 @@ mod audio_input;
 mod chatterbox_engine;
 mod kokoro_engine;
 mod server;
+mod vibevoice_engine;
 mod voice_design;
+mod voxcpm2_engine;
 
 #[derive(Debug, Parser)]
 #[command(version, about)]

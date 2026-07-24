@@ -138,6 +138,7 @@ impl KokoroEngine {
         let codec_elapsed = codec_started.elapsed();
         Ok(SynthesisOutput {
             samples,
+            sample_rate: 24_000,
             generated_frames: f0.len(),
             prompt_elapsed,
             generation_elapsed,

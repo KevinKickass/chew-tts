@@ -1,6 +1,9 @@
+use crate::audio_input::resample;
 use crate::chatterbox_engine::ChatterboxEngine;
 use crate::kokoro_engine::KokoroEngine;
+use crate::vibevoice_engine::VibeVoiceEngine;
 use crate::voice_design::{SynthesisRequest, VoiceDesignEngine};
+use crate::voxcpm2_engine::VoxCpm2Engine;
 use axum::extract::State;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -20,7 +23,7 @@ use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info};
 
-const SAMPLE_RATE: u32 = 24_000;
+const FLEET_SAMPLE_RATE: u32 = 24_000;
 const DEFAULT_INSTRUCTION: &str = "A natural, clear studio voice.";
 const MAX_SYNTHESIS_SEGMENT_CHARS: usize = 350;
 const SEGMENT_GAP_SAMPLES: usize = 1_200;
@@ -38,6 +41,7 @@ enum JobResponse {
 
 struct GeneratedAudio {
     samples: Vec<f32>,
+    sample_rate: u32,
     frames: usize,
     inference_ms: f64,
     prompt_ms: f64,
@@ -53,23 +57,36 @@ struct AppState {
 }
 
 enum TtsEngine {
-    Qwen(VoiceDesignEngine),
-    Kokoro(KokoroEngine),
-    Chatterbox(ChatterboxEngine),
+    Qwen(Box<VoiceDesignEngine>),
+    Kokoro(Box<KokoroEngine>),
+    Chatterbox(Box<ChatterboxEngine>),
+    VoxCpm2(Box<VoxCpm2Engine>),
+    VibeVoice(Box<VibeVoiceEngine>),
 }
 
 impl TtsEngine {
     fn load(model_dir: &std::path::Path, gpu: usize, max_frames: usize) -> anyhow::Result<Self> {
-        if model_dir.join("kokoro-v1_0.pth").is_file() {
-            Ok(Self::Kokoro(KokoroEngine::load(model_dir, gpu)?))
+        if model_dir.join("voices").is_dir() && model_dir.join("preprocessor_config.json").is_file()
+        {
+            Ok(Self::VibeVoice(Box::new(VibeVoiceEngine::load(
+                model_dir, gpu, max_frames,
+            )?)))
+        } else if model_dir.join("audiovae.safetensors").is_file()
+            || model_dir.join("audiovae.pth").is_file()
+        {
+            Ok(Self::VoxCpm2(Box::new(VoxCpm2Engine::load(
+                model_dir, gpu, max_frames,
+            )?)))
+        } else if model_dir.join("kokoro-v1_0.pth").is_file() {
+            Ok(Self::Kokoro(Box::new(KokoroEngine::load(model_dir, gpu)?)))
         } else if model_dir.join("t3_mtl23ls_v3.safetensors").is_file() {
-            Ok(Self::Chatterbox(ChatterboxEngine::load(
+            Ok(Self::Chatterbox(Box::new(ChatterboxEngine::load(
                 model_dir, gpu, max_frames,
-            )?))
+            )?)))
         } else {
-            Ok(Self::Qwen(VoiceDesignEngine::load(
+            Ok(Self::Qwen(Box::new(VoiceDesignEngine::load(
                 model_dir, gpu, max_frames,
-            )?))
+            )?)))
         }
     }
 
@@ -90,6 +107,16 @@ impl TtsEngine {
                 engine.vram_bytes,
                 engine.model_id().to_owned(),
             ),
+            Self::VoxCpm2(engine) => (
+                engine.load_elapsed,
+                engine.vram_bytes,
+                engine.model_id().to_owned(),
+            ),
+            Self::VibeVoice(engine) => (
+                engine.load_elapsed,
+                engine.vram_bytes,
+                engine.model_id().to_owned(),
+            ),
         }
     }
 
@@ -101,6 +128,8 @@ impl TtsEngine {
             Self::Qwen(engine) => engine.synthesize(request),
             Self::Kokoro(engine) => engine.synthesize(request),
             Self::Chatterbox(engine) => engine.synthesize(request),
+            Self::VoxCpm2(engine) => engine.synthesize(request),
+            Self::VibeVoice(engine) => engine.synthesize(request),
         }
     }
 }
@@ -350,6 +379,7 @@ fn synthesize_segmented(
     let segments = split_synthesis_text(&request.text, MAX_SYNTHESIS_SEGMENT_CHARS);
     let mut audio = GeneratedAudio {
         samples: Vec::new(),
+        sample_rate: 0,
         frames: 0,
         inference_ms: 0.0,
         prompt_ms: 0.0,
@@ -366,10 +396,19 @@ fn synthesize_segmented(
         let output = engine.synthesize(&segment).map_err(|error| {
             format!("segment {}/{} failed: {error:#}", index + 1, segments.len())
         })?;
+        if audio.sample_rate == 0 {
+            audio.sample_rate = output.sample_rate;
+        } else if audio.sample_rate != output.sample_rate {
+            return Err(format!(
+                "segment sample rate changed from {} to {} Hz",
+                audio.sample_rate, output.sample_rate
+            ));
+        }
         if index > 0 {
-            audio
-                .samples
-                .extend(std::iter::repeat_n(0.0, SEGMENT_GAP_SAMPLES));
+            audio.samples.extend(std::iter::repeat_n(
+                0.0,
+                segment_gap_samples(output.sample_rate),
+            ));
         }
         audio.frames += output.generated_frames;
         audio.inference_ms += output.inference_elapsed().as_secs_f64() * 1_000.0;
@@ -398,10 +437,14 @@ fn synthesize_segments(
                 let inference_ms = output.inference_elapsed().as_secs_f64() * 1_000.0;
                 let mut samples = output.samples;
                 if index > 0 {
-                    samples.splice(0..0, std::iter::repeat_n(0.0, SEGMENT_GAP_SAMPLES));
+                    samples.splice(
+                        0..0,
+                        std::iter::repeat_n(0.0, segment_gap_samples(output.sample_rate)),
+                    );
                 }
                 GeneratedAudio {
                     samples,
+                    sample_rate: output.sample_rate,
                     frames: output.generated_frames,
                     inference_ms,
                     prompt_ms: output.prompt_elapsed.as_secs_f64() * 1_000.0,
@@ -438,7 +481,7 @@ fn split_synthesis_text(text: &str, max_chars: usize) -> Vec<String> {
         });
         let word_end = (preferred_start..hard_end)
             .rev()
-            .find_map(|index| chars[index].is_whitespace().then_some(index));
+            .find(|&index| chars[index].is_whitespace());
         let end = sentence_end.or(word_end).unwrap_or(hard_end);
         let segment = chars[start..end].iter().collect::<String>();
         if !segment.trim().is_empty() {
@@ -487,11 +530,13 @@ async fn speech(
     match submit(&state, request).await {
         Ok(audio) => {
             let duration_ms = encoded_duration_header(&audio, speed);
-            match encode_audio(audio.samples, format, speed).await {
+            let sample_rate = audio.sample_rate;
+            match encode_audio(audio.samples, sample_rate, format, speed).await {
                 Ok(encoded) => Response::builder()
                     .status(StatusCode::OK)
                     .header(header::CONTENT_TYPE, format.content_type())
                     .header("x-sllm-audio-duration-ms", duration_ms)
+                    .header("x-sllm-audio-sample-rate", sample_rate)
                     .header("x-sllm-generation-frames", audio.frames)
                     .header(
                         "server-timing",
@@ -518,7 +563,8 @@ async fn raw_speech(
     let speed = request.speed;
     match submit(&state, request).await {
         Ok(audio) => {
-            let raw = match raw_f32le(audio.samples, speed).await {
+            let sample_rate = audio.sample_rate;
+            let raw = match raw_f32le(audio.samples, sample_rate, speed).await {
                 Ok(raw) => raw,
                 Err(message) => {
                     return error_response(StatusCode::INTERNAL_SERVER_ERROR, &message);
@@ -527,6 +573,7 @@ async fn raw_speech(
             Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, "audio/x-f32le")
+                .header("x-sllm-audio-sample-rate", sample_rate)
                 .header("x-sllm-generation-frames", audio.frames)
                 .header(
                     "server-timing",
@@ -568,7 +615,8 @@ async fn handle_fleet_connection(
     let audio = submit(&state, request)
         .await
         .map_err(|_| "synthesis request was rejected".to_string())?;
-    let raw = raw_f32le(audio.samples, speed).await?;
+    let samples = resample(&audio.samples, audio.sample_rate, FLEET_SAMPLE_RATE);
+    let raw = raw_f32le(samples, FLEET_SAMPLE_RATE, speed).await?;
     stream
         .write_all(&raw)
         .await
@@ -610,7 +658,8 @@ async fn handle_fleet_stream(
     while let Some(segment) = response_rx.recv().await {
         match segment {
             Ok(audio) => {
-                let raw = raw_f32le(audio.samples, speed).await?;
+                let samples = resample(&audio.samples, audio.sample_rate, FLEET_SAMPLE_RATE);
+                let raw = raw_f32le(samples, FLEET_SAMPLE_RATE, speed).await?;
                 write_stream_frame(&mut stream, AUDIO, &raw).await?;
             }
             Err(message) => {
@@ -670,7 +719,8 @@ async fn submit(state: &Arc<AppState>, request: SpeechRequest) -> Result<Generat
         Ok(Ok(audio)) => {
             info!(
                 frames = audio.frames,
-                audio_seconds = audio.samples.len() as f64 / SAMPLE_RATE as f64,
+                sample_rate = audio.sample_rate,
+                audio_seconds = audio.samples.len() as f64 / audio.sample_rate as f64,
                 inference_ms = audio.inference_ms,
                 prompt_ms = audio.prompt_ms,
                 generation_ms = audio.generation_ms,
@@ -713,27 +763,30 @@ fn prepare_synthesis(
             "speed must be between 0.25 and 4.0",
         ));
     }
-    if let Some(model) = request.model.as_deref() {
-        if model != state.model
-            && !matches!(
-                model,
-                "qwen3-tts-voice-design"
-                    | "qwen3-tts-customvoice"
-                    | "qwen3-tts"
-                    | "tts-multilingual"
-                    | "tts-premium"
-                    | "tts-voice-clone"
-                    | "tts-fast"
-                    | "kokoro"
-                    | "tts-expressive"
-                    | "chatterbox"
-            )
-        {
-            return Err(error_response(
-                StatusCode::BAD_REQUEST,
-                &format!("unsupported model {model:?}"),
-            ));
-        }
+    if let Some(model) = request.model.as_deref()
+        && model != state.model
+        && !matches!(
+            model,
+            "qwen3-tts-voice-design"
+                | "qwen3-tts-customvoice"
+                | "qwen3-tts"
+                | "tts-multilingual"
+                | "tts-premium"
+                | "tts-voice-clone"
+                | "tts-fast"
+                | "kokoro"
+                | "tts-expressive"
+                | "chatterbox"
+                | "tts-studio"
+                | "voxcpm2"
+                | "tts-realtime"
+                | "vibevoice"
+        )
+    {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            &format!("unsupported model {model:?}"),
+        ));
     }
     let instruction = request
         .instruct
@@ -842,6 +895,7 @@ impl AudioFormat {
 
 async fn encode_audio(
     samples: Vec<f32>,
+    sample_rate: u32,
     format: AudioFormat,
     speed: f32,
 ) -> Result<Vec<u8>, String> {
@@ -849,14 +903,14 @@ async fn encode_audio(
         let pcm = float32_to_pcm16(&samples);
         return match format {
             AudioFormat::Pcm => Ok(pcm),
-            AudioFormat::Wav => Ok(wav_from_pcm16(&pcm)),
-            _ => transcode(samples, format, speed).await,
+            AudioFormat::Wav => Ok(wav_from_pcm16(&pcm, sample_rate)),
+            _ => transcode(samples, sample_rate, format, speed).await,
         };
     }
-    transcode(samples, format, speed).await
+    transcode(samples, sample_rate, format, speed).await
 }
 
-async fn raw_f32le(samples: Vec<f32>, speed: f32) -> Result<Vec<u8>, String> {
+async fn raw_f32le(samples: Vec<f32>, sample_rate: u32, speed: f32) -> Result<Vec<u8>, String> {
     if speed == 1.0 {
         let mut raw = Vec::with_capacity(samples.len() * 4);
         for sample in samples {
@@ -864,14 +918,19 @@ async fn raw_f32le(samples: Vec<f32>, speed: f32) -> Result<Vec<u8>, String> {
         }
         return Ok(raw);
     }
-    transcode_raw(samples, speed).await
+    transcode_raw(samples, sample_rate, speed).await
 }
 
-async fn transcode_raw(samples: Vec<f32>, speed: f32) -> Result<Vec<u8>, String> {
-    run_ffmpeg(samples, speed, "pcm_f32le", "f32le").await
+async fn transcode_raw(samples: Vec<f32>, sample_rate: u32, speed: f32) -> Result<Vec<u8>, String> {
+    run_ffmpeg(samples, sample_rate, speed, "pcm_f32le", "f32le").await
 }
 
-async fn transcode(samples: Vec<f32>, format: AudioFormat, speed: f32) -> Result<Vec<u8>, String> {
+async fn transcode(
+    samples: Vec<f32>,
+    sample_rate: u32,
+    format: AudioFormat,
+    speed: f32,
+) -> Result<Vec<u8>, String> {
     let (codec, container) = match format {
         AudioFormat::Mp3 => ("libmp3lame", "mp3"),
         AudioFormat::Opus => ("libopus", "ogg"),
@@ -880,11 +939,12 @@ async fn transcode(samples: Vec<f32>, format: AudioFormat, speed: f32) -> Result
         AudioFormat::Wav => ("pcm_s16le", "wav"),
         AudioFormat::Pcm => ("pcm_s16le", "s16le"),
     };
-    run_ffmpeg(samples, speed, codec, container).await
+    run_ffmpeg(samples, sample_rate, speed, codec, container).await
 }
 
 async fn run_ffmpeg(
     samples: Vec<f32>,
+    sample_rate: u32,
     speed: f32,
     codec: &str,
     container: &str,
@@ -895,6 +955,7 @@ async fn run_ffmpeg(
     }
     let mut command =
         Command::new(std::env::var("CHEW_TTS_FFMPEG").unwrap_or_else(|_| "ffmpeg".into()));
+    let sample_rate = sample_rate.to_string();
     command.args([
         "-hide_banner",
         "-loglevel",
@@ -902,7 +963,7 @@ async fn run_ffmpeg(
         "-f",
         "f32le",
         "-ar",
-        "24000",
+        &sample_rate,
         "-ac",
         "1",
         "-i",
@@ -972,7 +1033,7 @@ fn float32_to_pcm16(samples: &[f32]) -> Vec<u8> {
     pcm
 }
 
-fn wav_from_pcm16(pcm: &[u8]) -> Vec<u8> {
+fn wav_from_pcm16(pcm: &[u8], sample_rate: u32) -> Vec<u8> {
     let data_len = u32::try_from(pcm.len()).unwrap_or(u32::MAX);
     let mut wav = Vec::with_capacity(44 + pcm.len());
     wav.extend_from_slice(b"RIFF");
@@ -981,8 +1042,8 @@ fn wav_from_pcm16(pcm: &[u8]) -> Vec<u8> {
     wav.extend_from_slice(&16u32.to_le_bytes());
     wav.extend_from_slice(&1u16.to_le_bytes());
     wav.extend_from_slice(&1u16.to_le_bytes());
-    wav.extend_from_slice(&SAMPLE_RATE.to_le_bytes());
-    wav.extend_from_slice(&(SAMPLE_RATE * 2).to_le_bytes());
+    wav.extend_from_slice(&sample_rate.to_le_bytes());
+    wav.extend_from_slice(&(sample_rate * 2).to_le_bytes());
     wav.extend_from_slice(&2u16.to_le_bytes());
     wav.extend_from_slice(&16u16.to_le_bytes());
     wav.extend_from_slice(b"data");
@@ -992,7 +1053,12 @@ fn wav_from_pcm16(pcm: &[u8]) -> Vec<u8> {
 }
 
 fn encoded_duration_header(audio: &GeneratedAudio, speed: f32) -> u64 {
-    ((audio.samples.len() as f64 * 1_000.0 / SAMPLE_RATE as f64) / f64::from(speed)).round() as u64
+    ((audio.samples.len() as f64 * 1_000.0 / audio.sample_rate as f64) / f64::from(speed)).round()
+        as u64
+}
+
+fn segment_gap_samples(sample_rate: u32) -> usize {
+    (sample_rate as usize * SEGMENT_GAP_SAMPLES) / FLEET_SAMPLE_RATE as usize
 }
 
 fn error_response(status: StatusCode, message: &str) -> Response {
@@ -1029,9 +1095,10 @@ mod tests {
     #[test]
     fn wav_header_describes_pcm_payload() {
         let pcm = [1u8, 2, 3, 4];
-        let wav = wav_from_pcm16(&pcm);
+        let wav = wav_from_pcm16(&pcm, 48_000);
         assert_eq!(&wav[..4], b"RIFF");
         assert_eq!(&wav[8..12], b"WAVE");
+        assert_eq!(u32::from_le_bytes(wav[24..28].try_into().unwrap()), 48_000);
         assert_eq!(u32::from_le_bytes(wav[40..44].try_into().unwrap()), 4);
         assert_eq!(&wav[44..], &pcm);
     }

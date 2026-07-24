@@ -73,6 +73,7 @@ pub struct SynthesisRequest {
 
 pub struct SynthesisOutput {
     pub samples: Vec<f32>,
+    pub sample_rate: u32,
     pub generated_frames: usize,
     pub prompt_elapsed: Duration,
     pub generation_elapsed: Duration,
@@ -593,6 +594,7 @@ impl<T: QwenDType> VoiceDesignEngineImpl<T> {
         );
         Ok(SynthesisOutput {
             samples,
+            sample_rate: 24_000,
             generated_frames,
             prompt_elapsed,
             generation_elapsed,
@@ -662,7 +664,7 @@ fn decode_codec_chunk(
     Ok(started.elapsed())
 }
 
-fn load_qwen_tokenizer(model_dir: &Path) -> anyhow::Result<Tokenizer> {
+pub(crate) fn load_qwen_tokenizer(model_dir: &Path) -> anyhow::Result<Tokenizer> {
     let vocab = model_dir.join("vocab.json");
     let merges = model_dir.join("merges.txt");
     let vocab = vocab.to_string_lossy();
