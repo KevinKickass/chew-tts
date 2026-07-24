@@ -48,6 +48,20 @@ pub trait QwenDType:
         cols: u32,
     ) -> anyhow::Result<()>;
     #[allow(clippy::too_many_arguments)]
+    fn gemv_qkv(
+        kernels: &mut GpuKernels,
+        input: &CudaSlice<Self>,
+        q_weight: &CudaSlice<Self>,
+        k_weight: &CudaSlice<Self>,
+        v_weight: &CudaSlice<Self>,
+        q_output: &mut CudaSlice<Self>,
+        k_output: &mut CudaSlice<Self>,
+        v_output: &mut CudaSlice<Self>,
+        q_rows: u32,
+        kv_rows: u32,
+        cols: u32,
+    ) -> anyhow::Result<()>;
+    #[allow(clippy::too_many_arguments)]
     fn gemv_dual(
         kernels: &mut GpuKernels,
         input: &CudaSlice<Self>,
@@ -168,6 +182,24 @@ impl QwenDType for f16 {
         c: u32,
     ) -> anyhow::Result<()> {
         k.gemv.gemv_f16(i, w, o, r, c)?;
+        Ok(())
+    }
+    fn gemv_qkv(
+        k: &mut GpuKernels,
+        i: &CudaSlice<Self>,
+        qw: &CudaSlice<Self>,
+        kw: &CudaSlice<Self>,
+        vw: &CudaSlice<Self>,
+        qo: &mut CudaSlice<Self>,
+        ko: &mut CudaSlice<Self>,
+        vo: &mut CudaSlice<Self>,
+        qr: u32,
+        kr: u32,
+        c: u32,
+    ) -> anyhow::Result<()> {
+        k.gemv.gemv_f16(i, qw, qo, qr, c)?;
+        k.gemv.gemv_f16(i, kw, ko, kr, c)?;
+        k.gemv.gemv_f16(i, vw, vo, kr, c)?;
         Ok(())
     }
     fn gemv_dual(
@@ -316,6 +348,22 @@ impl QwenDType for bf16 {
         c: u32,
     ) -> anyhow::Result<()> {
         k.gemv.gemv_bf16(i, w, o, r, c)?;
+        Ok(())
+    }
+    fn gemv_qkv(
+        k: &mut GpuKernels,
+        i: &CudaSlice<Self>,
+        qw: &CudaSlice<Self>,
+        kw: &CudaSlice<Self>,
+        vw: &CudaSlice<Self>,
+        qo: &mut CudaSlice<Self>,
+        ko: &mut CudaSlice<Self>,
+        vo: &mut CudaSlice<Self>,
+        qr: u32,
+        kr: u32,
+        c: u32,
+    ) -> anyhow::Result<()> {
+        k.gemv.gemv_qkv_bf16(i, qw, kw, vw, qo, ko, vo, qr, kr, c)?;
         Ok(())
     }
     fn gemv_dual(

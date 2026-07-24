@@ -19,6 +19,7 @@ pub struct GemvKernels {
     f16: CudaFunction,
     dual_f16: CudaFunction,
     bf16: CudaFunction,
+    qkv_bf16: CudaFunction,
     dual_bf16: CudaFunction,
     /// Pre-allocated Q8_1 buffer for input vector (max_k / 32 * 36 bytes)
     /// Q8_1 format: half2 ds (4 bytes) + int8_t qs[32] = 36 bytes per block
@@ -45,6 +46,7 @@ impl GemvKernels {
             f16: loader::get_fn(&module, "gemv_f16")?,
             dual_f16: loader::get_fn(&module, "gemv_dual_f16")?,
             bf16: loader::get_fn(&module, "gemv_bf16")?,
+            qkv_bf16: loader::get_fn(&module, "gemv_qkv_bf16")?,
             dual_bf16: loader::get_fn(&module, "gemv_dual_bf16")?,
             _module: module,
             x_q8,
@@ -280,6 +282,42 @@ impl GemvKernels {
         unsafe {
             self.fast
                 .fire(&self.bf16, (n, 1, 1), (256, 1, 1), 0, &mut args);
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_qkv_bf16(
+        &self,
+        x: &CudaSlice<half::bf16>,
+        q_weight: &CudaSlice<half::bf16>,
+        k_weight: &CudaSlice<half::bf16>,
+        v_weight: &CudaSlice<half::bf16>,
+        q_out: &mut CudaSlice<half::bf16>,
+        k_out: &mut CudaSlice<half::bf16>,
+        v_out: &mut CudaSlice<half::bf16>,
+        q_rows: u32,
+        kv_rows: u32,
+        cols: u32,
+    ) -> Result<(), KernelError> {
+        let q_rows_i32 = q_rows as i32;
+        let kv_rows_i32 = kv_rows as i32;
+        let cols_i32 = cols as i32;
+        let mut args = [
+            slice_ptr(x),
+            slice_ptr(q_weight),
+            slice_ptr(k_weight),
+            slice_ptr(v_weight),
+            slice_ptr_mut(q_out),
+            slice_ptr_mut(k_out),
+            slice_ptr_mut(v_out),
+            scalar_ptr(&q_rows_i32),
+            scalar_ptr(&kv_rows_i32),
+            scalar_ptr(&cols_i32),
+        ];
+        unsafe {
+            self.fast
+                .fire(&self.qkv_bf16, (q_rows, 1, 1), (256, 1, 1), 0, &mut args);
         }
         Ok(())
     }

@@ -92,27 +92,16 @@ impl<T: QwenDType> TalkerDecoderLayer<T> {
             config.rms_norm_eps as f32,
         )?;
         if seq_len == 1 {
-            T::gemv(
+            T::gemv_qkv(
                 kernels,
                 &scratch.norm,
                 &self.q_proj,
-                &mut scratch.q_native,
-                q_dim as u32,
-                hidden_dim as u32,
-            )?;
-            T::gemv(
-                kernels,
-                &scratch.norm,
                 &self.k_proj,
-                &mut scratch.k_native,
-                kv_dim as u32,
-                hidden_dim as u32,
-            )?;
-            T::gemv(
-                kernels,
-                &scratch.norm,
                 &self.v_proj,
+                &mut scratch.q_native,
+                &mut scratch.k_native,
                 &mut scratch.v_native,
+                q_dim as u32,
                 kv_dim as u32,
                 hidden_dim as u32,
             )?;

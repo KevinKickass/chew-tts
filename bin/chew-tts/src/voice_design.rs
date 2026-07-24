@@ -450,6 +450,10 @@ impl<T: QwenDType> VoiceDesignEngineImpl<T> {
         };
         let mut samples = Vec::new();
         let mut codec_elapsed = Duration::ZERO;
+        let mut predictor_elapsed = Duration::ZERO;
+        let mut embedding_elapsed = Duration::ZERO;
+        let mut talker_elapsed = Duration::ZERO;
+        let mut semantic_elapsed = Duration::ZERO;
         if wants_icl {
             let mut discarded_reference_samples = Vec::new();
             for frame in base_codes
@@ -490,6 +494,7 @@ impl<T: QwenDType> VoiceDesignEngineImpl<T> {
             if semantic == 2_150 {
                 break;
             }
+            let predictor_started = Instant::now();
             let acoustic = self
                 .predictor
                 .generate_acoustic_codes_sampled_with_session(
@@ -501,6 +506,7 @@ impl<T: QwenDType> VoiceDesignEngineImpl<T> {
                     &mut seed,
                     &mut self.kernels,
                 )?;
+            predictor_elapsed += predictor_started.elapsed();
             let mut codes = Vec::with_capacity(self.config.num_code_groups);
             codes.push(semantic);
             codes.extend_from_slice(&acoustic);
@@ -524,6 +530,7 @@ impl<T: QwenDType> VoiceDesignEngineImpl<T> {
                 )?;
             }
 
+            let embedding_started = Instant::now();
             let semantic_embedding = self
                 .frontend
                 .codec_embeddings(&[semantic], &mut self.kernels)?;
@@ -543,6 +550,8 @@ impl<T: QwenDType> VoiceDesignEngineImpl<T> {
                 .zip(text_embedding)
                 .map(|((semantic, acoustic), text)| semantic + acoustic + text)
                 .collect::<Vec<_>>();
+            embedding_elapsed += embedding_started.elapsed();
+            let talker_started = Instant::now();
             last_hidden = self.talker.forward_session(
                 &mut talker_session,
                 &next_input,
@@ -550,6 +559,8 @@ impl<T: QwenDType> VoiceDesignEngineImpl<T> {
                 &self.config,
                 &mut self.kernels,
             )?;
+            talker_elapsed += talker_started.elapsed();
+            let semantic_started = Instant::now();
             semantic = self.frontend.semantic_speech_sample_with_session(
                 &mut self.semantic_session,
                 &last_hidden,
@@ -560,9 +571,24 @@ impl<T: QwenDType> VoiceDesignEngineImpl<T> {
                 &mut seed,
                 &mut self.kernels,
             )?;
+            semantic_elapsed += semantic_started.elapsed();
             generated_semantics.push(semantic);
         }
         let generation_elapsed = generation_started.elapsed().saturating_sub(codec_elapsed);
+        tracing::debug!(
+            frames = generated_frames,
+            predictor_ms = predictor_elapsed.as_secs_f64() * 1_000.0,
+            embeddings_ms = embedding_elapsed.as_secs_f64() * 1_000.0,
+            talker_ms = talker_elapsed.as_secs_f64() * 1_000.0,
+            semantic_ms = semantic_elapsed.as_secs_f64() * 1_000.0,
+            other_ms = generation_elapsed
+                .saturating_sub(
+                    predictor_elapsed + embedding_elapsed + talker_elapsed + semantic_elapsed
+                )
+                .as_secs_f64()
+                * 1_000.0,
+            "Qwen generation stages"
+        );
         ensure!(
             generated_frames > 0,
             "model emitted EOS before producing audio"

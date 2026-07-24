@@ -500,6 +500,14 @@ model EOS normally, and produces 22.32 seconds of audio in approximately
 A separate 256-frame safety-limit run writes a valid 20.48-second WAV and
 returns an explicit truncation error instead of silently accepting it.
 
+The native-BF16 0.6B CustomVoice path uses vectorized BF16 GEMV and a fused
+Q/K/V projection for single-token decode. With the official
+`Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice` checkpoint, a warm RTX 3080 run produced
+6.48 seconds of audio in a median 1.122 seconds (RTF 0.173, 5.78x realtime).
+A longer German stability request produced 34.29 seconds in 6.013 seconds
+(RTF 0.175). Kernel profiling still places most generation time in the 15
+strictly autoregressive code-predictor steps rather than the talker or codec.
+
 ## HTTP server
 
 Run a persistent worker for any supported model directory:

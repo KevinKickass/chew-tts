@@ -462,8 +462,20 @@ __global__ void gemv_bf16(const __nv_bfloat16* __restrict__ x,
     const int tid = threadIdx.x;
     const __nv_bfloat16* w = weight + (long long)row * K;
     float sum = 0.0f;
-    for (int col = tid; col < K; col += blockDim.x) {
-        sum += __bfloat162float(x[col]) * __bfloat162float(w[col]);
+    const int pairs = K >> 1;
+    const __nv_bfloat162* x2 = reinterpret_cast<const __nv_bfloat162*>(x);
+    const __nv_bfloat162* w2 = reinterpret_cast<const __nv_bfloat162*>(w);
+    if ((K & 1) == 0) {
+        for (int col = tid; col < pairs; col += blockDim.x) {
+            const float2 xv = __bfloat1622float2(x2[col]);
+            const float2 wv = __bfloat1622float2(w2[col]);
+            sum = fmaf(xv.x, wv.x, sum);
+            sum = fmaf(xv.y, wv.y, sum);
+        }
+    } else {
+        for (int col = tid; col < K; col += blockDim.x) {
+            sum += __bfloat162float(x[col]) * __bfloat162float(w[col]);
+        }
     }
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
@@ -481,6 +493,98 @@ __global__ void gemv_bf16(const __nv_bfloat16* __restrict__ x,
             sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
         }
         if (lane == 0) out[row] = __float2bfloat16(sum);
+    }
+}
+
+// Q/K/V share the same normalized input. The Q projection may have more rows
+// than K/V under grouped-query attention, so the grid follows Q and only the
+// common prefix computes all three projections.
+__global__ void gemv_qkv_bf16(const __nv_bfloat16* __restrict__ x,
+                              const __nv_bfloat16* __restrict__ q_weight,
+                              const __nv_bfloat16* __restrict__ k_weight,
+                              const __nv_bfloat16* __restrict__ v_weight,
+                              __nv_bfloat16* __restrict__ q_out,
+                              __nv_bfloat16* __restrict__ k_out,
+                              __nv_bfloat16* __restrict__ v_out,
+                              int QN,
+                              int KVN,
+                              int K) {
+    const int row = blockIdx.x;
+    if (row >= QN) return;
+    const int tid = threadIdx.x;
+    const int pairs = K >> 1;
+    const __nv_bfloat162* x2 = reinterpret_cast<const __nv_bfloat162*>(x);
+    const __nv_bfloat162* qw2 = reinterpret_cast<const __nv_bfloat162*>(
+        q_weight + (long long)row * K);
+    const bool has_kv = row < KVN;
+    const __nv_bfloat162* kw2 = has_kv
+        ? reinterpret_cast<const __nv_bfloat162*>(k_weight + (long long)row * K)
+        : nullptr;
+    const __nv_bfloat162* vw2 = has_kv
+        ? reinterpret_cast<const __nv_bfloat162*>(v_weight + (long long)row * K)
+        : nullptr;
+    float q_sum = 0.0f;
+    float k_sum = 0.0f;
+    float v_sum = 0.0f;
+    if ((K & 1) == 0) {
+        for (int col = tid; col < pairs; col += blockDim.x) {
+            const float2 value = __bfloat1622float2(x2[col]);
+            const float2 qv = __bfloat1622float2(qw2[col]);
+            q_sum = fmaf(value.x, qv.x, q_sum);
+            q_sum = fmaf(value.y, qv.y, q_sum);
+            if (has_kv) {
+                const float2 kv = __bfloat1622float2(kw2[col]);
+                const float2 vv = __bfloat1622float2(vw2[col]);
+                k_sum = fmaf(value.x, kv.x, k_sum);
+                k_sum = fmaf(value.y, kv.y, k_sum);
+                v_sum = fmaf(value.x, vv.x, v_sum);
+                v_sum = fmaf(value.y, vv.y, v_sum);
+            }
+        }
+    } else {
+        for (int col = tid; col < K; col += blockDim.x) {
+            const float value = __bfloat162float(x[col]);
+            q_sum += value * __bfloat162float(q_weight[(long long)row * K + col]);
+            if (has_kv) {
+                k_sum += value * __bfloat162float(k_weight[(long long)row * K + col]);
+                v_sum += value * __bfloat162float(v_weight[(long long)row * K + col]);
+            }
+        }
+    }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        q_sum += __shfl_down_sync(0xFFFFFFFF, q_sum, offset);
+        k_sum += __shfl_down_sync(0xFFFFFFFF, k_sum, offset);
+        v_sum += __shfl_down_sync(0xFFFFFFFF, v_sum, offset);
+    }
+    __shared__ float q_warp_sums[8];
+    __shared__ float k_warp_sums[8];
+    __shared__ float v_warp_sums[8];
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    if (lane == 0) {
+        q_warp_sums[warp] = q_sum;
+        k_warp_sums[warp] = k_sum;
+        v_warp_sums[warp] = v_sum;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        q_sum = lane < 8 ? q_warp_sums[lane] : 0.0f;
+        k_sum = lane < 8 ? k_warp_sums[lane] : 0.0f;
+        v_sum = lane < 8 ? v_warp_sums[lane] : 0.0f;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            q_sum += __shfl_down_sync(0xFFFFFFFF, q_sum, offset);
+            k_sum += __shfl_down_sync(0xFFFFFFFF, k_sum, offset);
+            v_sum += __shfl_down_sync(0xFFFFFFFF, v_sum, offset);
+        }
+        if (lane == 0) {
+            q_out[row] = __float2bfloat16(q_sum);
+            if (has_kv) {
+                k_out[row] = __float2bfloat16(k_sum);
+                v_out[row] = __float2bfloat16(v_sum);
+            }
+        }
     }
 }
 
@@ -547,10 +651,26 @@ __global__ void gemv_dual_bf16(const __nv_bfloat16* __restrict__ x,
     const __nv_bfloat16* up = up_weight + (long long)row * K;
     float gate_sum = 0.0f;
     float up_sum = 0.0f;
-    for (int col = tid; col < K; col += blockDim.x) {
-        const float value = __bfloat162float(x[col]);
-        gate_sum += value * __bfloat162float(gate[col]);
-        up_sum += value * __bfloat162float(up[col]);
+    const int pairs = K >> 1;
+    const __nv_bfloat162* x2 = reinterpret_cast<const __nv_bfloat162*>(x);
+    const __nv_bfloat162* gate2 = reinterpret_cast<const __nv_bfloat162*>(gate);
+    const __nv_bfloat162* up2 = reinterpret_cast<const __nv_bfloat162*>(up);
+    if ((K & 1) == 0) {
+        for (int col = tid; col < pairs; col += blockDim.x) {
+            const float2 value = __bfloat1622float2(x2[col]);
+            const float2 gate_value = __bfloat1622float2(gate2[col]);
+            const float2 up_value = __bfloat1622float2(up2[col]);
+            gate_sum = fmaf(value.x, gate_value.x, gate_sum);
+            gate_sum = fmaf(value.y, gate_value.y, gate_sum);
+            up_sum = fmaf(value.x, up_value.x, up_sum);
+            up_sum = fmaf(value.y, up_value.y, up_sum);
+        }
+    } else {
+        for (int col = tid; col < K; col += blockDim.x) {
+            const float value = __bfloat162float(x[col]);
+            gate_sum += value * __bfloat162float(gate[col]);
+            up_sum += value * __bfloat162float(up[col]);
+        }
     }
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
