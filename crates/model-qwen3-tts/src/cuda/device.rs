@@ -16,6 +16,41 @@ impl<T: QwenDType> TalkerDecoderLayer<T> {
         cache: &mut TalkerLayerKvCache,
         scratch: &mut TalkerLayerScratch<T>,
     ) -> anyhow::Result<()> {
+        self.forward_device(hidden, seq_len, 1, config, kernels, cache, scratch)
+    }
+
+    pub fn forward_batched_full_device(
+        &self,
+        hidden: &mut CudaSlice<f32>,
+        total_rows: usize,
+        batches: usize,
+        config: &TalkerConfig,
+        kernels: &mut GpuKernels,
+        cache: &mut TalkerLayerKvCache,
+        scratch: &mut TalkerLayerScratch<T>,
+    ) -> anyhow::Result<()> {
+        ensure!(
+            !self.causal_attention,
+            "batched full attention requires a bidirectional layer"
+        );
+        ensure!(
+            batches > 0 && total_rows.is_multiple_of(batches),
+            "invalid batched attention geometry"
+        );
+        self.forward_device(hidden, total_rows, batches, config, kernels, cache, scratch)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_device(
+        &self,
+        hidden: &mut CudaSlice<f32>,
+        seq_len: usize,
+        batches: usize,
+        config: &TalkerConfig,
+        kernels: &mut GpuKernels,
+        cache: &mut TalkerLayerKvCache,
+        scratch: &mut TalkerLayerScratch<T>,
+    ) -> anyhow::Result<()> {
         let hidden_dim = config.hidden_size;
         let q_dim = config.num_attention_heads * config.head_dim;
         let kv_dim = config.num_key_value_heads * config.head_dim;
@@ -41,6 +76,8 @@ impl<T: QwenDType> TalkerDecoderLayer<T> {
             cache.position
         );
         let rows = u32::try_from(seq_len).context("sequence length exceeds CUDA limits")?;
+        let rows_per_batch = u32::try_from(seq_len / batches)
+            .context("batch sequence length exceeds CUDA limits")?;
         let position = u32::try_from(cache.position).context("KV position exceeds CUDA limits")?;
         let total_kv_len =
             u32::try_from(cache.position + seq_len).context("KV length exceeds CUDA limits")?;
@@ -164,24 +201,47 @@ impl<T: QwenDType> TalkerDecoderLayer<T> {
 
         if self.apply_rope {
             if let Some(factors) = &self.rope_factors {
-                kernels.ops.rope_neox_freqs(
-                    &mut scratch.q,
-                    factors,
-                    rows,
-                    config.num_attention_heads as u32,
-                    config.head_dim as u32,
-                    position,
-                    config.rope_theta as f32,
-                )?;
-                kernels.ops.rope_neox_freqs(
-                    &mut scratch.k,
-                    factors,
-                    rows,
-                    config.num_key_value_heads as u32,
-                    config.head_dim as u32,
-                    position,
-                    config.rope_theta as f32,
-                )?;
+                if batches == 1 {
+                    kernels.ops.rope_neox_freqs(
+                        &mut scratch.q,
+                        factors,
+                        rows,
+                        config.num_attention_heads as u32,
+                        config.head_dim as u32,
+                        position,
+                        config.rope_theta as f32,
+                    )?;
+                    kernels.ops.rope_neox_freqs(
+                        &mut scratch.k,
+                        factors,
+                        rows,
+                        config.num_key_value_heads as u32,
+                        config.head_dim as u32,
+                        position,
+                        config.rope_theta as f32,
+                    )?;
+                } else {
+                    kernels.ops.rope_neox_freqs_batched(
+                        &mut scratch.q,
+                        factors,
+                        rows,
+                        rows_per_batch,
+                        config.num_attention_heads as u32,
+                        config.head_dim as u32,
+                        position,
+                        config.rope_theta as f32,
+                    )?;
+                    kernels.ops.rope_neox_freqs_batched(
+                        &mut scratch.k,
+                        factors,
+                        rows,
+                        rows_per_batch,
+                        config.num_key_value_heads as u32,
+                        config.head_dim as u32,
+                        position,
+                        config.rope_theta as f32,
+                    )?;
+                }
             } else {
                 kernels.ops.rope_neox(
                     &mut scratch.q,
@@ -234,19 +294,34 @@ impl<T: QwenDType> TalkerDecoderLayer<T> {
                 position == 0 && total_kv_len == rows,
                 "bidirectional attention cannot append to a KV cache"
             );
-            kernels.ops.mha_naive_full(
-                &scratch.q,
-                &cache.k.slice(..cache_end),
-                &cache.v.slice(..cache_end),
-                &mut scratch.attention,
-                config.head_dim as u32,
-                config.num_attention_heads as u32,
-                config.num_key_value_heads as u32,
-                rows,
-                total_kv_len,
-                1.0 / (config.head_dim as f32).sqrt(),
-                0.0,
-            )?;
+            if batches == 1 {
+                kernels.ops.mha_naive_full(
+                    &scratch.q,
+                    &cache.k.slice(..cache_end),
+                    &cache.v.slice(..cache_end),
+                    &mut scratch.attention,
+                    config.head_dim as u32,
+                    config.num_attention_heads as u32,
+                    config.num_key_value_heads as u32,
+                    rows,
+                    total_kv_len,
+                    1.0 / (config.head_dim as f32).sqrt(),
+                    0.0,
+                )?;
+            } else {
+                kernels.ops.mha_naive_batched_full(
+                    &scratch.q,
+                    &cache.k.slice(..cache_end),
+                    &cache.v.slice(..cache_end),
+                    &mut scratch.attention,
+                    config.head_dim as u32,
+                    config.num_attention_heads as u32,
+                    config.num_key_value_heads as u32,
+                    rows_per_batch,
+                    batches as u32,
+                    1.0 / (config.head_dim as f32).sqrt(),
+                )?;
+            }
         }
         T::from_f16(
             kernels,

@@ -303,6 +303,62 @@ impl<T: QwenDType> TalkerTransformer<T> {
             Ok(output)
         }
     }
+
+    pub fn forward_hidden_batched_full(
+        &self,
+        hidden_host: &[f32],
+        tokens_per_batch: usize,
+        batches: usize,
+        config: &TalkerConfig,
+        kernels: &mut GpuKernels,
+    ) -> anyhow::Result<Vec<f32>> {
+        ensure!(
+            tokens_per_batch > 0 && batches > 0,
+            "empty transformer batch"
+        );
+        let total_rows = tokens_per_batch * batches;
+        ensure!(
+            hidden_host.len() == total_rows * config.hidden_size,
+            "batched hidden input geometry disagrees"
+        );
+        let stream = Arc::clone(kernels.ops.stream());
+        let mut hidden = stream.clone_htod(hidden_host)?;
+        let mut scratch = TalkerLayerScratch::allocate(total_rows, config, &stream)?;
+        let mut caches = (0..self.layers.len())
+            .map(|_| TalkerLayerKvCache::allocate(total_rows, config, &stream))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        for (layer, cache) in self.layers.iter().zip(&mut caches) {
+            layer.forward_batched_full_device(
+                &mut hidden,
+                total_rows,
+                batches,
+                config,
+                kernels,
+                cache,
+                &mut scratch,
+            )?;
+        }
+        if let Some(final_norm) = &self.final_norm {
+            T::rms_norm_f32in(
+                kernels,
+                &hidden,
+                final_norm,
+                &mut scratch.norm,
+                total_rows as u32,
+                config.hidden_size as u32,
+                config.rms_norm_eps as f32,
+            )?;
+            stream.synchronize()?;
+            let mut output = vec![T::zero(); total_rows * config.hidden_size];
+            stream.memcpy_dtoh(&scratch.norm, &mut output)?;
+            Ok(output.into_iter().map(T::to_f32).collect())
+        } else {
+            stream.synchronize()?;
+            let mut output = vec![0.0f32; total_rows * config.hidden_size];
+            stream.memcpy_dtoh(&hidden, &mut output)?;
+            Ok(output)
+        }
+    }
 }
 
 impl<T: QwenDType> TalkerGenerationSession<T> {

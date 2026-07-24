@@ -23,8 +23,8 @@ use chew_model_vibevoice::{
     inspect_model as inspect_vibevoice_model,
 };
 use chew_model_voxcpm2::{
-    VoxCpm2AudioDecoder, VoxCpm2Projections, VoxCpm2TransformerBackbones,
-    inspect_model as inspect_voxcpm2_model,
+    VoxCpm2AudioDecoder, VoxCpm2AudioEncoder, VoxCpm2Engine, VoxCpm2FlowDecoder,
+    VoxCpm2Projections, VoxCpm2TransformerBackbones, inspect_model as inspect_voxcpm2_model,
 };
 use clap::{Parser, Subcommand};
 use std::io::{Seek, SeekFrom, Write};
@@ -117,6 +117,23 @@ enum Command {
         model_dir: PathBuf,
         #[arg(long, default_value_t = 0)]
         gpu: usize,
+    },
+    /// Generate a zero-shot VoxCPM2 WAV through the fully native path.
+    CudaVoxCpm2Generate {
+        model_dir: PathBuf,
+        text: String,
+        output: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        gpu: usize,
+        #[arg(long, default_value_t = 2)]
+        min_patches: usize,
+        #[arg(long, default_value_t = 80)]
+        max_patches: usize,
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+        /// Optional reference-voice WAV; decoded and resampled to 16 kHz.
+        #[arg(long)]
+        reference: Option<PathBuf>,
     },
     /// Load and execute both native VibeVoice Qwen2 backbones on CUDA.
     CudaVibeVoiceBackboneSmoke {
@@ -775,6 +792,8 @@ fn main() -> anyhow::Result<()> {
                 VoxCpm2TransformerBackbones::load(&model_dir, &inspection.config, &stream)?;
             let projections = VoxCpm2Projections::load(&model_dir, &inspection.config, &stream)?;
             let decoder = VoxCpm2AudioDecoder::load(&model_dir, &inspection.config, &stream)?;
+            let encoder = VoxCpm2AudioEncoder::load(&model_dir, &inspection.config, &stream)?;
+            let flow = VoxCpm2FlowDecoder::load(&model_dir, &inspection.config, &stream)?;
             let load_elapsed = started.elapsed();
             let free_loaded = allocator.free_bytes(gpu)?;
             let forward_started = std::time::Instant::now();
@@ -784,6 +803,17 @@ fn main() -> anyhow::Result<()> {
                 .map(|index| ((index as f32 + 1.0) * 0.013).sin() * 0.125)
                 .collect::<Vec<_>>();
             let waveform = decoder.decode(&latent, &mut kernels)?;
+            let reference = (0..1_280)
+                .map(|index| ((index as f32 + 1.0) * 0.017).sin() * 0.125)
+                .collect::<Vec<_>>();
+            let encoded_reference = encoder.encode(&reference, &mut kernels)?;
+            let mut mu = projected.lm_to_dit.clone();
+            mu.extend_from_slice(&projected.res_to_dit);
+            let flow_started = std::time::Instant::now();
+            let patch =
+                flow.generate_patch(&backbones, &mu, &latent.repeat(4), 42, &mut kernels)?;
+            let flow_elapsed = flow_started.elapsed();
+            let generated_waveform = decoder.decode(&patch, &mut kernels)?;
             println!(
                 "VoxCPM2 transformers CUDA: load={:.3}s, forward={:.3}ms, VRAM={:.2} GiB",
                 load_elapsed.as_secs_f64(),
@@ -831,6 +861,83 @@ fn main() -> anyhow::Result<()> {
                 waveform.iter().copied().fold(f32::NEG_INFINITY, f32::max),
                 &waveform[..8],
             );
+            println!(
+                "encoder: {} frames, sum={:.9}, first={:?}",
+                encoded_reference.len() / inspection.config.feat_dim,
+                encoded_reference
+                    .iter()
+                    .map(|value| f64::from(*value))
+                    .sum::<f64>(),
+                &encoded_reference[..8],
+            );
+            println!(
+                "flow: {:.3}s for {} frames / {:.1}ms audio, PCM range [{:.6}, {:.6}]",
+                flow_elapsed.as_secs_f64(),
+                patch.len() / inspection.config.feat_dim,
+                generated_waveform.len() as f64 / 48.0,
+                generated_waveform
+                    .iter()
+                    .copied()
+                    .fold(f32::INFINITY, f32::min),
+                generated_waveform
+                    .iter()
+                    .copied()
+                    .fold(f32::NEG_INFINITY, f32::max),
+            );
+        }
+        Command::CudaVoxCpm2Generate {
+            model_dir,
+            text,
+            output,
+            gpu,
+            min_patches,
+            max_patches,
+            seed,
+            reference,
+        } => {
+            let inspection = inspect_voxcpm2_model(&model_dir)?;
+            let allocator = chew_vram::VramAllocator::init()?;
+            anyhow::ensure!(gpu < allocator.gpu_count(), "GPU index out of range");
+            let stream = std::sync::Arc::clone(allocator.stream(gpu));
+            let lm = &inspection.config.lm_config;
+            let mut kernels = chew_kernel::GpuKernels::load(
+                &stream,
+                lm.intermediate_size * lm.hidden_size,
+                lm.intermediate_size,
+            )?;
+            let free_before = allocator.free_bytes(gpu)?;
+            let load_started = std::time::Instant::now();
+            let engine = VoxCpm2Engine::load(&model_dir, &inspection.config, &stream)?;
+            let load_elapsed = load_started.elapsed();
+            let free_loaded = allocator.free_bytes(gpu)?;
+            let generation = if let Some(reference) = reference {
+                let bytes = std::fs::read(&reference)
+                    .with_context(|| format!("could not read {}", reference.display()))?;
+                let (samples, sample_rate) = audio_input::decode_wav(&bytes)?;
+                let samples = audio_input::resample(&samples, sample_rate, 16_000);
+                engine.generate_with_reference(
+                    &text,
+                    &samples,
+                    min_patches,
+                    max_patches,
+                    seed,
+                    &mut kernels,
+                )?
+            } else {
+                engine.generate_zero_shot(&text, min_patches, max_patches, seed, &mut kernels)?
+            };
+            write_pcm16_wav(&output, &generation.audio, generation.sample_rate)?;
+            let audio_seconds = generation.audio.len() as f64 / generation.sample_rate as f64;
+            println!(
+                "VoxCPM2 native: load={:.3}s, generate={:.3}s, audio={:.3}s, RTF={:.3}, patches={}, VRAM={:.2} GiB",
+                load_elapsed.as_secs_f64(),
+                generation.elapsed.as_secs_f64(),
+                audio_seconds,
+                generation.elapsed.as_secs_f64() / audio_seconds,
+                generation.patches,
+                free_before.saturating_sub(free_loaded) as f64 / 1024.0_f64.powi(3),
+            );
+            println!("wrote {}", output.display());
         }
         Command::CudaVibeVoiceBackboneSmoke { model_dir, gpu } => {
             let inspection = inspect_vibevoice_model(&model_dir)?;

@@ -6,7 +6,7 @@ use cudarc::driver::{CudaSlice, CudaStream};
 use std::path::Path;
 use std::sync::Arc;
 
-struct Bf16Linear {
+pub(crate) struct Bf16Linear {
     weight: CudaSlice<Bf16>,
     bias: Option<CudaSlice<Bf16>>,
     input: usize,
@@ -36,7 +36,7 @@ pub struct VoxCpm2ProjectionOutputs {
 }
 
 impl Bf16Linear {
-    fn load(
+    pub(crate) fn load(
         model_dir: &Path,
         prefix: &str,
         input: usize,
@@ -74,7 +74,15 @@ impl Bf16Linear {
         })
     }
 
-    fn forward_native(
+    pub(crate) fn input_size(&self) -> usize {
+        self.input
+    }
+
+    pub(crate) fn output_size(&self) -> usize {
+        self.output
+    }
+
+    pub(crate) fn forward_native(
         &self,
         input: &CudaSlice<Bf16>,
         rows: usize,
@@ -148,10 +156,10 @@ impl VoxCpm2Projections {
         let lm_input = deterministic_input(self.lm_to_dit.input, 0.007);
         let local_input = deterministic_input(self.enc_to_lm.input, 0.009);
         let fusion_input = deterministic_input(self.fusion_concat.input, 0.005);
-        let enc_to_lm = self.forward_host(&self.enc_to_lm, &local_input, kernels)?;
-        let lm_to_dit = self.forward_host(&self.lm_to_dit, &lm_input, kernels)?;
-        let res_to_dit = self.forward_host(&self.res_to_dit, &lm_input, kernels)?;
-        let fusion_concat = self.forward_host(&self.fusion_concat, &fusion_input, kernels)?;
+        let enc_to_lm = self.forward_host(&self.enc_to_lm, &local_input, 1, kernels)?;
+        let lm_to_dit = self.forward_host(&self.lm_to_dit, &lm_input, 1, kernels)?;
+        let res_to_dit = self.forward_host(&self.res_to_dit, &lm_input, 1, kernels)?;
+        let fusion_concat = self.forward_host(&self.fusion_concat, &fusion_input, 1, kernels)?;
         let fsq = self.fsq_host(&lm_input, kernels)?;
         let stop_logits = self.stop_host(&lm_input, kernels)?;
         ensure!(
@@ -179,6 +187,7 @@ impl VoxCpm2Projections {
         &self,
         linear: &Bf16Linear,
         input: &[f32],
+        rows: usize,
         kernels: &mut GpuKernels,
     ) -> anyhow::Result<Vec<f32>> {
         let input = input
@@ -187,8 +196,54 @@ impl VoxCpm2Projections {
             .map(Bf16::from_f32)
             .collect::<Vec<_>>();
         let input = self.stream.clone_htod(&input)?;
-        let output = linear.forward_native(&input, 1, kernels)?;
+        let output = linear.forward_native(&input, rows, kernels)?;
         self.download(&output)
+    }
+
+    pub(crate) fn encode_local(
+        &self,
+        input: &[f32],
+        rows: usize,
+        kernels: &mut GpuKernels,
+    ) -> anyhow::Result<Vec<f32>> {
+        self.forward_host(&self.enc_to_lm, input, rows, kernels)
+    }
+
+    pub(crate) fn flow_condition(
+        &self,
+        lm: &[f32],
+        residual: &[f32],
+        kernels: &mut GpuKernels,
+    ) -> anyhow::Result<Vec<f32>> {
+        let mut output = self.forward_host(&self.lm_to_dit, lm, 1, kernels)?;
+        output.extend(self.forward_host(&self.res_to_dit, residual, 1, kernels)?);
+        Ok(output)
+    }
+
+    pub(crate) fn fuse(
+        &self,
+        input: &[f32],
+        rows: usize,
+        kernels: &mut GpuKernels,
+    ) -> anyhow::Result<Vec<f32>> {
+        self.forward_host(&self.fusion_concat, input, rows, kernels)
+    }
+
+    pub(crate) fn quantize(
+        &self,
+        input: &[f32],
+        kernels: &mut GpuKernels,
+    ) -> anyhow::Result<Vec<f32>> {
+        self.fsq_host(input, kernels)
+    }
+
+    pub(crate) fn should_stop(
+        &self,
+        input: &[f32],
+        kernels: &mut GpuKernels,
+    ) -> anyhow::Result<bool> {
+        let logits = self.stop_host(input, kernels)?;
+        Ok(logits[1] > logits[0])
     }
 
     fn fsq_host(&self, input: &[f32], kernels: &mut GpuKernels) -> anyhow::Result<Vec<f32>> {

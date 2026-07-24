@@ -1,7 +1,9 @@
 use crate::VoxCpm2Config;
 use anyhow::ensure;
 use chew_kernel::GpuKernels;
-use chew_model_qwen3_tts::{Bf16, CodePredictorConfig, TalkerConfig, TalkerTransformer};
+use chew_model_qwen3_tts::{
+    Bf16, CodePredictorConfig, TalkerConfig, TalkerGenerationSession, TalkerTransformer,
+};
 use cudarc::driver::CudaStream;
 use std::collections::HashMap;
 use std::path::Path;
@@ -30,6 +32,11 @@ pub struct VoxCpm2TransformerSmoke {
     pub residual: Vec<f32>,
     pub encoder: Vec<f32>,
     pub dit: Vec<f32>,
+}
+
+pub struct VoxCpm2AutoregressiveSession {
+    base: TalkerGenerationSession<Bf16>,
+    residual: TalkerGenerationSession<Bf16>,
 }
 
 impl VoxCpm2BaseBackbone {
@@ -190,6 +197,86 @@ impl VoxCpm2TransformerBackbones {
             encoder,
             dit,
         })
+    }
+
+    pub(crate) fn dit_forward_batched(
+        &self,
+        input: &[f32],
+        tokens_per_batch: usize,
+        batches: usize,
+        kernels: &mut GpuKernels,
+    ) -> anyhow::Result<Vec<f32>> {
+        self.dit.forward_hidden_batched_full(
+            input,
+            tokens_per_batch,
+            batches,
+            &self.local_config,
+            kernels,
+        )
+    }
+
+    pub(crate) fn encoder_forward(
+        &self,
+        input: &[f32],
+        tokens: usize,
+        kernels: &mut GpuKernels,
+    ) -> anyhow::Result<Vec<f32>> {
+        self.encoder
+            .forward_hidden(input, tokens, tokens, &self.local_config, kernels)
+    }
+
+    pub(crate) fn start_autoregressive_session(
+        &self,
+        max_tokens: usize,
+        prompt_tokens: usize,
+        stream: &Arc<CudaStream>,
+    ) -> anyhow::Result<VoxCpm2AutoregressiveSession> {
+        Ok(VoxCpm2AutoregressiveSession {
+            base: self.base.transformer.start_session(
+                max_tokens,
+                prompt_tokens,
+                &self.base.config,
+                stream,
+            )?,
+            residual: self.residual.start_session(
+                max_tokens,
+                prompt_tokens,
+                &self.residual_config,
+                stream,
+            )?,
+        })
+    }
+
+    pub(crate) fn base_forward(
+        &self,
+        session: &mut VoxCpm2AutoregressiveSession,
+        input: &[f32],
+        tokens: usize,
+        kernels: &mut GpuKernels,
+    ) -> anyhow::Result<Vec<f32>> {
+        self.base.transformer.forward_session(
+            &mut session.base,
+            input,
+            tokens,
+            &self.base.config,
+            kernels,
+        )
+    }
+
+    pub(crate) fn residual_forward(
+        &self,
+        session: &mut VoxCpm2AutoregressiveSession,
+        input: &[f32],
+        tokens: usize,
+        kernels: &mut GpuKernels,
+    ) -> anyhow::Result<Vec<f32>> {
+        self.residual.forward_session(
+            &mut session.residual,
+            input,
+            tokens,
+            &self.residual_config,
+            kernels,
+        )
     }
 }
 

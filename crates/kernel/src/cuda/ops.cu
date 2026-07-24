@@ -2626,6 +2626,177 @@ __global__ void conv1d_causal_f16(const __half* __restrict__ x,
     }
 }
 
+__global__ void conv1d_causal_stride_f16(
+    const __half* __restrict__ x,
+    const __half* __restrict__ weight,
+    const __half* __restrict__ bias,
+    __half* __restrict__ out,
+    int in_channels,
+    int out_channels,
+    int input_len,
+    int output_len,
+    int kernel_size,
+    int stride,
+    int left_padding,
+    int groups) {
+    const int position = blockIdx.x;
+    const int out_channel = blockIdx.y;
+    if (out_channel >= out_channels || position >= output_len) return;
+    const int channels_per_group = in_channels / groups;
+    const int outputs_per_group = out_channels / groups;
+    const int group = out_channel / outputs_per_group;
+    const int input_start = group * channels_per_group;
+    const int work = channels_per_group * kernel_size;
+    float sum = 0.0f;
+    for (int item = threadIdx.x; item < work; item += blockDim.x) {
+        const int local_channel = item / kernel_size;
+        const int kernel_index = item % kernel_size;
+        const int input_position =
+            position * stride + kernel_index - left_padding;
+        if (input_position >= 0 && input_position < input_len) {
+            const int input_channel = input_start + local_channel;
+            const int input_index = input_channel * input_len + input_position;
+            const int weight_index =
+                (out_channel * channels_per_group + local_channel) * kernel_size
+                + kernel_index;
+            sum += __half2float(x[input_index]) * __half2float(weight[weight_index]);
+        }
+    }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+    }
+    __shared__ float warp_sums[8];
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    if (lane == 0) warp_sums[warp] = sum;
+    __syncthreads();
+    if (warp == 0) {
+        sum = lane < 8 ? warp_sums[lane] : 0.0f;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+        }
+        if (lane == 0) {
+            out[out_channel * output_len + position] =
+                __float2half(sum + __half2float(bias[out_channel]));
+        }
+    }
+}
+
+__global__ void conv1d_causal_f32(const float* __restrict__ x,
+                                  const float* __restrict__ weight,
+                                  const float* __restrict__ bias,
+                                  float* __restrict__ out,
+                                  int in_channels,
+                                  int out_channels,
+                                  int seq_len,
+                                  int kernel_size,
+                                  int dilation,
+                                  int groups) {
+    const int position = blockIdx.x;
+    const int out_channel = blockIdx.y;
+    if (out_channel >= out_channels || position >= seq_len) return;
+    const int channels_per_group = in_channels / groups;
+    const int outputs_per_group = out_channels / groups;
+    const int group = out_channel / outputs_per_group;
+    const int input_start = group * channels_per_group;
+    const int work = channels_per_group * kernel_size;
+    float sum = 0.0f;
+    for (int item = threadIdx.x; item < work; item += blockDim.x) {
+        const int local_channel = item / kernel_size;
+        const int kernel_index = item % kernel_size;
+        const int input_position =
+            position - (kernel_size - 1 - kernel_index) * dilation;
+        if (input_position >= 0) {
+            const int input_channel = input_start + local_channel;
+            sum += x[input_channel * seq_len + input_position]
+                * weight[(out_channel * channels_per_group + local_channel)
+                    * kernel_size + kernel_index];
+        }
+    }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+    __shared__ float warp_sums[8];
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    if (lane == 0) warp_sums[warp] = sum;
+    __syncthreads();
+    if (warp == 0) {
+        sum = lane < 8 ? warp_sums[lane] : 0.0f;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+        if (lane == 0) out[out_channel * seq_len + position] = sum + bias[out_channel];
+    }
+}
+
+__global__ void conv1d_causal_stride_f32(
+    const float* __restrict__ x,
+    const float* __restrict__ weight,
+    const float* __restrict__ bias,
+    float* __restrict__ out,
+    int in_channels,
+    int out_channels,
+    int input_len,
+    int output_len,
+    int kernel_size,
+    int stride,
+    int left_padding,
+    int groups) {
+    const int position = blockIdx.x;
+    const int out_channel = blockIdx.y;
+    if (out_channel >= out_channels || position >= output_len) return;
+    const int channels_per_group = in_channels / groups;
+    const int outputs_per_group = out_channels / groups;
+    const int group = out_channel / outputs_per_group;
+    const int input_start = group * channels_per_group;
+    const int work = channels_per_group * kernel_size;
+    float sum = 0.0f;
+    for (int item = threadIdx.x; item < work; item += blockDim.x) {
+        const int local_channel = item / kernel_size;
+        const int kernel_index = item % kernel_size;
+        const int input_position = position * stride + kernel_index - left_padding;
+        if (input_position >= 0 && input_position < input_len) {
+            const int input_channel = input_start + local_channel;
+            sum += x[input_channel * input_len + input_position]
+                * weight[(out_channel * channels_per_group + local_channel)
+                    * kernel_size + kernel_index];
+        }
+    }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+    __shared__ float warp_sums[8];
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    if (lane == 0) warp_sums[warp] = sum;
+    __syncthreads();
+    if (warp == 0) {
+        sum = lane < 8 ? warp_sums[lane] : 0.0f;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+        if (lane == 0) out[out_channel * output_len + position] = sum + bias[out_channel];
+    }
+}
+
+__global__ void snake_f32(const float* __restrict__ input,
+                          const float* __restrict__ alpha,
+                          float* __restrict__ output,
+                          int channels,
+                          int frames) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    const int n = channels * frames;
+    if (index < n) {
+        const float value = input[index];
+        const float frequency = alpha[index / frames];
+        const float periodic = sinf(frequency * value);
+        output[index] = value + periodic * periodic / (frequency + 1e-9f);
+    }
+}
+
 __global__ void conv1d_padded_f16(const __half* __restrict__ x,
                                   const __half* __restrict__ weight,
                                   const __half* __restrict__ bias,

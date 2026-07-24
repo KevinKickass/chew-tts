@@ -100,6 +100,10 @@ pub struct OpsKernels {
     softmax_topk: CudaFunction,
     fused_moe_router: CudaFunction,
     conv1d_causal_f16: CudaFunction,
+    conv1d_causal_stride_f16: CudaFunction,
+    conv1d_causal_f32: CudaFunction,
+    conv1d_causal_stride_f32: CudaFunction,
+    snake_f32: CudaFunction,
     conv1d_padded_f16: CudaFunction,
     conv1d_general_f16: CudaFunction,
     conv1d_causal_offset_f16: CudaFunction,
@@ -219,6 +223,10 @@ impl OpsKernels {
             softmax_topk: loader::get_fn(&module, "softmax_topk")?,
             fused_moe_router: loader::get_fn(&module, "fused_moe_router")?,
             conv1d_causal_f16: loader::get_fn(&module, "conv1d_causal_f16")?,
+            conv1d_causal_stride_f16: loader::get_fn(&module, "conv1d_causal_stride_f16")?,
+            conv1d_causal_f32: loader::get_fn(&module, "conv1d_causal_f32")?,
+            conv1d_causal_stride_f32: loader::get_fn(&module, "conv1d_causal_stride_f32")?,
+            snake_f32: loader::get_fn(&module, "snake_f32")?,
             conv1d_padded_f16: loader::get_fn(&module, "conv1d_padded_f16")?,
             conv1d_general_f16: loader::get_fn(&module, "conv1d_general_f16")?,
             conv1d_causal_offset_f16: loader::get_fn(&module, "conv1d_causal_offset_f16")?,
@@ -302,6 +310,189 @@ impl OpsKernels {
                 },
                 &mut args,
             )?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv1d_causal_stride_f16(
+        &self,
+        x: &CudaSlice<half::f16>,
+        weight: &CudaSlice<half::f16>,
+        bias: &CudaSlice<half::f16>,
+        out: &mut CudaSlice<half::f16>,
+        in_channels: u32,
+        out_channels: u32,
+        input_len: u32,
+        output_len: u32,
+        kernel_size: u32,
+        stride: u32,
+        left_padding: u32,
+        groups: u32,
+    ) -> Result<(), KernelError> {
+        let ic = in_channels as i32;
+        let oc = out_channels as i32;
+        let input = input_len as i32;
+        let output = output_len as i32;
+        let kernel = kernel_size as i32;
+        let stride_i = stride as i32;
+        let left_padding_i = left_padding as i32;
+        let groups_i = groups as i32;
+        let mut args: [*mut c_void; 12] = [
+            slice_ptr(x),
+            slice_ptr(weight),
+            slice_ptr(bias),
+            slice_ptr_mut(out),
+            scalar_ptr(&ic),
+            scalar_ptr(&oc),
+            scalar_ptr(&input),
+            scalar_ptr(&output),
+            scalar_ptr(&kernel),
+            scalar_ptr(&stride_i),
+            scalar_ptr(&left_padding_i),
+            scalar_ptr(&groups_i),
+        ];
+        unsafe {
+            self.fast.launch(
+                &self.conv1d_causal_stride_f16,
+                LaunchConfig {
+                    grid_dim: (output_len, out_channels, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                &mut args,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv1d_causal_f32(
+        &self,
+        x: &CudaSlice<f32>,
+        weight: &CudaSlice<f32>,
+        bias: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        in_channels: u32,
+        out_channels: u32,
+        seq_len: u32,
+        kernel_size: u32,
+        dilation: u32,
+        groups: u32,
+    ) -> Result<(), KernelError> {
+        let values = [
+            in_channels as i32,
+            out_channels as i32,
+            seq_len as i32,
+            kernel_size as i32,
+            dilation as i32,
+            groups as i32,
+        ];
+        let mut args: [*mut c_void; 10] = [
+            slice_ptr(x),
+            slice_ptr(weight),
+            slice_ptr(bias),
+            slice_ptr_mut(out),
+            scalar_ptr(&values[0]),
+            scalar_ptr(&values[1]),
+            scalar_ptr(&values[2]),
+            scalar_ptr(&values[3]),
+            scalar_ptr(&values[4]),
+            scalar_ptr(&values[5]),
+        ];
+        unsafe {
+            self.fast.launch(
+                &self.conv1d_causal_f32,
+                LaunchConfig {
+                    grid_dim: (seq_len, out_channels, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                &mut args,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv1d_causal_stride_f32(
+        &self,
+        x: &CudaSlice<f32>,
+        weight: &CudaSlice<f32>,
+        bias: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        in_channels: u32,
+        out_channels: u32,
+        input_len: u32,
+        output_len: u32,
+        kernel_size: u32,
+        stride: u32,
+        left_padding: u32,
+        groups: u32,
+    ) -> Result<(), KernelError> {
+        let values = [
+            in_channels as i32,
+            out_channels as i32,
+            input_len as i32,
+            output_len as i32,
+            kernel_size as i32,
+            stride as i32,
+            left_padding as i32,
+            groups as i32,
+        ];
+        let mut args: [*mut c_void; 12] = [
+            slice_ptr(x),
+            slice_ptr(weight),
+            slice_ptr(bias),
+            slice_ptr_mut(out),
+            scalar_ptr(&values[0]),
+            scalar_ptr(&values[1]),
+            scalar_ptr(&values[2]),
+            scalar_ptr(&values[3]),
+            scalar_ptr(&values[4]),
+            scalar_ptr(&values[5]),
+            scalar_ptr(&values[6]),
+            scalar_ptr(&values[7]),
+        ];
+        unsafe {
+            self.fast.launch(
+                &self.conv1d_causal_stride_f32,
+                LaunchConfig {
+                    grid_dim: (output_len, out_channels, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                &mut args,
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn snake_f32(
+        &self,
+        input: &CudaSlice<f32>,
+        alpha: &CudaSlice<f32>,
+        output: &mut CudaSlice<f32>,
+        channels: u32,
+        frames: u32,
+    ) -> Result<(), KernelError> {
+        let n = channels * frames;
+        let values = [channels as i32, frames as i32];
+        let mut args = [
+            slice_ptr(input),
+            slice_ptr(alpha),
+            slice_ptr_mut(output),
+            scalar_ptr(&values[0]),
+            scalar_ptr(&values[1]),
+        ];
+        unsafe {
+            self.fast.fire(
+                &self.snake_f32,
+                (n.div_ceil(256), 1, 1),
+                (256, 1, 1),
+                0,
+                &mut args,
+            );
         }
         Ok(())
     }

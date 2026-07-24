@@ -29,8 +29,9 @@ without carrying an LLM API or llama.cpp dependency.
 
 ## Status
 
-Qwen3-TTS is end-to-end usable. Native Kokoro and Chatterbox Multilingual V3
-support is under active development.
+Qwen3-TTS, Kokoro, Chatterbox Multilingual V3, VibeVoice-Realtime, and
+VoxCPM2 have native end-to-end CUDA paths. VoxCPM2 currently exposes its
+generation CLI while its HTTP/Fleet adapter is being connected.
 
 Implemented:
 
@@ -92,6 +93,11 @@ Implemented:
 - the complete native HiFT neural-source-filter vocoder: F0 predictor,
   harmonic source, GPU upsampling and Snake ResBlocks, 16-point STFT/ISTFT,
   and 24-kHz waveform output.
+- native VibeVoice-Realtime BF16 text/TTS backbones, cached voice prompts,
+  diffusion sampling, causal streaming codec, and German/English generation;
+- native VoxCPM2 with all 60 MiniCPM4/local-DiT layers, LongRoPE, FSQ,
+  CFG-Zero* Euler flow, FP32 reference encoder, mixed-precision 48-kHz
+  AudioVAE decoder, zero-shot synthesis, and reference-voice cloning.
 
 Next:
 
@@ -145,6 +151,7 @@ RTX 3080 10 GB:
 | Qwen3-TTS 1.7B VoiceDesign | designed voice | 4.14 s | 3,901 MiB | 8.320 s | 1.967 s | 0.2364 | 4.23x |
 | Qwen3-TTS 1.7B CustomVoice | `serena` | 4.13 s | 3,948 MiB | 9.200 s | 2.148 s | 0.2334 | 4.28x |
 | Qwen3-TTS 1.7B Base | cached ICL clone | 4.36 s | 4,040 MiB | 13.280 s | 3.191 s | 0.2403 | 4.16x |
+| VoxCPM2 | zero-shot | 1.88 s | 4,444 MiB | 5.760 s | 2.333 s | 0.4050 | 2.47x |
 
 All rows use the same English input, seed 4242, native mono WAV output, one
 worker, one discarded warm-up, and the median of five sequential requests
@@ -166,6 +173,7 @@ include a German example:
 | Qwen3-TTS 1.7B VoiceDesign | [MP3](samples/qwen3-voice-design-en.mp3) | [MP3, whispered](samples/qwen3-voice-design-de.mp3) |
 | Qwen3-TTS 1.7B CustomVoice | [MP3](samples/qwen3-custom-en.mp3) | [MP3](samples/qwen3-custom-de.mp3) |
 | Qwen3-TTS 1.7B Base | [MP3](samples/qwen3-base-en.mp3) | [MP3](samples/qwen3-base-de.mp3) |
+| VoxCPM2 | — | [zero-shot](samples/voxcpm2-de.mp3), [reference voice](samples/voxcpm2-reference-de.mp3) |
 
 ### Kokoro concurrency
 
@@ -209,6 +217,8 @@ crates/
   model-qwen3-tts/      Qwen configuration and inference
   model-kokoro/         Kokoro checkpoint, voice, and inference path
   model-chatterbox/     Chatterbox Multilingual V3 T3 and S3Gen path
+  model-vibevoice/      VibeVoice-Realtime generation and streaming codec
+  model-voxcpm2/        VoxCPM2 LM, flow, reference encoder, and AudioVAE
   kernel/               inherited CUDA/NVRTC kernels
   vram/                 inherited VRAM ownership and budgeting
 ```
@@ -247,6 +257,23 @@ Inspect all Chatterbox Multilingual V3 components:
 ```bash
 cargo run --release -p chew-tts -- \
   inspect-chatterbox /models/chatterbox-v3
+```
+
+Prepare the official VoxCPM2 AudioVAE once, then generate zero-shot or with a
+reference voice. Python/PyTorch are used only by the conversion step; the
+resulting inference path is the standalone Rust binary:
+
+```bash
+python scripts/convert_voxcpm2_audiovae.py /models/VoxCPM2
+
+cargo run --release -p chew-tts -- \
+  cuda-vox-cpm2-generate /models/VoxCPM2 \
+  'Hallo aus dem nativen VoxCPM2 Backend.' speech.wav
+
+cargo run --release -p chew-tts -- \
+  cuda-vox-cpm2-generate /models/VoxCPM2 \
+  'Diese Stimme wurde aus der Referenz übernommen.' cloned.wav \
+  --reference reference.wav
 ```
 
 Run the native Chatterbox T3 CUDA stack:

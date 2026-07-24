@@ -1,6 +1,8 @@
 mod backbone;
 mod config;
 mod decoder;
+mod dit;
+mod engine;
 mod projections;
 
 pub use backbone::{VoxCpm2BaseBackbone, VoxCpm2TransformerBackbones, VoxCpm2TransformerSmoke};
@@ -8,7 +10,9 @@ pub use config::{
     AudioVaeConfig, CfmConfig, DitConfig, LocalTransformerConfig, MiniCpm4Config,
     RopeScalingConfig, VoxCpm2Config,
 };
-pub use decoder::VoxCpm2AudioDecoder;
+pub use decoder::{VoxCpm2AudioDecoder, VoxCpm2AudioEncoder};
+pub use dit::VoxCpm2FlowDecoder;
+pub use engine::{VoxCpm2Engine, VoxCpm2Generation};
 pub use projections::{VoxCpm2ProjectionOutputs, VoxCpm2Projections};
 
 use chew_safetensors::{MappedSafetensors, TensorInfo};
@@ -28,7 +32,12 @@ pub fn inspect_model(model_dir: impl AsRef<Path>) -> Result<VoxCpm2Inspection, E
     let config: VoxCpm2Config = serde_json::from_slice(&fs::read(model_dir.join("config.json"))?)?;
     config.validate().map_err(Error::InvalidConfig)?;
     let weight_path = model_dir.join("model.safetensors");
-    let audio_vae_path = model_dir.join("audiovae.pth");
+    let safe_audio_vae_path = model_dir.join("audiovae.safetensors");
+    let audio_vae_path = if safe_audio_vae_path.is_file() {
+        safe_audio_vae_path
+    } else {
+        model_dir.join("audiovae.pth")
+    };
     if !weight_path.is_file() {
         return Err(Error::MissingFile(weight_path));
     }

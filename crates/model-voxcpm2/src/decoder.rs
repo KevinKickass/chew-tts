@@ -41,6 +41,30 @@ struct DecoderStage {
     residuals: Vec<ResidualUnit>,
 }
 
+struct F32Conv1d {
+    weight: CudaSlice<f32>,
+    bias: CudaSlice<f32>,
+    input_channels: usize,
+    output_channels: usize,
+    kernel: usize,
+    dilation: usize,
+    groups: usize,
+}
+
+struct F32ResidualUnit {
+    first_alpha: CudaSlice<f32>,
+    first_conv: F32Conv1d,
+    second_alpha: CudaSlice<f32>,
+    second_conv: F32Conv1d,
+}
+
+struct EncoderBlock {
+    residuals: Vec<F32ResidualUnit>,
+    alpha: CudaSlice<f32>,
+    downsample: F32Conv1d,
+    stride: usize,
+}
+
 /// Native mixed-precision VoxCPM2 48-kHz AudioVAE decoder.
 ///
 /// The official VAE runs in FP32. Chew folds weight normalization once while
@@ -55,6 +79,169 @@ pub struct VoxCpm2AudioDecoder {
     latent_dim: usize,
     samples_per_latent: usize,
     stream: Arc<CudaStream>,
+}
+
+pub struct VoxCpm2AudioEncoder {
+    stem: F32Conv1d,
+    blocks: Vec<EncoderBlock>,
+    mean: F32Conv1d,
+    hop_length: usize,
+    latent_dim: usize,
+    stream: Arc<CudaStream>,
+}
+
+impl VoxCpm2AudioEncoder {
+    pub fn load(
+        model_dir: &Path,
+        config: &VoxCpm2Config,
+        stream: &Arc<CudaStream>,
+    ) -> anyhow::Result<Self> {
+        ensure!(
+            model_dir.join("audiovae.safetensors").is_file(),
+            "native VoxCPM2 requires converted audiovae.safetensors"
+        );
+        let mut channels = config.audio_vae_config.encoder_dim;
+        let stem = load_conv_f32(model_dir, "encoder.block.0", 1, channels, 7, 1, 1, stream)?;
+        let mut blocks = Vec::with_capacity(config.audio_vae_config.encoder_rates.len());
+        for (block_index, &stride) in config.audio_vae_config.encoder_rates.iter().enumerate() {
+            let prefix = format!("encoder.block.{}.block", block_index + 1);
+            let mut residuals = Vec::with_capacity(3);
+            for (unit, dilation) in [1, 3, 9].into_iter().enumerate() {
+                let unit_prefix = format!("{prefix}.{unit}.block");
+                residuals.push(F32ResidualUnit {
+                    first_alpha: load_vector_f32(
+                        model_dir,
+                        &format!("{unit_prefix}.0.alpha"),
+                        channels,
+                        stream,
+                    )?,
+                    first_conv: load_conv_f32(
+                        model_dir,
+                        &format!("{unit_prefix}.1"),
+                        channels,
+                        channels,
+                        7,
+                        dilation,
+                        channels,
+                        stream,
+                    )?,
+                    second_alpha: load_vector_f32(
+                        model_dir,
+                        &format!("{unit_prefix}.2.alpha"),
+                        channels,
+                        stream,
+                    )?,
+                    second_conv: load_conv_f32(
+                        model_dir,
+                        &format!("{unit_prefix}.3"),
+                        channels,
+                        channels,
+                        1,
+                        1,
+                        1,
+                        stream,
+                    )?,
+                });
+            }
+            let alpha = load_vector_f32(model_dir, &format!("{prefix}.3.alpha"), channels, stream)?;
+            let output_channels = channels * 2;
+            let downsample = load_conv_f32(
+                model_dir,
+                &format!("{prefix}.4"),
+                channels,
+                output_channels,
+                stride * 2,
+                1,
+                1,
+                stream,
+            )?;
+            blocks.push(EncoderBlock {
+                residuals,
+                alpha,
+                downsample,
+                stride,
+            });
+            channels = output_channels;
+        }
+        let mean = load_conv_f32(
+            model_dir,
+            "encoder.fc_mu",
+            channels,
+            config.audio_vae_config.latent_dim,
+            3,
+            1,
+            1,
+            stream,
+        )?;
+        Ok(Self {
+            stem,
+            blocks,
+            mean,
+            hop_length: config.audio_vae_config.encoder_rates.iter().product(),
+            latent_dim: config.audio_vae_config.latent_dim,
+            stream: Arc::clone(stream),
+        })
+    }
+
+    /// Encode 16-kHz mono PCM to frame-major 64-dimensional AudioVAE latents.
+    pub fn encode(&self, audio: &[f32], kernels: &mut GpuKernels) -> anyhow::Result<Vec<f32>> {
+        ensure!(!audio.is_empty(), "VoxCPM2 reference audio is empty");
+        ensure!(
+            audio.iter().all(|value| value.is_finite()),
+            "VoxCPM2 reference audio contains non-finite samples"
+        );
+        let padded_len = audio.len().div_ceil(self.hop_length) * self.hop_length;
+        let mut host = audio.to_vec();
+        host.resize(padded_len, 0.0);
+        let mut frames = padded_len;
+        let input = self.stream.clone_htod(&host)?;
+        let mut hidden = conv_forward_f32(&self.stream, &input, frames, &self.stem, kernels)?;
+        for block in &self.blocks {
+            for residual in &block.residuals {
+                hidden = residual_forward_f32(&self.stream, hidden, frames, residual, kernels)?;
+            }
+            let mut activated = self.stream.alloc_zeros::<f32>(hidden.len())?;
+            kernels.ops.snake_f32(
+                &hidden,
+                &block.alpha,
+                &mut activated,
+                block.downsample.input_channels as u32,
+                frames as u32,
+            )?;
+            let output_frames = frames.div_ceil(block.stride);
+            let mut downsampled = self
+                .stream
+                .alloc_zeros::<f32>(block.downsample.output_channels * output_frames)?;
+            kernels.ops.conv1d_causal_stride_f32(
+                &activated,
+                &block.downsample.weight,
+                &block.downsample.bias,
+                &mut downsampled,
+                block.downsample.input_channels as u32,
+                block.downsample.output_channels as u32,
+                frames as u32,
+                output_frames as u32,
+                block.downsample.kernel as u32,
+                block.stride as u32,
+                block.stride as u32,
+                block.downsample.groups as u32,
+            )?;
+            hidden = downsampled;
+            frames = output_frames;
+        }
+        hidden = conv_forward_f32(&self.stream, &hidden, frames, &self.mean, kernels)?;
+        self.stream.synchronize()?;
+        let mut channel_first = vec![0.0f32; self.latent_dim * frames];
+        self.stream.memcpy_dtoh(&hidden, &mut channel_first)?;
+        let mut frame_major = vec![0.0f32; channel_first.len()];
+        for frame in 0..frames {
+            for channel in 0..self.latent_dim {
+                frame_major[frame * self.latent_dim + channel] =
+                    channel_first[channel * frames + frame];
+            }
+        }
+        Ok(frame_major)
+    }
 }
 
 impl VoxCpm2AudioDecoder {
@@ -373,6 +560,30 @@ fn load_conv(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+fn load_conv_f32(
+    model_dir: &Path,
+    prefix: &str,
+    input: usize,
+    output: usize,
+    kernel: usize,
+    dilation: usize,
+    groups: usize,
+    stream: &Arc<CudaStream>,
+) -> anyhow::Result<F32Conv1d> {
+    let weight = load_weight_norm_f32(model_dir, prefix, output, output, input / groups, kernel)?;
+    let bias = load_bias_f32(model_dir, prefix, output)?;
+    Ok(F32Conv1d {
+        weight: stream.clone_htod(&weight)?,
+        bias: stream.clone_htod(&bias)?,
+        input_channels: input,
+        output_channels: output,
+        kernel,
+        dilation,
+        groups,
+    })
+}
+
 fn load_transpose(
     model_dir: &Path,
     prefix: &str,
@@ -402,6 +613,22 @@ fn load_weight_norm(
     dim1: usize,
     kernel: usize,
 ) -> anyhow::Result<Vec<f16>> {
+    Ok(
+        load_weight_norm_f32(model_dir, prefix, norm_channels, dim0, dim1, kernel)?
+            .into_iter()
+            .map(f16::from_f32)
+            .collect(),
+    )
+}
+
+fn load_weight_norm_f32(
+    model_dir: &Path,
+    prefix: &str,
+    norm_channels: usize,
+    dim0: usize,
+    dim1: usize,
+    kernel: usize,
+) -> anyhow::Result<Vec<f32>> {
     let g_name = format!("{prefix}.weight_g");
     let v_name = format!("{prefix}.weight_v");
     let g =
@@ -417,17 +644,24 @@ fn load_weight_norm(
     for (channel, values) in v.values.chunks_exact(block).enumerate() {
         let norm = values.iter().map(|value| value * value).sum::<f32>().sqrt();
         let scale = g.values[channel] / norm;
-        output.extend(values.iter().map(|value| f16::from_f32(value * scale)));
+        output.extend(values.iter().map(|value| value * scale));
     }
     Ok(output)
 }
 
 fn load_bias(model_dir: &Path, prefix: &str, size: usize) -> anyhow::Result<Vec<f16>> {
+    Ok(load_bias_f32(model_dir, prefix, size)?
+        .into_iter()
+        .map(f16::from_f32)
+        .collect())
+}
+
+fn load_bias_f32(model_dir: &Path, prefix: &str, size: usize) -> anyhow::Result<Vec<f32>> {
     let name = format!("{prefix}.bias");
     let tensor =
         load_f32_tensor(model_dir, &name).with_context(|| format!("could not load {name}"))?;
     ensure!(tensor.shape == [size], "{name} has unexpected shape");
-    Ok(tensor.values.into_iter().map(f16::from_f32).collect())
+    Ok(tensor.values)
 }
 
 fn load_vector(
@@ -445,6 +679,18 @@ fn load_vector(
         .map(f16::from_f32)
         .collect::<Vec<_>>();
     Ok(stream.clone_htod(&values)?)
+}
+
+fn load_vector_f32(
+    model_dir: &Path,
+    name: &str,
+    size: usize,
+    stream: &Arc<CudaStream>,
+) -> anyhow::Result<CudaSlice<f32>> {
+    let tensor =
+        load_f32_tensor(model_dir, name).with_context(|| format!("could not load {name}"))?;
+    ensure!(tensor.values.len() == size, "{name} has unexpected shape");
+    Ok(stream.clone_htod(&tensor.values)?)
 }
 
 fn load_condition(
@@ -465,4 +711,57 @@ fn load_condition(
         .map(f16::from_f32)
         .collect::<Vec<_>>();
     Ok(stream.clone_htod(&values)?)
+}
+
+fn conv_forward_f32(
+    stream: &Arc<CudaStream>,
+    input: &CudaSlice<f32>,
+    frames: usize,
+    conv: &F32Conv1d,
+    kernels: &mut GpuKernels,
+) -> anyhow::Result<CudaSlice<f32>> {
+    let mut output = stream.alloc_zeros::<f32>(conv.output_channels * frames)?;
+    kernels.ops.conv1d_causal_f32(
+        input,
+        &conv.weight,
+        &conv.bias,
+        &mut output,
+        conv.input_channels as u32,
+        conv.output_channels as u32,
+        frames as u32,
+        conv.kernel as u32,
+        conv.dilation as u32,
+        conv.groups as u32,
+    )?;
+    Ok(output)
+}
+
+fn residual_forward_f32(
+    stream: &Arc<CudaStream>,
+    mut input: CudaSlice<f32>,
+    frames: usize,
+    unit: &F32ResidualUnit,
+    kernels: &mut GpuKernels,
+) -> anyhow::Result<CudaSlice<f32>> {
+    let channels = unit.first_conv.input_channels;
+    let mut activated = stream.alloc_zeros::<f32>(input.len())?;
+    kernels.ops.snake_f32(
+        &input,
+        &unit.first_alpha,
+        &mut activated,
+        channels as u32,
+        frames as u32,
+    )?;
+    let hidden = conv_forward_f32(stream, &activated, frames, &unit.first_conv, kernels)?;
+    kernels.ops.snake_f32(
+        &hidden,
+        &unit.second_alpha,
+        &mut activated,
+        channels as u32,
+        frames as u32,
+    )?;
+    let hidden = conv_forward_f32(stream, &activated, frames, &unit.second_conv, kernels)?;
+    let elements = input.len() as u32;
+    kernels.ops.add_inplace_f32(&mut input, &hidden, elements)?;
+    Ok(input)
 }
