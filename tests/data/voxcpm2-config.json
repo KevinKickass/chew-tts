@@ -65,6 +65,7 @@
     "latent_dim": 64,
     "decoder_dim": 2048,
     "decoder_rates": [8, 6, 5, 2, 2, 2],
+    "sr_bin_boundaries": [20000, 30000, 40000],
     "sample_rate": 16000,
     "out_sample_rate": 48000
   },

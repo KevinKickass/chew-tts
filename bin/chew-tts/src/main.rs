@@ -24,7 +24,8 @@ use chew_model_vibevoice::{
 };
 use chew_model_voxcpm2::{
     VoxCpm2AudioDecoder, VoxCpm2AudioEncoder, VoxCpm2Engine, VoxCpm2FlowDecoder,
-    VoxCpm2Projections, VoxCpm2TransformerBackbones, inspect_model as inspect_voxcpm2_model,
+    VoxCpm2Projections, VoxCpm2TransformerBackbones, convert_audiovae_checkpoint,
+    inspect_model as inspect_voxcpm2_model,
 };
 use clap::{Parser, Subcommand};
 use std::io::{Seek, SeekFrom, Write};
@@ -112,6 +113,11 @@ enum Command {
     /// Validate a VoxCPM2 checkpoint and print its native geometry.
     InspectVoxCpm2 {
         /// Directory containing config.json, model.safetensors, and audiovae.pth.
+        model_dir: PathBuf,
+    },
+    /// Convert the official VoxCPM2 AudioVAE checkpoint to Safetensors.
+    ConvertVoxCpm2 {
+        /// Directory containing audiovae.pth.
         model_dir: PathBuf,
     },
     /// Load and execute the native VoxCPM2 MiniCPM4 base LM on CUDA.
@@ -776,6 +782,12 @@ fn main() -> anyhow::Result<()> {
                 inspection.total_weight_bytes as f64 / 1024.0_f64.powi(3),
                 std::fs::metadata(&inspection.audio_vae_path)?.len() as f64 / 1024.0_f64.powi(2),
             );
+        }
+        Command::ConvertVoxCpm2 { model_dir } => {
+            let source = model_dir.join("audiovae.pth");
+            let destination = model_dir.join("audiovae.safetensors");
+            convert_audiovae_checkpoint(&source, &destination)?;
+            println!("converted {}", destination.display());
         }
         Command::CudaVoxCpm2BackboneSmoke { model_dir, gpu } => {
             let inspection = inspect_voxcpm2_model(&model_dir)?;

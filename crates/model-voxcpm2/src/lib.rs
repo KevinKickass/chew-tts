@@ -15,6 +15,103 @@ pub use dit::VoxCpm2FlowDecoder;
 pub use engine::{VoxCpm2Engine, VoxCpm2Generation};
 pub use projections::{VoxCpm2ProjectionOutputs, VoxCpm2Projections};
 
+/// Convert the official AudioVAE checkpoint once into mmap-friendly
+/// Safetensors without a Python/PyTorch installation.
+pub fn convert_audiovae_checkpoint(source: &Path, destination: &Path) -> anyhow::Result<()> {
+    use anyhow::{Context, ensure};
+    use candle_core::{DType as CandleDType, pickle::PthTensors};
+    use safetensors::Dtype;
+    use safetensors::tensor::{TensorView, serialize_to_file};
+    use std::collections::HashMap;
+
+    ensure!(source.is_file(), "missing checkpoint {}", source.display());
+    let checkpoint = PthTensors::new(source, Some("state_dict"))
+        .with_context(|| format!("could not read {}", source.display()))?;
+    ensure!(
+        !checkpoint.tensor_infos().is_empty(),
+        "AudioVAE checkpoint contains no tensors"
+    );
+    struct OwnedTensor {
+        dtype: Dtype,
+        shape: Vec<usize>,
+        bytes: Vec<u8>,
+    }
+    let mut owned = HashMap::new();
+    for name in checkpoint.tensor_infos().keys() {
+        let tensor = checkpoint
+            .get(name)?
+            .with_context(|| format!("AudioVAE tensor {name:?} disappeared"))?;
+        let (dtype, bytes) = match tensor.dtype() {
+            CandleDType::F32 => {
+                let values = tensor.flatten_all()?.to_vec1::<f32>()?;
+                let mut bytes = Vec::with_capacity(values.len() * 4);
+                for value in values {
+                    bytes.extend_from_slice(&value.to_le_bytes());
+                }
+                (Dtype::F32, bytes)
+            }
+            CandleDType::I32 => {
+                let values = tensor.flatten_all()?.to_vec1::<i32>()?;
+                let mut bytes = Vec::with_capacity(values.len() * 4);
+                for value in values {
+                    bytes.extend_from_slice(&value.to_le_bytes());
+                }
+                (Dtype::I32, bytes)
+            }
+            other => anyhow::bail!("unsupported AudioVAE dtype {other:?} for {name}"),
+        };
+        owned.insert(
+            name.clone(),
+            OwnedTensor {
+                dtype,
+                shape: tensor.dims().to_vec(),
+                bytes,
+            },
+        );
+    }
+    // Candle intentionally skips PyTorch's IntStorage. This immutable buffer is
+    // also declared in the official config, so reconstruct it from that source.
+    let config_path = source
+        .parent()
+        .context("AudioVAE checkpoint has no parent directory")?
+        .join("config.json");
+    let config: VoxCpm2Config = serde_json::from_slice(
+        &std::fs::read(&config_path)
+            .with_context(|| format!("could not read {}", config_path.display()))?,
+    )?;
+    let boundaries = config.audio_vae_config.sr_bin_boundaries;
+    let mut boundary_bytes = Vec::with_capacity(boundaries.len() * 4);
+    for boundary in &boundaries {
+        boundary_bytes.extend_from_slice(&(*boundary as i32).to_le_bytes());
+    }
+    owned.insert(
+        "decoder.sr_bin_boundaries".to_string(),
+        OwnedTensor {
+            dtype: Dtype::I32,
+            shape: vec![boundaries.len()],
+            bytes: boundary_bytes,
+        },
+    );
+    let views = owned
+        .iter()
+        .map(|(name, tensor)| {
+            Ok((
+                name.as_str(),
+                TensorView::new(tensor.dtype, tensor.shape.clone(), &tensor.bytes)?,
+            ))
+        })
+        .collect::<Result<HashMap<_, _>, safetensors::SafeTensorError>>()?;
+    serialize_to_file(
+        &views,
+        Some(HashMap::from([
+            ("format".into(), "pt".into()),
+            ("source".into(), "openbmb/VoxCPM2 audiovae.pth".into()),
+        ])),
+        destination,
+    )?;
+    Ok(())
+}
+
 use chew_safetensors::{MappedSafetensors, TensorInfo};
 use std::fs;
 use std::path::{Path, PathBuf};

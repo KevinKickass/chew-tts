@@ -82,6 +82,7 @@ pub struct AudioVaeConfig {
     pub latent_dim: usize,
     pub decoder_dim: usize,
     pub decoder_rates: Vec<usize>,
+    pub sr_bin_boundaries: Vec<usize>,
     pub sample_rate: usize,
     pub out_sample_rate: usize,
 }
@@ -138,6 +139,10 @@ impl VoxCpm2Config {
             self.audio_vae_config.sample_rate == 16_000
                 && self.audio_vae_config.out_sample_rate == 48_000,
             "unexpected VoxCPM2 audio rates"
+        );
+        ensure!(
+            self.audio_vae_config.sr_bin_boundaries == [20_000, 30_000, 40_000],
+            "unexpected VoxCPM2 sample-rate bins"
         );
         Ok(())
     }

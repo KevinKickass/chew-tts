@@ -348,11 +348,13 @@ name = "chew-model-voxcpm2"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "candle-core",
  "chew-kernel",
  "chew-model-qwen3-tts",
  "chew-safetensors",
  "cudarc",
  "half",
+ "safetensors 0.6.2",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

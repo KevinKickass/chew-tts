@@ -7,6 +7,7 @@ description = "Native VoxCPM2 model inspection and inference for Chew TTS"
 
 [dependencies]
 anyhow.workspace = true
+candle-core.workspace = true
 chew-kernel.workspace = true
 chew-model-qwen3-tts.workspace = true
 chew-safetensors.workspace = true
@@ -14,5 +15,6 @@ cudarc.workspace = true
 half.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+safetensors.workspace = true
 thiserror.workspace = true
 tokenizers.workspace = true
