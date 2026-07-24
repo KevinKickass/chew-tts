@@ -41,8 +41,10 @@ pub struct DecoderConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct DiffusionHeadConfig {
+    pub ddpm_beta_schedule: String,
     pub ddpm_num_inference_steps: usize,
     pub ddpm_num_steps: usize,
+    pub diffusion_type: String,
     pub head_ffn_ratio: f64,
     pub head_layers: usize,
     pub hidden_size: usize,
@@ -80,6 +82,12 @@ impl VibeVoiceConfig {
             self.diffusion_head_config.model_type == "vibevoice_diffusion_head",
             "unsupported VibeVoice diffusion head {:?}",
             self.diffusion_head_config.model_type
+        );
+        ensure!(
+            self.diffusion_head_config.diffusion_type == "ddpm"
+                && self.diffusion_head_config.ddpm_beta_schedule == "cosine"
+                && self.diffusion_head_config.prediction_type == "v_prediction",
+            "unsupported VibeVoice diffusion schedule"
         );
         ensure!(
             self.torch_dtype == "bfloat16" && self.decoder_config.torch_dtype == "bfloat16",

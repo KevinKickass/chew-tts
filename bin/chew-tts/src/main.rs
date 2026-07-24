@@ -18,7 +18,7 @@ use chew_model_qwen3_tts::{
     inspect_model, load_f16_tensor,
 };
 use chew_model_vibevoice::{
-    VibeVoiceBackbones, VibeVoiceDiffusionHead, VibeVoicePrompt,
+    VibeVoiceAcousticDecoder, VibeVoiceBackbones, VibeVoiceDiffusionHead, VibeVoicePrompt,
     inspect_model as inspect_vibevoice_model,
 };
 use clap::{Parser, Subcommand};
@@ -115,6 +115,14 @@ enum Command {
         gpu: usize,
         #[arg(long, default_value_t = 999.0)]
         timestep: f32,
+    },
+    /// Decode deterministic acoustic latents through the native CUDA codec.
+    CudaVibeVoiceDecoderSmoke {
+        model_dir: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        gpu: usize,
+        #[arg(long, default_value_t = 1)]
+        frames: usize,
     },
     /// Validate a Kokoro model and print its native checkpoint geometry.
     InspectKokoro {
@@ -742,6 +750,43 @@ fn main() -> anyhow::Result<()> {
                     .map(|value| f64::from(*value) * f64::from(*value))
                     .sum::<f64>(),
                 &output[..8],
+            );
+        }
+        Command::CudaVibeVoiceDecoderSmoke {
+            model_dir,
+            gpu,
+            frames,
+        } => {
+            anyhow::ensure!(frames > 0, "frames must be positive");
+            let inspection = inspect_vibevoice_model(&model_dir)?;
+            let allocator = chew_vram::VramAllocator::init()?;
+            anyhow::ensure!(gpu < allocator.gpu_count(), "GPU index out of range");
+            let stream = std::sync::Arc::clone(allocator.stream(gpu));
+            let mut kernels = chew_kernel::GpuKernels::load(&stream, 8192 * 2048, 8192)?;
+            let free_before = allocator.free_bytes(gpu)?;
+            let load_started = std::time::Instant::now();
+            let decoder = VibeVoiceAcousticDecoder::load(&model_dir, &inspection.config, &stream)?;
+            let load_elapsed = load_started.elapsed();
+            let free_loaded = allocator.free_bytes(gpu)?;
+            let latents = (0..frames * inspection.config.acoustic_vae_dim)
+                .map(|index| ((index as f32 + 1.0) * 0.031).sin() * 0.1)
+                .collect::<Vec<_>>();
+            let started = std::time::Instant::now();
+            let samples = decoder.decode(&latents, &mut kernels)?;
+            let elapsed = started.elapsed();
+            println!(
+                "VibeVoice decoder CUDA: load={:.3}s, decode={:.3}ms, VRAM={:.2} GiB, samples={}",
+                load_elapsed.as_secs_f64(),
+                elapsed.as_secs_f64() * 1_000.0,
+                free_before.saturating_sub(free_loaded) as f64 / 1024.0_f64.powi(3),
+                samples.len(),
+            );
+            println!(
+                "sum={:.9}, peak={:.7}, finite={}, first={:?}",
+                samples.iter().map(|value| f64::from(*value)).sum::<f64>(),
+                samples.iter().copied().map(f32::abs).fold(0.0, f32::max),
+                samples.iter().all(|value| value.is_finite()),
+                &samples[..samples.len().min(8)],
             );
         }
         Command::InspectKokoro {

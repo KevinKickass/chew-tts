@@ -24,8 +24,10 @@
     "vocab_size": 151936
   },
   "diffusion_head_config": {
+    "ddpm_beta_schedule": "cosine",
     "ddpm_num_inference_steps": 20,
     "ddpm_num_steps": 1000,
+    "diffusion_type": "ddpm",
     "head_ffn_ratio": 3.0,
     "head_layers": 4,
     "hidden_size": 896,
