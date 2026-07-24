@@ -1,4 +1,3 @@
-use crate::audio_input::resample;
 use crate::chatterbox_engine::ChatterboxEngine;
 use crate::kokoro_engine::KokoroEngine;
 use crate::vibevoice_engine::VibeVoiceEngine;
@@ -636,8 +635,7 @@ async fn handle_fleet_connection(
     let audio = submit(&state, request)
         .await
         .map_err(|_| "synthesis request was rejected".to_string())?;
-    let samples = fleet_samples(audio.samples, audio.sample_rate);
-    let raw = raw_f32le(samples, FLEET_SAMPLE_RATE, speed).await?;
+    let raw = raw_f32le(audio.samples, audio.sample_rate, speed).await?;
     stream
         .write_all(&raw)
         .await
@@ -679,8 +677,7 @@ async fn handle_fleet_stream(
     while let Some(segment) = response_rx.recv().await {
         match segment {
             Ok(audio) => {
-                let samples = fleet_samples(audio.samples, audio.sample_rate);
-                let raw = raw_f32le(samples, FLEET_SAMPLE_RATE, speed).await?;
+                let raw = raw_f32le(audio.samples, audio.sample_rate, speed).await?;
                 write_stream_frame(&mut stream, AUDIO, &raw).await?;
             }
             Err(message) => {
@@ -1080,14 +1077,6 @@ fn encoded_duration_header(audio: &GeneratedAudio, speed: f32) -> u64 {
 
 fn segment_gap_samples(sample_rate: u32) -> usize {
     (sample_rate as usize * SEGMENT_GAP_SAMPLES) / FLEET_SAMPLE_RATE as usize
-}
-
-fn fleet_samples(samples: Vec<f32>, sample_rate: u32) -> Vec<f32> {
-    if sample_rate == FLEET_SAMPLE_RATE {
-        samples
-    } else {
-        resample(&samples, sample_rate, FLEET_SAMPLE_RATE)
-    }
 }
 
 fn error_response(status: StatusCode, message: &str) -> Response {
