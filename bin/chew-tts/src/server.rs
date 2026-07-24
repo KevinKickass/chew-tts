@@ -28,7 +28,12 @@ static REQUEST_SEED_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 struct Job {
     request: SynthesisRequest,
-    response: oneshot::Sender<Result<GeneratedAudio, String>>,
+    response: JobResponse,
+}
+
+enum JobResponse {
+    Complete(oneshot::Sender<Result<GeneratedAudio, String>>),
+    Segments(mpsc::Sender<Result<GeneratedAudio, String>>),
 }
 
 struct GeneratedAudio {
@@ -132,6 +137,8 @@ struct SpeechRequest {
     reference_audio: Option<String>,
     #[serde(default, alias = "ref_text")]
     reference_text: Option<String>,
+    #[serde(default, rename = "_fleet_stream")]
+    fleet_stream: bool,
 }
 
 fn default_voice() -> String {
@@ -323,8 +330,16 @@ fn gpu_worker(mut engine: TtsEngine, jobs: Arc<Mutex<mpsc::Receiver<Job>>>) {
         let Some(job) = job else {
             break;
         };
-        let result = synthesize_segmented(&mut engine, &job.request);
-        let _ = job.response.send(result);
+        match job.response {
+            JobResponse::Complete(response) => {
+                let _ = response.send(synthesize_segmented(&mut engine, &job.request));
+            }
+            JobResponse::Segments(response) => {
+                synthesize_segments(&mut engine, &job.request, |segment| {
+                    response.blocking_send(segment).is_ok()
+                });
+            }
+        }
     }
 }
 
@@ -364,6 +379,42 @@ fn synthesize_segmented(
         audio.samples.extend(output.samples);
     }
     Ok(audio)
+}
+
+fn synthesize_segments(
+    engine: &mut TtsEngine,
+    request: &SynthesisRequest,
+    mut emit: impl FnMut(Result<GeneratedAudio, String>) -> bool,
+) {
+    let segments = split_synthesis_text(&request.text, MAX_SYNTHESIS_SEGMENT_CHARS);
+    for (index, text) in segments.iter().enumerate() {
+        let mut segment = request.clone();
+        segment.text.clone_from(text);
+        segment.seed = segment.seed.wrapping_add(index as u64);
+        segment.speed = 1.0;
+        let result = engine
+            .synthesize(&segment)
+            .map(|output| {
+                let inference_ms = output.inference_elapsed().as_secs_f64() * 1_000.0;
+                let mut samples = output.samples;
+                if index > 0 {
+                    samples.splice(0..0, std::iter::repeat_n(0.0, SEGMENT_GAP_SAMPLES));
+                }
+                GeneratedAudio {
+                    samples,
+                    frames: output.generated_frames,
+                    inference_ms,
+                    prompt_ms: output.prompt_elapsed.as_secs_f64() * 1_000.0,
+                    generation_ms: output.generation_elapsed.as_secs_f64() * 1_000.0,
+                    codec_ms: output.codec_elapsed.as_secs_f64() * 1_000.0,
+                }
+            })
+            .map_err(|error| format!("segment {}/{} failed: {error:#}", index + 1, segments.len()));
+        let failed = result.is_err();
+        if !emit(result) || failed {
+            break;
+        }
+    }
 }
 
 fn split_synthesis_text(text: &str, max_chars: usize) -> Vec<String> {
@@ -510,6 +561,9 @@ async fn handle_fleet_connection(
     }
     let request: SpeechRequest =
         serde_json::from_slice(&body).map_err(|error| format!("invalid request JSON: {error}"))?;
+    if request.fleet_stream {
+        return handle_fleet_stream(stream, &state, request).await;
+    }
     let speed = request.speed;
     let audio = submit(&state, request)
         .await
@@ -525,7 +579,122 @@ async fn handle_fleet_connection(
         .map_err(|error| format!("could not finish response: {error}"))
 }
 
+async fn handle_fleet_stream(
+    mut stream: TcpStream,
+    state: &Arc<AppState>,
+    request: SpeechRequest,
+) -> Result<(), String> {
+    const MAGIC: &[u8; 4] = b"FTS1";
+    const AUDIO: u8 = 1;
+    const DONE: u8 = 2;
+    const ERROR: u8 = 3;
+
+    let speed = request.speed;
+    let synthesis = prepare_synthesis(state, request)
+        .map_err(|_| "streaming synthesis request was rejected".to_string())?;
+    let (response_tx, mut response_rx) = mpsc::channel(2);
+    state
+        .jobs
+        .try_send(Job {
+            request: synthesis,
+            response: JobResponse::Segments(response_tx),
+        })
+        .map_err(|error| match error {
+            mpsc::error::TrySendError::Full(_) => "TTS queue is full",
+            mpsc::error::TrySendError::Closed(_) => "TTS worker is unavailable",
+        })?;
+    stream
+        .write_all(MAGIC)
+        .await
+        .map_err(|error| format!("could not start audio stream: {error}"))?;
+    while let Some(segment) = response_rx.recv().await {
+        match segment {
+            Ok(audio) => {
+                let raw = raw_f32le(audio.samples, speed).await?;
+                write_stream_frame(&mut stream, AUDIO, &raw).await?;
+            }
+            Err(message) => {
+                write_stream_frame(&mut stream, ERROR, message.as_bytes()).await?;
+                stream.shutdown().await.ok();
+                return Err(message);
+            }
+        }
+    }
+    write_stream_frame(&mut stream, DONE, &[]).await?;
+    stream
+        .shutdown()
+        .await
+        .map_err(|error| format!("could not finish audio stream: {error}"))
+}
+
+async fn write_stream_frame(
+    stream: &mut TcpStream,
+    kind: u8,
+    payload: &[u8],
+) -> Result<(), String> {
+    let length =
+        u32::try_from(payload.len()).map_err(|_| "stream frame exceeds 4 GiB".to_string())?;
+    stream
+        .write_all(&[kind])
+        .await
+        .map_err(|error| format!("could not write stream frame type: {error}"))?;
+    stream
+        .write_all(&length.to_le_bytes())
+        .await
+        .map_err(|error| format!("could not write stream frame length: {error}"))?;
+    stream
+        .write_all(payload)
+        .await
+        .map_err(|error| format!("could not write stream frame payload: {error}"))
+}
+
 async fn submit(state: &Arc<AppState>, request: SpeechRequest) -> Result<GeneratedAudio, Response> {
+    let synthesis = prepare_synthesis(state, request)?;
+    let (response_tx, response_rx) = oneshot::channel();
+    state
+        .jobs
+        .try_send(Job {
+            request: synthesis,
+            response: JobResponse::Complete(response_tx),
+        })
+        .map_err(|error| match error {
+            mpsc::error::TrySendError::Full(_) => {
+                error_response(StatusCode::TOO_MANY_REQUESTS, "TTS queue is full")
+            }
+            mpsc::error::TrySendError::Closed(_) => {
+                error_response(StatusCode::SERVICE_UNAVAILABLE, "TTS worker is unavailable")
+            }
+        })?;
+    let started = Instant::now();
+    match response_rx.await {
+        Ok(Ok(audio)) => {
+            info!(
+                frames = audio.frames,
+                audio_seconds = audio.samples.len() as f64 / SAMPLE_RATE as f64,
+                inference_ms = audio.inference_ms,
+                prompt_ms = audio.prompt_ms,
+                generation_ms = audio.generation_ms,
+                codec_ms = audio.codec_ms,
+                wall_ms = started.elapsed().as_secs_f64() * 1_000.0,
+                "speech generated"
+            );
+            Ok(audio)
+        }
+        Ok(Err(message)) => {
+            error!(error = %message, "speech generation failed");
+            Err(error_response(StatusCode::BAD_REQUEST, &message))
+        }
+        Err(_) => Err(error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "TTS worker exited",
+        )),
+    }
+}
+
+fn prepare_synthesis(
+    state: &Arc<AppState>,
+    request: SpeechRequest,
+) -> Result<SynthesisRequest, Response> {
     if request.input.trim().is_empty() {
         return Err(error_response(
             StatusCode::BAD_REQUEST,
@@ -582,7 +751,7 @@ async fn submit(state: &Arc<AppState>, request: SpeechRequest) -> Result<Generat
     } else {
         instruction
     };
-    let synthesis = SynthesisRequest {
+    Ok(SynthesisRequest {
         text: request.input,
         voice: request.voice,
         instruction,
@@ -602,46 +771,7 @@ async fn submit(state: &Arc<AppState>, request: SpeechRequest) -> Result<Generat
         top_k: request.top_k,
         chunk_frames: 32,
         chunk_context: 4,
-    };
-    let (response_tx, response_rx) = oneshot::channel();
-    state
-        .jobs
-        .try_send(Job {
-            request: synthesis,
-            response: response_tx,
-        })
-        .map_err(|error| match error {
-            mpsc::error::TrySendError::Full(_) => {
-                error_response(StatusCode::TOO_MANY_REQUESTS, "TTS queue is full")
-            }
-            mpsc::error::TrySendError::Closed(_) => {
-                error_response(StatusCode::SERVICE_UNAVAILABLE, "TTS worker is unavailable")
-            }
-        })?;
-    let started = Instant::now();
-    match response_rx.await {
-        Ok(Ok(audio)) => {
-            info!(
-                frames = audio.frames,
-                audio_seconds = audio.samples.len() as f64 / SAMPLE_RATE as f64,
-                inference_ms = audio.inference_ms,
-                prompt_ms = audio.prompt_ms,
-                generation_ms = audio.generation_ms,
-                codec_ms = audio.codec_ms,
-                wall_ms = started.elapsed().as_secs_f64() * 1_000.0,
-                "speech generated"
-            );
-            Ok(audio)
-        }
-        Ok(Err(message)) => {
-            error!(error = %message, "speech generation failed");
-            Err(error_response(StatusCode::BAD_REQUEST, &message))
-        }
-        Err(_) => Err(error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "TTS worker exited",
-        )),
-    }
+    })
 }
 
 fn decode_reference_audio(encoded: &str) -> Result<Vec<u8>, String> {

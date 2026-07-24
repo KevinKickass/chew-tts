@@ -540,6 +540,19 @@ Python or PyTorch runtime dependency. A local RTX 3080 protocol test generated
 4.16 seconds of audio in about 1.1 seconds; `speed: 2.0` returned the expected
 2.08-second raw stream.
 
+Fleet can opt into progressive framed output by adding
+`"_fleet_stream": true`. The response begins with `FTS1`, followed by frames
+containing a one-byte type, a little-endian `u32` payload length, and the
+payload. Type `1` contains `f32le` audio, type `2` marks successful completion,
+and type `3` contains a UTF-8 error. Long input is emitted immediately after
+each existing synthesis segment instead of being buffered until the entire
+request completes. The legacy request format remains raw and unframed.
+
+On an RTX 3080, a 45.675-second Kokoro result arrived in three progressive
+segments: first audio after 2.586 seconds and completion after 5.572 seconds.
+This is segment-level streaming; model-specific codec-frame streaming can use
+the same wire format later without changing Fleet or client WebSockets.
+
 ## Requirements
 
 - NVIDIA GPU with compute capability 7.0 or newer
