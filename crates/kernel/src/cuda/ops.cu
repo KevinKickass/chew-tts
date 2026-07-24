@@ -2779,6 +2779,38 @@ __global__ void conv1d_causal_offset_f16(
     }
 }
 
+__global__ void concat_channel_history_f16(
+    const __half* __restrict__ history,
+    const __half* __restrict__ input,
+    __half* __restrict__ output,
+    int channels,
+    int history_len,
+    int input_len) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    const int output_len = history_len + input_len;
+    const int n = channels * output_len;
+    if (index >= n) return;
+    const int channel = index / output_len;
+    const int position = index - channel * output_len;
+    output[index] = position < history_len
+        ? history[channel * history_len + position]
+        : input[channel * input_len + position - history_len];
+}
+
+__global__ void copy_channel_tail_f16(
+    const __half* __restrict__ input,
+    __half* __restrict__ tail,
+    int channels,
+    int input_len,
+    int tail_len) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    const int n = channels * tail_len;
+    if (index >= n) return;
+    const int channel = index / tail_len;
+    const int position = index - channel * tail_len;
+    tail[index] = input[channel * input_len + input_len - tail_len + position];
+}
+
 // Unfold channel-first causal Conv1d input into row-major GEMM rows:
 // [channels, sequence] -> [sequence, channels * kernel].
 __global__ void unfold_causal_f16(
@@ -3375,6 +3407,14 @@ __global__ void silu_act_bf16(const __nv_bfloat16* __restrict__ x,
     if (idx >= n) return;
     float value = __bfloat162float(x[idx]);
     out[idx] = __float2bfloat16(value / (1.0f + expf(-value)));
+}
+
+__global__ void relu_bf16(const __nv_bfloat16* __restrict__ x,
+                          __nv_bfloat16* __restrict__ out,
+                          int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    out[idx] = __float2bfloat16(fmaxf(0.0f, __bfloat162float(x[idx])));
 }
 
 __global__ void add_bf16(const __nv_bfloat16* __restrict__ left,

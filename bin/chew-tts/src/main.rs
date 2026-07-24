@@ -18,7 +18,8 @@ use chew_model_qwen3_tts::{
     inspect_model, load_f16_tensor,
 };
 use chew_model_vibevoice::{
-    VibeVoiceAcousticDecoder, VibeVoiceBackbones, VibeVoiceDiffusionHead, VibeVoicePrompt,
+    VibeVoiceAcousticDecoder, VibeVoiceBackbones, VibeVoiceDecoderState, VibeVoiceDiffusionHead,
+    VibeVoiceGenerationWeights, VibeVoicePrompt, VibeVoiceScheduler,
     inspect_model as inspect_vibevoice_model,
 };
 use clap::{Parser, Subcommand};
@@ -108,6 +109,13 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         gpu: usize,
     },
+    /// Resume all four native transformer branches from a cached voice prompt.
+    CudaVibeVoicePromptSmoke {
+        model_dir: PathBuf,
+        voice: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        gpu: usize,
+    },
     /// Execute the native VibeVoice diffusion velocity head on CUDA.
     CudaVibeVoiceDiffusionSmoke {
         model_dir: PathBuf,
@@ -123,6 +131,23 @@ enum Command {
         gpu: usize,
         #[arg(long, default_value_t = 1)]
         frames: usize,
+    },
+    /// Generate a real VibeVoice-Realtime WAV through the fully native path.
+    CudaVibeVoiceGenerate {
+        model_dir: PathBuf,
+        voice: PathBuf,
+        text: String,
+        output: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        gpu: usize,
+        #[arg(long, default_value_t = 5)]
+        diffusion_steps: usize,
+        #[arg(long, default_value_t = 1.5)]
+        cfg_scale: f32,
+        #[arg(long, default_value_t = 12.0)]
+        max_seconds: f32,
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
     },
     /// Validate a Kokoro model and print its native checkpoint geometry.
     InspectKokoro {
@@ -720,6 +745,32 @@ fn main() -> anyhow::Result<()> {
                 &tts[..8],
             );
         }
+        Command::CudaVibeVoicePromptSmoke {
+            model_dir,
+            voice,
+            gpu,
+        } => {
+            let inspection = inspect_vibevoice_model(&model_dir)?;
+            let prompt = VibeVoicePrompt::load(&voice, &inspection.config)?;
+            let allocator = chew_vram::VramAllocator::init()?;
+            anyhow::ensure!(gpu < allocator.gpu_count(), "GPU index out of range");
+            let stream = std::sync::Arc::clone(allocator.stream(gpu));
+            let decoder = &inspection.config.decoder_config;
+            let mut kernels = chew_kernel::GpuKernels::load(
+                &stream,
+                decoder.intermediate_size * decoder.hidden_size,
+                decoder.intermediate_size,
+            )?;
+            let backbones = VibeVoiceBackbones::load(&model_dir, &inspection.config, &stream)?;
+            let started = std::time::Instant::now();
+            let (positive, negative) = backbones.prompt_cache_smoke(&prompt, &mut kernels)?;
+            println!(
+                "VibeVoice prompt KV CUDA: {:.3}ms, positive_sum={:.8}, negative_sum={:.8}",
+                started.elapsed().as_secs_f64() * 1_000.0,
+                positive.iter().map(|value| f64::from(*value)).sum::<f64>(),
+                negative.iter().map(|value| f64::from(*value)).sum::<f64>(),
+            );
+        }
         Command::CudaVibeVoiceDiffusionSmoke {
             model_dir,
             gpu,
@@ -774,20 +825,188 @@ fn main() -> anyhow::Result<()> {
             let started = std::time::Instant::now();
             let samples = decoder.decode(&latents, &mut kernels)?;
             let elapsed = started.elapsed();
+            let streaming_started = std::time::Instant::now();
+            let mut state = VibeVoiceDecoderState::default();
+            let mut streaming = Vec::with_capacity(samples.len());
+            for latent in latents.chunks_exact(inspection.config.acoustic_vae_dim) {
+                streaming.extend(decoder.decode_streaming(latent, &mut state, &mut kernels)?);
+            }
+            let streaming_elapsed = streaming_started.elapsed();
+            let (max_error, error_sum) = samples.iter().zip(&streaming).fold(
+                (0.0f32, 0.0f64),
+                |(maximum, sum), (&batch, &stream)| {
+                    let error = (batch - stream).abs();
+                    (maximum.max(error), sum + f64::from(error))
+                },
+            );
+            let mean_error = error_sum / samples.len() as f64;
             println!(
-                "VibeVoice decoder CUDA: load={:.3}s, decode={:.3}ms, VRAM={:.2} GiB, samples={}",
+                "VibeVoice decoder CUDA: load={:.3}s, decode={:.3}ms, stream={:.3}ms, VRAM={:.2} GiB, samples={}",
                 load_elapsed.as_secs_f64(),
                 elapsed.as_secs_f64() * 1_000.0,
+                streaming_elapsed.as_secs_f64() * 1_000.0,
                 free_before.saturating_sub(free_loaded) as f64 / 1024.0_f64.powi(3),
                 samples.len(),
             );
             println!(
-                "sum={:.9}, peak={:.7}, finite={}, first={:?}",
+                "sum={:.9}, peak={:.7}, finite={}, stream max/mean error={:.8}/{:.8}, first={:?}",
                 samples.iter().map(|value| f64::from(*value)).sum::<f64>(),
                 samples.iter().copied().map(f32::abs).fold(0.0, f32::max),
                 samples.iter().all(|value| value.is_finite()),
+                max_error,
+                mean_error,
                 &samples[..samples.len().min(8)],
             );
+        }
+        Command::CudaVibeVoiceGenerate {
+            model_dir,
+            voice,
+            text,
+            output,
+            gpu,
+            diffusion_steps,
+            cfg_scale,
+            max_seconds,
+            seed,
+        } => {
+            anyhow::ensure!(!text.trim().is_empty(), "text must not be empty");
+            anyhow::ensure!(diffusion_steps > 0, "diffusion steps must be positive");
+            anyhow::ensure!(cfg_scale.is_finite(), "CFG scale must be finite");
+            anyhow::ensure!(
+                max_seconds.is_finite() && max_seconds > 0.0,
+                "max seconds must be positive"
+            );
+            let inspection = inspect_vibevoice_model(&model_dir)?;
+            let prompt = VibeVoicePrompt::load(&voice, &inspection.config)?;
+            let tokenizer = load_qwen_tokenizer(&model_dir)?;
+            let encoded = tokenizer
+                .encode(format!("{}\n", text.trim()), false)
+                .map_err(|error| anyhow::anyhow!("could not tokenize VibeVoice text: {error}"))?;
+            let text_ids = encoded.get_ids();
+            anyhow::ensure!(!text_ids.is_empty(), "VibeVoice text produced no tokens");
+            let max_speech_frames = (max_seconds * 7.5).ceil() as usize;
+            let max_new_tokens = text_ids.len() + max_speech_frames + 8;
+
+            let allocator = chew_vram::VramAllocator::init()?;
+            anyhow::ensure!(gpu < allocator.gpu_count(), "GPU index out of range");
+            let stream = std::sync::Arc::clone(allocator.stream(gpu));
+            let mut kernels = chew_kernel::GpuKernels::load(&stream, 8192 * 2048, 8192)?;
+            let free_before = allocator.free_bytes(gpu)?;
+            let load_started = std::time::Instant::now();
+            let backbones = VibeVoiceBackbones::load(&model_dir, &inspection.config, &stream)?;
+            let diffusion = VibeVoiceDiffusionHead::load(&model_dir, &inspection.config, &stream)?;
+            let decoder = VibeVoiceAcousticDecoder::load(&model_dir, &inspection.config, &stream)?;
+            let generation =
+                VibeVoiceGenerationWeights::load(&model_dir, &inspection.config, &stream)?;
+            let mut session =
+                backbones.start_prompt_session(&prompt, max_new_tokens, 5, &stream)?;
+            let load_elapsed = load_started.elapsed();
+            let free_loaded = allocator.free_bytes(gpu)?;
+
+            let generation_started = std::time::Instant::now();
+            let mut rng = VibeVoiceRng::new(seed);
+            let mut decoder_state = VibeVoiceDecoderState::default();
+            let mut samples = Vec::new();
+            let mut speech_frames = 0usize;
+            let mut text_offset = 0;
+            let mut eos = 0.0f32;
+            let mut first_audio = None;
+            let mut previous_audio = generation_started;
+            let mut maximum_audio_gap = std::time::Duration::ZERO;
+            while speech_frames < max_speech_frames {
+                if text_offset < text_ids.len() {
+                    let end = (text_offset + 5).min(text_ids.len());
+                    let ids = &text_ids[text_offset..end];
+                    let embeddings = generation.embed_text(ids)?;
+                    backbones.push_text(
+                        &mut session,
+                        &embeddings,
+                        ids.len(),
+                        |hidden| generation.add_text_type(hidden),
+                        &mut kernels,
+                    )?;
+                    text_offset = end;
+                }
+
+                for _ in 0..6 {
+                    if speech_frames >= max_speech_frames {
+                        break;
+                    }
+                    let mut speech = (0..inspection.config.acoustic_vae_dim)
+                        .map(|_| rng.normal())
+                        .collect::<Vec<_>>();
+                    let mut scheduler = VibeVoiceScheduler::new(
+                        &inspection.config.diffusion_head_config,
+                        diffusion_steps,
+                    )?;
+                    for timestep in scheduler.timesteps().to_vec() {
+                        let positive = diffusion.forward(
+                            &speech,
+                            timestep as f32,
+                            session.positive_condition(),
+                            &mut kernels,
+                        )?;
+                        let negative = diffusion.forward(
+                            &speech,
+                            timestep as f32,
+                            session.negative_condition(),
+                            &mut kernels,
+                        )?;
+                        let guided = positive
+                            .iter()
+                            .zip(&negative)
+                            .map(|(&positive, &negative)| {
+                                negative + cfg_scale * (positive - negative)
+                            })
+                            .collect::<Vec<_>>();
+                        speech = scheduler.step(&guided, timestep, &speech)?;
+                    }
+                    let decoder_latent = generation.decoder_latent(&speech)?;
+                    samples.extend(decoder.decode_streaming(
+                        &decoder_latent,
+                        &mut decoder_state,
+                        &mut kernels,
+                    )?);
+                    let audio_ready = std::time::Instant::now();
+                    if first_audio.is_none() {
+                        first_audio = Some(audio_ready.duration_since(generation_started));
+                    } else {
+                        maximum_audio_gap =
+                            maximum_audio_gap.max(audio_ready.duration_since(previous_audio));
+                    }
+                    previous_audio = audio_ready;
+                    speech_frames += 1;
+                    let acoustic = generation.connect_latent(&speech, &mut kernels)?;
+                    backbones.push_speech(
+                        &mut session,
+                        acoustic,
+                        |hidden| generation.add_speech_type(hidden),
+                        &mut kernels,
+                    )?;
+                    eos = generation.eos_probability(session.positive_condition(), &mut kernels)?;
+                    if text_offset == text_ids.len() && eos > 0.5 {
+                        break;
+                    }
+                }
+                if text_offset == text_ids.len() && eos > 0.5 {
+                    break;
+                }
+            }
+            write_pcm16_wav(&output, &samples, 24_000)?;
+            let elapsed = generation_started.elapsed();
+            println!(
+                "VibeVoice native: load={:.3}s, generation={:.3}s, audio={:.3}s, RTF={:.3}, TTFA={:.1}ms, max_gap={:.1}ms, frames={}, EOS={:.3}, VRAM={:.2} GiB",
+                load_elapsed.as_secs_f64(),
+                elapsed.as_secs_f64(),
+                samples.len() as f64 / 24_000.0,
+                elapsed.as_secs_f64() / (samples.len() as f64 / 24_000.0),
+                first_audio.unwrap_or_default().as_secs_f64() * 1_000.0,
+                maximum_audio_gap.as_secs_f64() * 1_000.0,
+                speech_frames,
+                eos,
+                free_before.saturating_sub(free_loaded) as f64 / 1024.0_f64.powi(3),
+            );
+            println!("wrote {}", output.display());
         }
         Command::InspectKokoro {
             model_dir,
@@ -1913,6 +2132,37 @@ fn load_qwen_tokenizer(model_dir: &std::path::Path) -> anyhow::Result<Tokenizer>
         .collect::<Vec<_>>();
     tokenizer.add_tokens(&added);
     Ok(tokenizer)
+}
+
+struct VibeVoiceRng {
+    state: u64,
+    spare: Option<f32>,
+}
+
+impl VibeVoiceRng {
+    fn new(seed: u64) -> Self {
+        Self {
+            state: seed.max(1),
+            spare: None,
+        }
+    }
+
+    fn uniform(&mut self) -> f32 {
+        self.state ^= self.state << 13;
+        self.state ^= self.state >> 7;
+        self.state ^= self.state << 17;
+        ((self.state >> 40) as f32 + 0.5) / (1u32 << 24) as f32
+    }
+
+    fn normal(&mut self) -> f32 {
+        if let Some(value) = self.spare.take() {
+            return value;
+        }
+        let radius = (-2.0 * self.uniform().max(1e-7).ln()).sqrt();
+        let angle = std::f32::consts::TAU * self.uniform();
+        self.spare = Some(radius * angle.sin());
+        radius * angle.cos()
+    }
 }
 
 fn cuda_talker_frontend_smoke(

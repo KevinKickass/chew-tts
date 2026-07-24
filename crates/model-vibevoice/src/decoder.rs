@@ -46,6 +46,18 @@ struct DecoderStage {
     blocks: Vec<DecoderBlock>,
 }
 
+struct DecoderCache {
+    values: CudaSlice<f16>,
+    channels: usize,
+    frames: usize,
+}
+
+#[derive(Default)]
+pub struct VibeVoiceDecoderState {
+    caches: Vec<DecoderCache>,
+    cursor: usize,
+}
+
 /// Native causal acoustic decoder for VibeVoice-Realtime.
 ///
 /// The checkpoint stores the codec in BF16. Convolution kernels currently
@@ -124,6 +136,31 @@ impl VibeVoiceAcousticDecoder {
 
     /// Decode frame-major acoustic latents to 24-kHz mono samples.
     pub fn decode(&self, latents: &[f32], kernels: &mut GpuKernels) -> anyhow::Result<Vec<f32>> {
+        self.decode_impl(latents, None, kernels)
+    }
+
+    /// Decode only new latent frames and retain every causal convolution cache.
+    pub fn decode_streaming(
+        &self,
+        latents: &[f32],
+        state: &mut VibeVoiceDecoderState,
+        kernels: &mut GpuKernels,
+    ) -> anyhow::Result<Vec<f32>> {
+        state.cursor = 0;
+        let output = self.decode_impl(latents, Some(state), kernels)?;
+        ensure!(
+            state.cursor == state.caches.len(),
+            "VibeVoice decoder cache traversal mismatch"
+        );
+        Ok(output)
+    }
+
+    fn decode_impl(
+        &self,
+        latents: &[f32],
+        mut state: Option<&mut VibeVoiceDecoderState>,
+        kernels: &mut GpuKernels,
+    ) -> anyhow::Result<Vec<f32>> {
         ensure!(
             !latents.is_empty() && latents.len().is_multiple_of(self.latent_dim),
             "VibeVoice decoder needs complete acoustic latent frames"
@@ -146,24 +183,36 @@ impl VibeVoiceAcousticDecoder {
             frames as u32,
             self.latent_dim as u32,
         )?;
-        channel_first = self.conv(&channel_first, frames, &self.stem, kernels)?;
+        channel_first = if let Some(state) = state.as_deref_mut() {
+            self.conv_streaming(&channel_first, frames, &self.stem, state, kernels)?
+        } else {
+            self.conv(&channel_first, frames, &self.stem, kernels)?
+        };
         let mut hidden = self.to_frame_major(&channel_first, frames, 2048, kernels)?;
 
         for (stage_index, stage) in self.stages.iter().enumerate() {
             if let Some(upsample) = &stage.upsample {
                 let channel_first =
                     self.to_channel_first(&hidden, frames, upsample.input_channels, kernels)?;
-                let upsampled = self.conv_transpose(&channel_first, frames, upsample, kernels)?;
+                let upsampled = if let Some(state) = state.as_deref_mut() {
+                    self.conv_transpose_streaming(&channel_first, frames, upsample, state, kernels)?
+                } else {
+                    self.conv_transpose(&channel_first, frames, upsample, kernels)?
+                };
                 frames *= self.ratios[stage_index - 1];
                 hidden =
                     self.to_frame_major(&upsampled, frames, upsample.output_channels, kernels)?;
             }
             for block in &stage.blocks {
-                hidden = self.block(hidden, frames, block, kernels)?;
+                hidden = self.block(hidden, frames, block, state.as_deref_mut(), kernels)?;
             }
         }
         let channel_first = self.to_channel_first(&hidden, frames, 32, kernels)?;
-        let waveform = self.conv(&channel_first, frames, &self.head, kernels)?;
+        let waveform = if let Some(state) = state.as_deref_mut() {
+            self.conv_streaming(&channel_first, frames, &self.head, state, kernels)?
+        } else {
+            self.conv(&channel_first, frames, &self.head, kernels)?
+        };
         self.stream.synchronize()?;
         let mut host = vec![f16::ZERO; frames];
         self.stream.memcpy_dtoh(&waveform, &mut host)?;
@@ -175,6 +224,7 @@ impl VibeVoiceAcousticDecoder {
         hidden: CudaSlice<f16>,
         frames: usize,
         block: &DecoderBlock,
+        state: Option<&mut VibeVoiceDecoderState>,
         kernels: &mut GpuKernels,
     ) -> anyhow::Result<CudaSlice<f16>> {
         let elements = frames * block.channels;
@@ -188,7 +238,11 @@ impl VibeVoiceAcousticDecoder {
             self.norm_eps,
         )?;
         let norm_cf = self.to_channel_first(&norm, frames, block.channels, kernels)?;
-        let mixed_cf = self.conv(&norm_cf, frames, &block.mixer, kernels)?;
+        let mixed_cf = if let Some(state) = state {
+            self.conv_streaming(&norm_cf, frames, &block.mixer, state, kernels)?
+        } else {
+            self.conv(&norm_cf, frames, &block.mixer, kernels)?
+        };
         let mixed = self.to_frame_major(&mixed_cf, frames, block.channels, kernels)?;
         let mut scaled = self.stream.alloc_zeros::<f16>(elements)?;
         kernels.ops.mul_f16_broadcast(
@@ -317,6 +371,113 @@ impl VibeVoiceAcousticDecoder {
         Ok(output)
     }
 
+    fn conv_streaming(
+        &self,
+        input: &CudaSlice<f16>,
+        frames: usize,
+        conv: &Conv1d,
+        state: &mut VibeVoiceDecoderState,
+        kernels: &mut GpuKernels,
+    ) -> anyhow::Result<CudaSlice<f16>> {
+        let history = conv.kernel - 1;
+        let cache = state.cache(conv.input_channels, history, &self.stream)?;
+        let total = history + frames;
+        let mut combined = self
+            .stream
+            .alloc_zeros::<f16>(conv.input_channels * total)?;
+        kernels.ops.concat_channel_history_f16(
+            &cache.values,
+            input,
+            &mut combined,
+            conv.input_channels as u32,
+            history as u32,
+            frames as u32,
+        )?;
+        let mut output = self
+            .stream
+            .alloc_zeros::<f16>(conv.output_channels * frames)?;
+        kernels.ops.conv1d_causal_offset_f16(
+            &combined,
+            &conv.weight,
+            &conv.bias,
+            &mut output,
+            conv.input_channels as u32,
+            conv.output_channels as u32,
+            total as u32,
+            frames as u32,
+            history as u32,
+            conv.kernel as u32,
+            1,
+            conv.groups as u32,
+        )?;
+        kernels.ops.copy_channel_tail_f16(
+            &combined,
+            &mut cache.values,
+            conv.input_channels as u32,
+            total as u32,
+            history as u32,
+        )?;
+        Ok(output)
+    }
+
+    fn conv_transpose_streaming(
+        &self,
+        input: &CudaSlice<f16>,
+        frames: usize,
+        conv: &ConvTranspose1d,
+        state: &mut VibeVoiceDecoderState,
+        kernels: &mut GpuKernels,
+    ) -> anyhow::Result<CudaSlice<f16>> {
+        let history = conv.kernel - 1;
+        let cache = state.cache(conv.input_channels, history, &self.stream)?;
+        let total = history + frames;
+        let mut combined = self
+            .stream
+            .alloc_zeros::<f16>(conv.input_channels * total)?;
+        kernels.ops.concat_channel_history_f16(
+            &cache.values,
+            input,
+            &mut combined,
+            conv.input_channels as u32,
+            history as u32,
+            frames as u32,
+        )?;
+        let total_output = total * conv.stride;
+        let mut full = self
+            .stream
+            .alloc_zeros::<f16>(conv.output_channels * total_output)?;
+        kernels.ops.conv_transpose1d_causal_f16(
+            &combined,
+            &conv.weight,
+            &conv.bias,
+            &mut full,
+            conv.input_channels as u32,
+            conv.output_channels as u32,
+            total as u32,
+            conv.kernel as u32,
+            conv.stride as u32,
+        )?;
+        let output_frames = frames * conv.stride;
+        let mut output = self
+            .stream
+            .alloc_zeros::<f16>(conv.output_channels * output_frames)?;
+        kernels.ops.copy_channel_tail_f16(
+            &full,
+            &mut output,
+            conv.output_channels as u32,
+            total_output as u32,
+            output_frames as u32,
+        )?;
+        kernels.ops.copy_channel_tail_f16(
+            &combined,
+            &mut cache.values,
+            conv.input_channels as u32,
+            total as u32,
+            history as u32,
+        )?;
+        Ok(output)
+    }
+
     fn to_frame_major(
         &self,
         channel_first: &CudaSlice<f16>,
@@ -343,6 +504,31 @@ impl VibeVoiceAcousticDecoder {
             .ops
             .transpose_f16(frame_major, &mut output, frames as u32, channels as u32)?;
         Ok(output)
+    }
+}
+
+impl VibeVoiceDecoderState {
+    fn cache(
+        &mut self,
+        channels: usize,
+        frames: usize,
+        stream: &Arc<CudaStream>,
+    ) -> anyhow::Result<&mut DecoderCache> {
+        let index = self.cursor;
+        self.cursor += 1;
+        if index == self.caches.len() {
+            self.caches.push(DecoderCache {
+                values: stream.alloc_zeros::<f16>(channels * frames)?,
+                channels,
+                frames,
+            });
+        }
+        let cache = &mut self.caches[index];
+        ensure!(
+            cache.channels == channels && cache.frames == frames,
+            "VibeVoice decoder cache geometry changed"
+        );
+        Ok(cache)
     }
 }
 

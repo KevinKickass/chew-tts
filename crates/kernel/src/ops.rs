@@ -61,6 +61,7 @@ pub struct OpsKernels {
     add_inplace_f32_bf16: CudaFunction,
     silu_bf16: CudaFunction,
     silu_act_bf16: CudaFunction,
+    relu_bf16: CudaFunction,
     add_bf16: CudaFunction,
     modulate_bf16: CudaFunction,
     gated_residual_bf16: CudaFunction,
@@ -99,6 +100,8 @@ pub struct OpsKernels {
     conv1d_padded_f16: CudaFunction,
     conv1d_general_f16: CudaFunction,
     conv1d_causal_offset_f16: CudaFunction,
+    concat_channel_history_f16: CudaFunction,
+    copy_channel_tail_f16: CudaFunction,
     unfold_causal_f16: CudaFunction,
     unfold_causal_batched_f16: CudaFunction,
     unfold_conv1d_f16: CudaFunction,
@@ -177,6 +180,7 @@ impl OpsKernels {
             add_inplace_f32_bf16: loader::get_fn(&module, "add_inplace_f32_bf16")?,
             silu_bf16: loader::get_fn(&module, "silu_bf16")?,
             silu_act_bf16: loader::get_fn(&module, "silu_act_bf16")?,
+            relu_bf16: loader::get_fn(&module, "relu_bf16")?,
             add_bf16: loader::get_fn(&module, "add_bf16")?,
             modulate_bf16: loader::get_fn(&module, "modulate_bf16")?,
             gated_residual_bf16: loader::get_fn(&module, "gated_residual_bf16")?,
@@ -212,6 +216,8 @@ impl OpsKernels {
             conv1d_padded_f16: loader::get_fn(&module, "conv1d_padded_f16")?,
             conv1d_general_f16: loader::get_fn(&module, "conv1d_general_f16")?,
             conv1d_causal_offset_f16: loader::get_fn(&module, "conv1d_causal_offset_f16")?,
+            concat_channel_history_f16: loader::get_fn(&module, "concat_channel_history_f16")?,
+            copy_channel_tail_f16: loader::get_fn(&module, "copy_channel_tail_f16")?,
             unfold_causal_f16: loader::get_fn(&module, "unfold_causal_f16")?,
             unfold_causal_batched_f16: loader::get_fn(&module, "unfold_causal_batched_f16")?,
             unfold_conv1d_f16: loader::get_fn(&module, "unfold_conv1d_f16")?,
@@ -439,6 +445,73 @@ impl OpsKernels {
                 },
                 &mut args,
             )?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn concat_channel_history_f16(
+        &self,
+        history: &CudaSlice<half::f16>,
+        input: &CudaSlice<half::f16>,
+        output: &mut CudaSlice<half::f16>,
+        channels: u32,
+        history_len: u32,
+        input_len: u32,
+    ) -> Result<(), KernelError> {
+        let count = channels * (history_len + input_len);
+        let threads = 256u32;
+        let channels_i = channels as i32;
+        let history_i = history_len as i32;
+        let input_i = input_len as i32;
+        let mut args = [
+            slice_ptr(history),
+            slice_ptr(input),
+            slice_ptr_mut(output),
+            scalar_ptr(&channels_i),
+            scalar_ptr(&history_i),
+            scalar_ptr(&input_i),
+        ];
+        unsafe {
+            self.fast.fire(
+                &self.concat_channel_history_f16,
+                (count.div_ceil(threads), 1, 1),
+                (threads, 1, 1),
+                0,
+                &mut args,
+            );
+        }
+        Ok(())
+    }
+
+    pub fn copy_channel_tail_f16(
+        &self,
+        input: &CudaSlice<half::f16>,
+        tail: &mut CudaSlice<half::f16>,
+        channels: u32,
+        input_len: u32,
+        tail_len: u32,
+    ) -> Result<(), KernelError> {
+        let count = channels * tail_len;
+        let threads = 256u32;
+        let channels_i = channels as i32;
+        let input_i = input_len as i32;
+        let tail_i = tail_len as i32;
+        let mut args = [
+            slice_ptr(input),
+            slice_ptr_mut(tail),
+            scalar_ptr(&channels_i),
+            scalar_ptr(&input_i),
+            scalar_ptr(&tail_i),
+        ];
+        unsafe {
+            self.fast.fire(
+                &self.copy_channel_tail_f16,
+                (count.div_ceil(threads), 1, 1),
+                (threads, 1, 1),
+                0,
+                &mut args,
+            );
         }
         Ok(())
     }
@@ -3728,6 +3801,31 @@ impl OpsKernels {
                 &self.silu_act_bf16,
                 (count.div_ceil(256), 1, 1),
                 (256, 1, 1),
+                0,
+                &mut args,
+            );
+        }
+        Ok(())
+    }
+
+    pub fn relu_bf16(
+        &self,
+        input: &CudaSlice<half::bf16>,
+        output: &mut CudaSlice<half::bf16>,
+        count: u32,
+    ) -> Result<(), KernelError> {
+        let threads = 256u32;
+        let count_i = count as i32;
+        let mut args = [
+            slice_ptr(input),
+            slice_ptr_mut(output),
+            scalar_ptr(&count_i),
+        ];
+        unsafe {
+            self.fast.fire(
+                &self.relu_bf16,
+                (count.div_ceil(threads), 1, 1),
+                (threads, 1, 1),
                 0,
                 &mut args,
             );

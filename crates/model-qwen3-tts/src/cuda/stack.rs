@@ -264,4 +264,36 @@ impl<T: QwenDType> TalkerGenerationSession<T> {
             cache.reset();
         }
     }
+
+    /// Seed a session from a safe, host-side Hugging Face KV snapshot.
+    ///
+    /// Source tensors use `[heads, tokens, head_dim]` ordering and BF16
+    /// storage. Attention kernels use position-major FP16 caches internally,
+    /// so conversion and the small layout transpose happen once per request.
+    pub fn load_prompt_kv<'a>(
+        &mut self,
+        layers: impl IntoIterator<Item = (&'a [half::bf16], &'a [half::bf16])>,
+        tokens: usize,
+        config: &TalkerConfig,
+        stream: &Arc<CudaStream>,
+    ) -> anyhow::Result<()> {
+        let layers = layers.into_iter().collect::<Vec<_>>();
+        ensure!(
+            layers.len() == self.caches.len(),
+            "prompt has {} KV layers, session expects {}",
+            layers.len(),
+            self.caches.len()
+        );
+        for (cache, (key, value)) in self.caches.iter_mut().zip(layers) {
+            cache.load_prompt_bf16(
+                key,
+                value,
+                tokens,
+                config.num_key_value_heads,
+                config.head_dim,
+                stream,
+            )?;
+        }
+        Ok(())
+    }
 }

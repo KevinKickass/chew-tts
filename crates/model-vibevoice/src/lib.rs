@@ -2,13 +2,15 @@ mod backbone;
 mod config;
 mod decoder;
 mod diffusion;
+mod generation;
 mod scheduler;
 mod voice;
 
-pub use backbone::VibeVoiceBackbones;
+pub use backbone::{VibeVoiceBackboneSession, VibeVoiceBackbones};
 pub use config::{AcousticTokenizerConfig, DecoderConfig, DiffusionHeadConfig, VibeVoiceConfig};
-pub use decoder::VibeVoiceAcousticDecoder;
+pub use decoder::{VibeVoiceAcousticDecoder, VibeVoiceDecoderState};
 pub use diffusion::VibeVoiceDiffusionHead;
+pub use generation::VibeVoiceGenerationWeights;
 pub use scheduler::VibeVoiceScheduler;
 pub use voice::{VibeVoicePrompt, VibeVoicePromptBranch, VibeVoicePromptKv};
 

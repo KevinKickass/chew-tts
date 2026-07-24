@@ -116,6 +116,51 @@ impl TalkerLayerKvCache {
     pub fn reset(&mut self) {
         self.position = 0;
     }
+
+    fn load_prompt_bf16(
+        &mut self,
+        key_head_major: &[half::bf16],
+        value_head_major: &[half::bf16],
+        tokens: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        stream: &Arc<CudaStream>,
+    ) -> anyhow::Result<()> {
+        ensure!(tokens > 0, "prompt KV cache is empty");
+        ensure!(
+            kv_heads * head_dim == self.kv_dim,
+            "prompt KV geometry does not match the session"
+        );
+        ensure!(
+            tokens <= self.max_seq_len,
+            "prompt has {tokens} tokens but session capacity is {}",
+            self.max_seq_len
+        );
+        let expected = tokens * self.kv_dim;
+        ensure!(
+            key_head_major.len() == expected && value_head_major.len() == expected,
+            "prompt KV payload size mismatch"
+        );
+        let reorder = |source: &[half::bf16]| {
+            let mut output = vec![f16::ZERO; expected];
+            for token in 0..tokens {
+                for head in 0..kv_heads {
+                    for dim in 0..head_dim {
+                        let source_index = (head * tokens + token) * head_dim + dim;
+                        let target_index = token * self.kv_dim + head * head_dim + dim;
+                        output[target_index] = f16::from_f32(source[source_index].to_f32());
+                    }
+                }
+            }
+            output
+        };
+        let key = reorder(key_head_major);
+        let value = reorder(value_head_major);
+        stream.memcpy_htod(&key, &mut self.k.slice_mut(..expected))?;
+        stream.memcpy_htod(&value, &mut self.v.slice_mut(..expected))?;
+        self.position = tokens;
+        Ok(())
+    }
 }
 
 impl<T: QwenDType> TalkerDecoderLayer<T> {
