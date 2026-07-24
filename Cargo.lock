@@ -352,6 +352,7 @@ dependencies = [
  "chew-model-qwen3-tts",
  "chew-safetensors",
  "cudarc",
+ "half",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

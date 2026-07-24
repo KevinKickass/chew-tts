@@ -22,7 +22,10 @@ use chew_model_vibevoice::{
     VibeVoiceGenerationWeights, VibeVoicePrompt, VibeVoiceScheduler,
     inspect_model as inspect_vibevoice_model,
 };
-use chew_model_voxcpm2::{VoxCpm2TransformerBackbones, inspect_model as inspect_voxcpm2_model};
+use chew_model_voxcpm2::{
+    VoxCpm2AudioDecoder, VoxCpm2Projections, VoxCpm2TransformerBackbones,
+    inspect_model as inspect_voxcpm2_model,
+};
 use clap::{Parser, Subcommand};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::PathBuf;
@@ -770,10 +773,17 @@ fn main() -> anyhow::Result<()> {
             let started = std::time::Instant::now();
             let backbones =
                 VoxCpm2TransformerBackbones::load(&model_dir, &inspection.config, &stream)?;
+            let projections = VoxCpm2Projections::load(&model_dir, &inspection.config, &stream)?;
+            let decoder = VoxCpm2AudioDecoder::load(&model_dir, &inspection.config, &stream)?;
             let load_elapsed = started.elapsed();
             let free_loaded = allocator.free_bytes(gpu)?;
             let forward_started = std::time::Instant::now();
             let output = backbones.smoke(&mut kernels)?;
+            let projected = projections.smoke(&mut kernels)?;
+            let latent = (0..inspection.config.feat_dim)
+                .map(|index| ((index as f32 + 1.0) * 0.013).sin() * 0.125)
+                .collect::<Vec<_>>();
+            let waveform = decoder.decode(&latent, &mut kernels)?;
             println!(
                 "VoxCPM2 transformers CUDA: load={:.3}s, forward={:.3}ms, VRAM={:.2} GiB",
                 load_elapsed.as_secs_f64(),
@@ -802,6 +812,24 @@ fn main() -> anyhow::Result<()> {
                     .iter()
                     .map(|value| f64::from(*value))
                     .sum::<f64>(),
+            );
+            println!(
+                "FSQ={:.9}, stop={:?}",
+                projected
+                    .fsq
+                    .iter()
+                    .map(|value| f64::from(*value))
+                    .sum::<f64>(),
+                projected.stop_logits,
+            );
+            println!(
+                "AudioVAE: {} samples / {:.3}ms, sum={:.9}, range [{:.6}, {:.6}], first={:?}",
+                waveform.len(),
+                waveform.len() as f64 / 48.0,
+                waveform.iter().map(|value| f64::from(*value)).sum::<f64>(),
+                waveform.iter().copied().fold(f32::INFINITY, f32::min),
+                waveform.iter().copied().fold(f32::NEG_INFINITY, f32::max),
+                &waveform[..8],
             );
         }
         Command::CudaVibeVoiceBackboneSmoke { model_dir, gpu } => {

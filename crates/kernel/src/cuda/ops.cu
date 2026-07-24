@@ -3382,6 +3382,35 @@ __global__ void copy_f16_to_bf16(const __half* __restrict__ src,
     if (idx < n) dst[idx] = __float2bfloat16(__half2float(src[idx]));
 }
 
+__global__ void fsq_quantize_bf16(__nv_bfloat16* __restrict__ values,
+                                   int n,
+                                   float scale) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    float value = tanhf(__bfloat162float(values[idx]));
+    values[idx] = __float2bfloat16(roundf(value * scale) / scale);
+}
+
+__global__ void channel_affine_f16(const __half* __restrict__ input,
+                                    const __half* __restrict__ scale,
+                                    const __half* __restrict__ bias,
+                                    __half* __restrict__ output,
+                                    int channels,
+                                    int frames) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int n = channels * frames;
+    if (idx >= n) return;
+    int channel = idx / frames;
+    output[idx] = __float2half(
+        __half2float(input[idx]) * __half2float(scale[channel])
+        + __half2float(bias[channel]));
+}
+
+__global__ void tanh_f16_inplace(__half* __restrict__ values, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) values[idx] = __float2half(tanhf(__half2float(values[idx])));
+}
+
 __global__ void add_inplace_f32_bf16(float* __restrict__ hidden,
                                       const __nv_bfloat16* __restrict__ delta,
                                       int n) {

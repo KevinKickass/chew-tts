@@ -58,6 +58,9 @@ pub struct OpsKernels {
     copy_bf16_to_f32: CudaFunction,
     copy_bf16_to_f16: CudaFunction,
     copy_f16_to_bf16: CudaFunction,
+    fsq_quantize_bf16: CudaFunction,
+    channel_affine_f16: CudaFunction,
+    tanh_f16_inplace: CudaFunction,
     add_inplace_f32_bf16: CudaFunction,
     silu_bf16: CudaFunction,
     silu_act_bf16: CudaFunction,
@@ -177,6 +180,9 @@ impl OpsKernels {
             copy_bf16_to_f32: loader::get_fn(&module, "copy_bf16_to_f32")?,
             copy_bf16_to_f16: loader::get_fn(&module, "copy_bf16_to_f16")?,
             copy_f16_to_bf16: loader::get_fn(&module, "copy_f16_to_bf16")?,
+            fsq_quantize_bf16: loader::get_fn(&module, "fsq_quantize_bf16")?,
+            channel_affine_f16: loader::get_fn(&module, "channel_affine_f16")?,
+            tanh_f16_inplace: loader::get_fn(&module, "tanh_f16_inplace")?,
             add_inplace_f32_bf16: loader::get_fn(&module, "add_inplace_f32_bf16")?,
             silu_bf16: loader::get_fn(&module, "silu_bf16")?,
             silu_act_bf16: loader::get_fn(&module, "silu_act_bf16")?,
@@ -3712,6 +3718,77 @@ impl OpsKernels {
         n: u32,
     ) -> Result<(), KernelError> {
         self.launch_bf16_copy(&self.copy_f16_to_bf16, src, dst, n)
+    }
+
+    pub fn fsq_quantize_bf16(
+        &self,
+        values: &mut CudaSlice<half::bf16>,
+        n: u32,
+        scale: f32,
+    ) -> Result<(), KernelError> {
+        let threads = 256u32;
+        let n_i = n as i32;
+        let mut args = [slice_ptr_mut(values), scalar_ptr(&n_i), scalar_ptr(&scale)];
+        unsafe {
+            self.fast.fire(
+                &self.fsq_quantize_bf16,
+                (n.div_ceil(threads), 1, 1),
+                (threads, 1, 1),
+                0,
+                &mut args,
+            );
+        }
+        Ok(())
+    }
+
+    pub fn channel_affine_f16(
+        &self,
+        input: &CudaSlice<half::f16>,
+        scale: &CudaSlice<half::f16>,
+        bias: &CudaSlice<half::f16>,
+        output: &mut CudaSlice<half::f16>,
+        channels: u32,
+        frames: u32,
+    ) -> Result<(), KernelError> {
+        let n = channels * frames;
+        let threads = 256u32;
+        let channels_i = channels as i32;
+        let frames_i = frames as i32;
+        let mut args = [
+            slice_ptr(input),
+            slice_ptr(scale),
+            slice_ptr(bias),
+            slice_ptr_mut(output),
+            scalar_ptr(&channels_i),
+            scalar_ptr(&frames_i),
+        ];
+        unsafe {
+            self.fast.fire(
+                &self.channel_affine_f16,
+                (n.div_ceil(threads), 1, 1),
+                (threads, 1, 1),
+                0,
+                &mut args,
+            );
+        }
+        Ok(())
+    }
+
+    pub fn tanh_f16_inplace(&self, values: &mut CudaSlice<half::f16>) -> Result<(), KernelError> {
+        let n = values.len() as u32;
+        let threads = 256u32;
+        let n_i = n as i32;
+        let mut args = [slice_ptr_mut(values), scalar_ptr(&n_i)];
+        unsafe {
+            self.fast.fire(
+                &self.tanh_f16_inplace,
+                (n.div_ceil(threads), 1, 1),
+                (threads, 1, 1),
+                0,
+                &mut args,
+            );
+        }
+        Ok(())
     }
 
     fn launch_bf16_copy<S: cudarc::driver::DeviceRepr, D: cudarc::driver::DeviceRepr>(

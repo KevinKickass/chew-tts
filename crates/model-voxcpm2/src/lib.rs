@@ -1,11 +1,15 @@
 mod backbone;
 mod config;
+mod decoder;
+mod projections;
 
 pub use backbone::{VoxCpm2BaseBackbone, VoxCpm2TransformerBackbones, VoxCpm2TransformerSmoke};
 pub use config::{
     AudioVaeConfig, CfmConfig, DitConfig, LocalTransformerConfig, MiniCpm4Config,
     RopeScalingConfig, VoxCpm2Config,
 };
+pub use decoder::VoxCpm2AudioDecoder;
+pub use projections::{VoxCpm2ProjectionOutputs, VoxCpm2Projections};
 
 use chew_safetensors::{MappedSafetensors, TensorInfo};
 use std::fs;
