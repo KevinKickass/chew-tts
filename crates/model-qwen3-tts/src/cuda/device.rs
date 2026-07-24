@@ -127,28 +127,30 @@ impl<T: QwenDType> TalkerDecoderLayer<T> {
             rows * kv_dim as u32,
         )?;
 
-        // The kernels support an aliased source/destination for per-head Q/K norm.
-        unsafe {
-            let q_in = &scratch.q as *const CudaSlice<f16>;
-            let q_out = &mut scratch.q as *mut CudaSlice<f16>;
-            kernels.ops.rms_norm(
-                &*q_in,
-                &self.q_norm,
-                &mut *q_out,
-                rows * config.num_attention_heads as u32,
-                config.head_dim as u32,
-                config.rms_norm_eps as f32,
-            )?;
-            let k_in = &scratch.k as *const CudaSlice<f16>;
-            let k_out = &mut scratch.k as *mut CudaSlice<f16>;
-            kernels.ops.rms_norm(
-                &*k_in,
-                &self.k_norm,
-                &mut *k_out,
-                rows * config.num_key_value_heads as u32,
-                config.head_dim as u32,
-                config.rms_norm_eps as f32,
-            )?;
+        if let (Some(q_norm), Some(k_norm)) = (&self.q_norm, &self.k_norm) {
+            // The kernels support an aliased source/destination for per-head Q/K norm.
+            unsafe {
+                let q_in = &scratch.q as *const CudaSlice<f16>;
+                let q_out = &mut scratch.q as *mut CudaSlice<f16>;
+                kernels.ops.rms_norm(
+                    &*q_in,
+                    q_norm,
+                    &mut *q_out,
+                    rows * config.num_attention_heads as u32,
+                    config.head_dim as u32,
+                    config.rms_norm_eps as f32,
+                )?;
+                let k_in = &scratch.k as *const CudaSlice<f16>;
+                let k_out = &mut scratch.k as *mut CudaSlice<f16>;
+                kernels.ops.rms_norm(
+                    &*k_in,
+                    k_norm,
+                    &mut *k_out,
+                    rows * config.num_key_value_heads as u32,
+                    config.head_dim as u32,
+                    config.rms_norm_eps as f32,
+                )?;
+            }
         }
 
         kernels.ops.rope_neox(

@@ -1,0 +1,17 @@
+[package]
+name = "chew-model-vibevoice"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Native VibeVoice-Realtime model inspection and inference for Chew TTS"
+
+[dependencies]
+anyhow.workspace = true
+chew-kernel.workspace = true
+chew-model-qwen3-tts.workspace = true
+chew-safetensors.workspace = true
+cudarc.workspace = true
+half.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

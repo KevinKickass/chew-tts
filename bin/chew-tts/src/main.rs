@@ -17,6 +17,9 @@ use chew_model_qwen3_tts::{
     SpeakerEncoder, TalkerDecoderLayer, TalkerFrontend, TalkerLayerKvCache, TalkerTransformer,
     inspect_model, load_f16_tensor,
 };
+use chew_model_vibevoice::{
+    VibeVoiceBackbones, VibeVoicePrompt, inspect_model as inspect_vibevoice_model,
+};
 use clap::{Parser, Subcommand};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::PathBuf;
@@ -89,6 +92,20 @@ enum Command {
     Inspect {
         /// Directory containing config.json and Safetensors weights.
         model_dir: PathBuf,
+    },
+    /// Validate a VibeVoice-Realtime checkpoint and print its native geometry.
+    InspectVibeVoice {
+        /// Directory containing config.json and model.safetensors.
+        model_dir: PathBuf,
+        /// Optional Chew-converted voice-prompt Safetensors file.
+        #[arg(long)]
+        voice: Option<PathBuf>,
+    },
+    /// Load and execute both native VibeVoice Qwen2 backbones on CUDA.
+    CudaVibeVoiceBackboneSmoke {
+        model_dir: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        gpu: usize,
     },
     /// Validate a Kokoro model and print its native checkpoint geometry.
     InspectKokoro {
@@ -611,6 +628,79 @@ fn main() -> anyhow::Result<()> {
                 inspection.tensors.len(),
                 inspection.weight_files.len(),
                 inspection.total_weight_bytes as f64 / 1024.0_f64.powi(3)
+            );
+        }
+        Command::InspectVibeVoice { model_dir, voice } => {
+            let inspection = inspect_vibevoice_model(&model_dir)
+                .with_context(|| format!("could not inspect {}", model_dir.display()))?;
+            let config = &inspection.config;
+            let decoder = &config.decoder_config;
+            println!("VibeVoice-Realtime native BF16");
+            println!(
+                "decoder: {} text + {} TTS layers, hidden {}, {} Q heads / {} KV heads",
+                config.text_layers(),
+                config.tts_backbone_num_hidden_layers,
+                decoder.hidden_size,
+                decoder.num_attention_heads,
+                decoder.num_key_value_heads,
+            );
+            println!(
+                "diffusion: {} layers, {} default / {} training steps, latent {}",
+                config.diffusion_head_config.head_layers,
+                config.diffusion_head_config.ddpm_num_inference_steps,
+                config.diffusion_head_config.ddpm_num_steps,
+                config.acoustic_vae_dim,
+            );
+            println!(
+                "audio: causal mono decoder, {} samples per 7.5-Hz latent",
+                config.samples_per_latent(),
+            );
+            println!(
+                "weights: {} tensors, {:.2} GiB",
+                inspection.tensors.len(),
+                inspection.total_weight_bytes as f64 / 1024.0_f64.powi(3)
+            );
+            if let Some(voice) = voice {
+                let prompt = VibeVoicePrompt::load(&voice, config)
+                    .with_context(|| format!("could not inspect voice {}", voice.display()))?;
+                println!(
+                    "voice: LM {} / TTS {} prompt tokens; negative {} / {}",
+                    prompt.lm.tokens,
+                    prompt.tts_lm.tokens,
+                    prompt.negative_lm.tokens,
+                    prompt.negative_tts_lm.tokens,
+                );
+            }
+        }
+        Command::CudaVibeVoiceBackboneSmoke { model_dir, gpu } => {
+            let inspection = inspect_vibevoice_model(&model_dir)?;
+            let allocator = chew_vram::VramAllocator::init()?;
+            anyhow::ensure!(gpu < allocator.gpu_count(), "GPU index out of range");
+            let stream = std::sync::Arc::clone(allocator.stream(gpu));
+            let decoder = &inspection.config.decoder_config;
+            let mut kernels = chew_kernel::GpuKernels::load(
+                &stream,
+                decoder.intermediate_size * decoder.hidden_size,
+                decoder.intermediate_size,
+            )?;
+            let free_before = allocator.free_bytes(gpu)?;
+            let started = std::time::Instant::now();
+            let backbones = VibeVoiceBackbones::load(&model_dir, &inspection.config, &stream)?;
+            let load_elapsed = started.elapsed();
+            let free_loaded = allocator.free_bytes(gpu)?;
+            let forward_started = std::time::Instant::now();
+            let (text, tts) = backbones.smoke(&mut kernels)?;
+            println!(
+                "VibeVoice Qwen2 CUDA: load={:.3}s, forward={:.3}ms, VRAM={:.2} GiB",
+                load_elapsed.as_secs_f64(),
+                forward_started.elapsed().as_secs_f64() * 1_000.0,
+                free_before.saturating_sub(free_loaded) as f64 / 1024.0_f64.powi(3),
+            );
+            println!(
+                "text sum={:.9}, TTS sum={:.9}, first={:?}",
+                text.iter().map(|value| f64::from(*value)).sum::<f64>(),
+                tts.iter().map(|value| f64::from(*value)).sum::<f64>(),
+                &tts[..8],
             );
         }
         Command::InspectKokoro {

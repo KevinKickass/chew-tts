@@ -10,7 +10,7 @@ use std::sync::Arc;
 /// GPU-resident Qwen3-TTS talker transformer.
 pub struct TalkerTransformer<T: QwenDType = f16> {
     layers: Vec<TalkerDecoderLayer<T>>,
-    final_norm: CudaSlice<T>,
+    final_norm: Option<CudaSlice<T>>,
 }
 
 /// Persistent KV caches and scratch buffers for talker generation.
@@ -42,6 +42,48 @@ impl<T: QwenDType> TalkerTransformer<T> {
             norm_shape,
             config.hidden_size
         );
+        Ok(Self {
+            layers,
+            final_norm: Some(final_norm),
+        })
+    }
+
+    /// Load a standard Qwen2 stack rooted at `prefix`, for example
+    /// `model.language_model` or `model.tts_language_model`.
+    pub fn load_qwen2(
+        model_dir: impl AsRef<Path>,
+        prefix: &str,
+        config: &TalkerConfig,
+        stream: &Arc<CudaStream>,
+        has_final_norm: bool,
+    ) -> anyhow::Result<Self> {
+        let model_dir = model_dir.as_ref();
+        let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        for layer_index in 0..config.num_hidden_layers {
+            layers.push(
+                TalkerDecoderLayer::load_qwen2_from_prefix(
+                    model_dir,
+                    &format!("{prefix}.layers.{layer_index}"),
+                    config,
+                    stream,
+                )
+                .with_context(|| format!("could not load Qwen2 layer {layer_index}"))?,
+            );
+        }
+        let final_norm = if has_final_norm {
+            let name = format!("{prefix}.norm.weight");
+            let (norm_shape, final_norm) = T::load(model_dir, &name, stream)
+                .with_context(|| format!("could not load {name}"))?;
+            ensure!(
+                norm_shape == [config.hidden_size],
+                "{name} has shape {:?}, expected [{}]",
+                norm_shape,
+                config.hidden_size
+            );
+            Some(final_norm)
+        } else {
+            None
+        };
         Ok(Self { layers, final_norm })
     }
 
@@ -120,22 +162,29 @@ impl<T: QwenDType> TalkerTransformer<T> {
                 &mut session.scratch,
             )?;
         }
-        T::rms_norm_f32in(
-            kernels,
-            &hidden,
-            &self.final_norm,
-            &mut session.scratch.norm,
-            seq_len as u32,
-            config.hidden_size as u32,
-            config.rms_norm_eps as f32,
-        )?;
-        stream.synchronize()?;
-        let mut output = vec![T::zero(); seq_len * config.hidden_size];
-        stream.memcpy_dtoh(
-            &session.scratch.norm.slice(..seq_len * config.hidden_size),
-            &mut output,
-        )?;
-        Ok(output.into_iter().map(T::to_f32).collect())
+        if let Some(final_norm) = &self.final_norm {
+            T::rms_norm_f32in(
+                kernels,
+                &hidden,
+                final_norm,
+                &mut session.scratch.norm,
+                seq_len as u32,
+                config.hidden_size as u32,
+                config.rms_norm_eps as f32,
+            )?;
+            stream.synchronize()?;
+            let mut output = vec![T::zero(); seq_len * config.hidden_size];
+            stream.memcpy_dtoh(
+                &session.scratch.norm.slice(..seq_len * config.hidden_size),
+                &mut output,
+            )?;
+            Ok(output.into_iter().map(T::to_f32).collect())
+        } else {
+            stream.synchronize()?;
+            let mut output = vec![0.0f32; seq_len * config.hidden_size];
+            stream.memcpy_dtoh(&hidden, &mut output)?;
+            Ok(output)
+        }
     }
 
     /// Correctness-first stack execution from prepared talker embeddings.
@@ -179,23 +228,29 @@ impl<T: QwenDType> TalkerTransformer<T> {
                 &mut scratch,
             )?;
         }
-        T::rms_norm_f32in(
-            kernels,
-            &hidden,
-            &self.final_norm,
-            &mut scratch.norm,
-            seq_len as u32,
-            config.hidden_size as u32,
-            config.rms_norm_eps as f32,
-        )?;
-        stream.synchronize()?;
-
-        let mut output_f16 = vec![T::zero(); seq_len * config.hidden_size];
-        stream.memcpy_dtoh(
-            &scratch.norm.slice(..seq_len * config.hidden_size),
-            &mut output_f16,
-        )?;
-        Ok(output_f16.into_iter().map(T::to_f32).collect())
+        if let Some(final_norm) = &self.final_norm {
+            T::rms_norm_f32in(
+                kernels,
+                &hidden,
+                final_norm,
+                &mut scratch.norm,
+                seq_len as u32,
+                config.hidden_size as u32,
+                config.rms_norm_eps as f32,
+            )?;
+            stream.synchronize()?;
+            let mut output_native = vec![T::zero(); seq_len * config.hidden_size];
+            stream.memcpy_dtoh(
+                &scratch.norm.slice(..seq_len * config.hidden_size),
+                &mut output_native,
+            )?;
+            Ok(output_native.into_iter().map(T::to_f32).collect())
+        } else {
+            stream.synchronize()?;
+            let mut output = vec![0.0f32; seq_len * config.hidden_size];
+            stream.memcpy_dtoh(&hidden, &mut output)?;
+            Ok(output)
+        }
     }
 }
 

@@ -21,8 +21,8 @@ pub struct TalkerDecoderLayer<T: QwenDType = f16> {
     q_proj: CudaSlice<T>,
     k_proj: CudaSlice<T>,
     v_proj: CudaSlice<T>,
-    q_norm: CudaSlice<f16>,
-    k_norm: CudaSlice<f16>,
+    q_norm: Option<CudaSlice<f16>>,
+    k_norm: Option<CudaSlice<f16>>,
     o_proj: CudaSlice<T>,
     post_attention_norm: CudaSlice<T>,
     gate_proj: CudaSlice<T>,
@@ -136,6 +136,27 @@ impl<T: QwenDType> TalkerDecoderLayer<T> {
         config: &TalkerConfig,
         stream: &Arc<CudaStream>,
     ) -> anyhow::Result<Self> {
+        Self::load_architecture(model_dir, prefix, config, stream, true)
+    }
+
+    /// Load a standard Qwen2 decoder layer. Qwen2 does not have Q/K RMSNorm,
+    /// but otherwise uses the same GQA, RoPE, and SwiGLU path.
+    pub fn load_qwen2_from_prefix(
+        model_dir: impl AsRef<Path>,
+        prefix: &str,
+        config: &TalkerConfig,
+        stream: &Arc<CudaStream>,
+    ) -> anyhow::Result<Self> {
+        Self::load_architecture(model_dir, prefix, config, stream, false)
+    }
+
+    fn load_architecture(
+        model_dir: impl AsRef<Path>,
+        prefix: &str,
+        config: &TalkerConfig,
+        stream: &Arc<CudaStream>,
+        qk_norm: bool,
+    ) -> anyhow::Result<Self> {
         let load = |suffix: &str, expected: &[usize]| -> anyhow::Result<CudaSlice<T>> {
             let name = format!("{prefix}.{suffix}");
             let (shape, tensor) = T::load(model_dir.as_ref(), &name, stream)?;
@@ -167,8 +188,12 @@ impl<T: QwenDType> TalkerDecoderLayer<T> {
             q_proj: load("self_attn.q_proj.weight", &[q_dim, hidden])?,
             k_proj: load("self_attn.k_proj.weight", &[kv_dim, hidden])?,
             v_proj: load("self_attn.v_proj.weight", &[kv_dim, hidden])?,
-            q_norm: load_f16("self_attn.q_norm.weight", &[config.head_dim])?,
-            k_norm: load_f16("self_attn.k_norm.weight", &[config.head_dim])?,
+            q_norm: qk_norm
+                .then(|| load_f16("self_attn.q_norm.weight", &[config.head_dim]))
+                .transpose()?,
+            k_norm: qk_norm
+                .then(|| load_f16("self_attn.k_norm.weight", &[config.head_dim]))
+                .transpose()?,
             o_proj: load("self_attn.o_proj.weight", &[hidden, q_dim])?,
             post_attention_norm: load("post_attention_layernorm.weight", &[hidden])?,
             gate_proj: load("mlp.gate_proj.weight", &[intermediate, hidden])?,

@@ -13,6 +13,7 @@ chew-kernel.workspace = true
 chew-model-kokoro.workspace = true
 chew-model-chatterbox.workspace = true
 chew-model-qwen3-tts.workspace = true
+chew-model-vibevoice.workspace = true
 chew-vram.workspace = true
 clap.workspace = true
 cudarc.workspace = true

@@ -8,6 +8,7 @@ members = [
     "crates/model-qwen3-tts",
     "crates/model-kokoro",
     "crates/model-chatterbox",
+    "crates/model-vibevoice",
     "bin/chew-tts",
 ]
 
@@ -25,6 +26,7 @@ chew-safetensors = { path = "crates/safetensors" }
 chew-model-qwen3-tts = { path = "crates/model-qwen3-tts" }
 chew-model-kokoro = { path = "crates/model-kokoro" }
 chew-model-chatterbox = { path = "crates/model-chatterbox" }
+chew-model-vibevoice = { path = "crates/model-vibevoice" }
 
 # CUDA
 cudarc = { path = "cudarc-fork", features = ["std", "driver", "cublas", "nvrtc", "cuda-12060", "f16"] }
