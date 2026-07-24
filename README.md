@@ -592,8 +592,12 @@ request completes. The legacy request format remains raw and unframed.
 
 On an RTX 3080, a 45.675-second Kokoro result arrived in three progressive
 segments: first audio after 2.586 seconds and completion after 5.572 seconds.
-This is segment-level streaming; model-specific codec-frame streaming can use
-the same wire format later without changing Fleet or client WebSockets.
+Most engines currently stream at segment boundaries. VibeVoice-Realtime uses
+the same wire format at codec-frame granularity: a local German request emitted
+32 audio frames, delivered first audio after 272 ms, and completed 4.267
+seconds of audio after 1.018 seconds. This is the worker-side data path needed
+for a gateway-held realtime session; no OpenAI synchronous endpoint behavior
+changes.
 
 ## Requirements
 

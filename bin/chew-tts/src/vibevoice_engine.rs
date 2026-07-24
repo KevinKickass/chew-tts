@@ -84,6 +84,24 @@ impl VibeVoiceEngine {
     }
 
     pub fn synthesize(&mut self, request: &SynthesisRequest) -> anyhow::Result<SynthesisOutput> {
+        self.synthesize_inner(request, None)?
+            .ok_or_else(|| anyhow::anyhow!("VibeVoice synthesis stopped before completion"))
+    }
+
+    pub fn synthesize_streaming(
+        &mut self,
+        request: &SynthesisRequest,
+        mut emit: impl FnMut(SynthesisOutput) -> bool,
+    ) -> anyhow::Result<()> {
+        self.synthesize_inner(request, Some(&mut emit))?;
+        Ok(())
+    }
+
+    fn synthesize_inner(
+        &mut self,
+        request: &SynthesisRequest,
+        mut emit: Option<&mut dyn FnMut(SynthesisOutput) -> bool>,
+    ) -> anyhow::Result<Option<SynthesisOutput>> {
         ensure!(!request.text.trim().is_empty(), "text must not be empty");
         let max_frames = request
             .max_frames
@@ -111,6 +129,7 @@ impl VibeVoiceEngine {
         let prompt_elapsed = prompt_started.elapsed();
 
         let generation_started = Instant::now();
+        let mut previous_emit = generation_started;
         let mut rng = VibeVoiceRng::new(request.seed);
         let mut decoder_state = VibeVoiceDecoderState::default();
         let mut samples = Vec::new();
@@ -163,13 +182,40 @@ impl VibeVoiceEngine {
                 }
                 let decoder_latent = self.generation.decoder_latent(&speech)?;
                 let codec_started = Instant::now();
-                samples.extend(self.decoder.decode_streaming(
+                let chunk = self.decoder.decode_streaming(
                     &decoder_latent,
                     &mut decoder_state,
                     &mut self.kernels,
-                )?);
-                codec_elapsed += codec_started.elapsed();
+                )?;
+                let frame_codec_elapsed = codec_started.elapsed();
+                codec_elapsed += frame_codec_elapsed;
                 speech_frames += 1;
+                ensure!(
+                    chunk.iter().all(|sample| sample.is_finite()),
+                    "VibeVoice generated non-finite audio"
+                );
+                if let Some(callback) = emit.as_mut() {
+                    let now = Instant::now();
+                    let frame_elapsed = now.duration_since(previous_emit);
+                    previous_emit = now;
+                    let keep_going = callback(SynthesisOutput {
+                        samples: chunk,
+                        sample_rate: SAMPLE_RATE,
+                        generated_frames: 1,
+                        prompt_elapsed: if speech_frames == 1 {
+                            prompt_elapsed
+                        } else {
+                            Duration::ZERO
+                        },
+                        generation_elapsed: frame_elapsed.saturating_sub(frame_codec_elapsed),
+                        codec_elapsed: frame_codec_elapsed,
+                    });
+                    if !keep_going {
+                        return Ok(None);
+                    }
+                } else {
+                    samples.extend(chunk);
+                }
                 let acoustic = self.generation.connect_latent(&speech, &mut self.kernels)?;
                 self.backbones.push_speech(
                     &mut session,
@@ -192,14 +238,17 @@ impl VibeVoiceEngine {
             samples.iter().all(|sample| sample.is_finite()),
             "VibeVoice generated non-finite audio"
         );
-        Ok(SynthesisOutput {
+        if emit.is_some() {
+            return Ok(None);
+        }
+        Ok(Some(SynthesisOutput {
             samples,
             sample_rate: SAMPLE_RATE,
             generated_frames: speech_frames,
             prompt_elapsed,
             generation_elapsed: generation_started.elapsed().saturating_sub(codec_elapsed),
             codec_elapsed,
-        })
+        }))
     }
 
     fn voice_path(&self, voice: &str, language: &str) -> anyhow::Result<PathBuf> {

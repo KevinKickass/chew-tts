@@ -132,6 +132,19 @@ impl TtsEngine {
             Self::VibeVoice(engine) => engine.synthesize(request),
         }
     }
+
+    fn synthesize_streaming(
+        &mut self,
+        request: &SynthesisRequest,
+        mut emit: impl FnMut(crate::voice_design::SynthesisOutput) -> bool,
+    ) -> anyhow::Result<()> {
+        if let Self::VibeVoice(engine) = self {
+            return engine.synthesize_streaming(request, emit);
+        }
+        let output = self.synthesize(request)?;
+        emit(output);
+        Ok(())
+    }
 }
 
 #[derive(Deserialize)]
@@ -431,30 +444,38 @@ fn synthesize_segments(
         segment.text.clone_from(text);
         segment.seed = segment.seed.wrapping_add(index as u64);
         segment.speed = 1.0;
-        let result = engine
-            .synthesize(&segment)
-            .map(|output| {
-                let inference_ms = output.inference_elapsed().as_secs_f64() * 1_000.0;
-                let mut samples = output.samples;
-                if index > 0 {
-                    samples.splice(
-                        0..0,
-                        std::iter::repeat_n(0.0, segment_gap_samples(output.sample_rate)),
-                    );
-                }
-                GeneratedAudio {
-                    samples,
-                    sample_rate: output.sample_rate,
-                    frames: output.generated_frames,
-                    inference_ms,
-                    prompt_ms: output.prompt_elapsed.as_secs_f64() * 1_000.0,
-                    generation_ms: output.generation_elapsed.as_secs_f64() * 1_000.0,
-                    codec_ms: output.codec_elapsed.as_secs_f64() * 1_000.0,
-                }
-            })
-            .map_err(|error| format!("segment {}/{} failed: {error:#}", index + 1, segments.len()));
-        let failed = result.is_err();
-        if !emit(result) || failed {
+        let mut first_chunk = true;
+        let mut connected = true;
+        let result = engine.synthesize_streaming(&segment, |output| {
+            let inference_ms = output.inference_elapsed().as_secs_f64() * 1_000.0;
+            let mut samples = output.samples;
+            if index > 0 && first_chunk {
+                samples.splice(
+                    0..0,
+                    std::iter::repeat_n(0.0, segment_gap_samples(output.sample_rate)),
+                );
+            }
+            first_chunk = false;
+            connected = emit(Ok(GeneratedAudio {
+                samples,
+                sample_rate: output.sample_rate,
+                frames: output.generated_frames,
+                inference_ms,
+                prompt_ms: output.prompt_elapsed.as_secs_f64() * 1_000.0,
+                generation_ms: output.generation_elapsed.as_secs_f64() * 1_000.0,
+                codec_ms: output.codec_elapsed.as_secs_f64() * 1_000.0,
+            }));
+            connected
+        });
+        if let Err(error) = result {
+            emit(Err(format!(
+                "segment {}/{} failed: {error:#}",
+                index + 1,
+                segments.len()
+            )));
+            break;
+        }
+        if !connected {
             break;
         }
     }
@@ -615,7 +636,7 @@ async fn handle_fleet_connection(
     let audio = submit(&state, request)
         .await
         .map_err(|_| "synthesis request was rejected".to_string())?;
-    let samples = resample(&audio.samples, audio.sample_rate, FLEET_SAMPLE_RATE);
+    let samples = fleet_samples(audio.samples, audio.sample_rate);
     let raw = raw_f32le(samples, FLEET_SAMPLE_RATE, speed).await?;
     stream
         .write_all(&raw)
@@ -658,7 +679,7 @@ async fn handle_fleet_stream(
     while let Some(segment) = response_rx.recv().await {
         match segment {
             Ok(audio) => {
-                let samples = resample(&audio.samples, audio.sample_rate, FLEET_SAMPLE_RATE);
+                let samples = fleet_samples(audio.samples, audio.sample_rate);
                 let raw = raw_f32le(samples, FLEET_SAMPLE_RATE, speed).await?;
                 write_stream_frame(&mut stream, AUDIO, &raw).await?;
             }
@@ -1059,6 +1080,14 @@ fn encoded_duration_header(audio: &GeneratedAudio, speed: f32) -> u64 {
 
 fn segment_gap_samples(sample_rate: u32) -> usize {
     (sample_rate as usize * SEGMENT_GAP_SAMPLES) / FLEET_SAMPLE_RATE as usize
+}
+
+fn fleet_samples(samples: Vec<f32>, sample_rate: u32) -> Vec<f32> {
+    if sample_rate == FLEET_SAMPLE_RATE {
+        samples
+    } else {
+        resample(&samples, sample_rate, FLEET_SAMPLE_RATE)
+    }
 }
 
 fn error_response(status: StatusCode, message: &str) -> Response {
